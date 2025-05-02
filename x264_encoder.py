@@ -21,15 +21,17 @@ class X264Encoder(BaseVideoEncoder):
     Concrete implementation of BaseVideoEncoder for x264 encoding using FFmpeg via pipe.
     """
     def __init__(self,
+                 shared_buffer: ProcessSafeSharedRingBuffer,
                  output_path: str,
-                 frame_size: Tuple[int, int, int],
-                 fps: int = 30,
-                 bitrate: str = '800k',
-                 buffer_capacity: int = 10,
-                 batch_size: int = 5): # Add batch_size parameter
-        super().__init__(output_path, frame_size, buffer_capacity=buffer_capacity, batch_size=batch_size) # Pass batch_size to base class
-        self._fps = fps
-        self._bitrate = bitrate
+                 batch_size: int = 5,
+                 **kwargs):
+        super().__init__(shared_buffer, output_path, batch_size=batch_size, **kwargs)
+        # The following attributes should now be accessed from self._encoder_kwargs
+        self._fps = kwargs.get('fps', 30)
+        self._bitrate = kwargs.get('bitrate', '800k')
+        self._frame_size = kwargs.get('frame_size') # Assuming frame_size is required and passed in kwargs
+        if self._frame_size is None:
+             raise ValueError("frame_size must be provided in kwargs")
         # Attribute to hold the FFmpeg process
         self._ffmpeg_process: Optional[subprocess.Popen] = None
         # Attributes to hold reader threads

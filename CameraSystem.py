@@ -5,12 +5,12 @@ import multiprocessing as mp
 from multiprocessing.shared_memory import SharedMemory
 
 from collections import deque
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Type # Import Type for class hints
 
 from huateng_camera import Camera
-from ringbuffer import RingBuffer
+# from ringbuffer import RingBuffer # No longer needed
 from shared_ring_buffer import ProcessSafeSharedRingBuffer
-# 不再需要导入具体的 Analyzer 实现，只需要类型提示
+# No longer need specific analyzer import here
 # from nnanalyzer import MySpecificNNAnalyzer
 from nnanalyzer import NNAnalyzer # 导入基类用于类型提示
 from videoencoder import BaseVideoEncoder, X264Encoder # Import video encoder classes
@@ -26,74 +26,147 @@ class CameraSystem:
     This system orchestrates the flow of frames from a camera to an analyzer and a video encoder.
     It uses a ring buffer for temporary frame storage and threading for concurrent operations.
     The lifecycle (start/stop) of the provided analyzer and video encoder instances
-    is assumed to be managed externally.
+    It creates and manages the internal components including the shared buffer
+    for video encoding.
     """
-    # 1. 修改 __init__ 签名，接收 analyzer 和 encoder 实例
-    def __init__(self, camera: Camera, analyzer: NNAnalyzer, video_encoder: BaseVideoEncoder):
+    def __init__(self,
+                 camera: Camera,
+                 AnalyzerClass: Type[NNAnalyzer],
+                 VideoEncoderClass: Type[BaseVideoEncoder],
+                 analyzer_config: dict,
+                 video_encoder_config: dict,
+                 buffer_capacity: int = 600): # Added buffer_capacity config
         """
-        Initializes the CameraSystem with a Camera instance, an NNAnalyzer instance,
-        and a BaseVideoEncoder instance.
+        Initializes the CameraSystem by creating internal components.
         Args:
             camera (Camera): The camera object to grab frames from.
-            analyzer (NNAnalyzer): The pre-initialized analyzer object to submit frames to.
-                                   Assumes analyzer manages its own IPC resources.
-            video_encoder (BaseVideoEncoder): The pre-initialized video encoder object.
-                                              Assumes encoder manages its own IPC resources.
+            AnalyzerClass (Type[NNAnalyzer]): The class of the NN analyzer to use.
+            VideoEncoderClass (Type[BaseVideoEncoder]): The class of the video encoder to use.
+            analyzer_config (dict): Configuration dictionary for the analyzer.
+            video_encoder_config (dict): Configuration dictionary for the video encoder.
+                                         Must include 'output_path', 'batch_size', etc.
+                                         It should NOT include 'shared_buffer'.
+            buffer_capacity (int): Capacity of the shared ring buffer. Defaults to 600.
         """
-        self.ring_buffer = RingBuffer(60 * 10)  # 环形缓冲60帧 * 10s
-        self.snapshot_condition = Condition(Lock())  # 快照开始锁
+        self.snapshot_condition = Condition(Lock())
         self.running = Event()
         self.camera = camera
-        # 3. 直接使用传入的 analyzer 和 encoder 实例
-        self.analyzer = analyzer
-        self.video_encoder = video_encoder
-        self.thread_pool = []  # 线程池，用于管理线程
+        self.thread_pool = []
+        self.shared_buffer: Optional[ProcessSafeSharedRingBuffer] = None # Initialize as None
+
+        # --- Create Shared Buffer ---
+        try:
+            width = self.camera.width
+            height = self.camera.height
+            frame_shape = (height, width, 3) # Assuming 3 channels
+            dtype = np.uint8 # Assuming uint8
+            print(f"CameraSystem: Determined frame shape {frame_shape}, dtype {dtype}")
+        except AttributeError:
+            print("Warning: Camera object does not provide shape/dtype info. Using defaults.")
+            frame_shape = (1024, 1280, 3) # Default
+            dtype = np.uint8
+            print(f"CameraSystem: Using default frame shape {frame_shape}, dtype {dtype}")
+
+        print(f"CameraSystem: Creating Shared Ring Buffer (capacity: {buffer_capacity}, shape: {frame_shape}, dtype: {dtype})...")
+        try:
+            self.shared_buffer = ProcessSafeSharedRingBuffer(
+                create=True,
+                buffer_capacity=buffer_capacity,
+                frame_shape=frame_shape,
+                dtype=dtype
+            )
+            print("CameraSystem: Shared Ring Buffer created.")
+        except Exception as e:
+            print(f"FATAL: Failed to create Shared Ring Buffer: {e}")
+            # Handle buffer creation failure (e.g., raise exception or set a failed state)
+            raise RuntimeError("Failed to initialize shared buffer") from e
+
+        # --- Instantiate Components ---
+        print("CameraSystem: Instantiating Analyzer...")
+        self.analyzer = AnalyzerClass(**analyzer_config)
+        print("CameraSystem: Analyzer instantiated.")
+
+        print("CameraSystem: Instantiating VideoEncoder...")
+        # Inject the created shared buffer into the video encoder config
+        encoder_final_config = {**video_encoder_config, 'shared_buffer': self.shared_buffer}
+        self.video_encoder = VideoEncoderClass(**encoder_final_config)
+        print("CameraSystem: VideoEncoder instantiated.")
+
+
+    def submit_frame(self, frame: np.ndarray, timeout: float = 1.0) -> bool:
+        """
+        Submits a single frame to the shared buffer with timeout handling.
+
+        Args:
+            frame: The frame (without batch dimension) to submit.
+            timeout: Seconds to wait for space in the buffer.
+
+        Returns:
+            True if successful, False if timeout or error occurred.
+        """
+        if not self.running.is_set() or self.shared_buffer is None:
+            # print("Warning: CameraSystem not running or buffer not initialized.") # Optional
+            return False
+
+        try:
+            # Add batch dimension as required by shared_buffer.put
+            frame_batch = np.expand_dims(frame, axis=0)
+            success = self.shared_buffer.put(frame_batch, timeout=timeout)
+            if not success:
+                print(f"Warning: Timeout ({timeout}s) submitting frame to shared buffer.")
+                # Consider adding more robust error handling/logging here
+            return success
+        except Exception as e:
+            print(f"Error submitting frame to shared buffer: {e}")
+            return False
 
     def capture_thread(self):
+        """Captures frames from the camera and submits them to the shared buffer."""
         while self.running.is_set():
             frame = self.camera.grab()
             # The grab method returns a *view* of ndarray
             if frame is not None:
-                self.ring_buffer.put(frame)
-    
+                # Check if encoder is ready before submitting
+                # Add a small initial delay or check only after first few frames if needed
+                if self.video_encoder and not self.video_encoder.is_ready:
+                    print("Capture thread: Warning - VideoEncoder worker is not ready. Frame submitted but might fill buffer.")
+                    # Optionally, could skip submission or sleep briefly if encoder not ready
+
+                # Submit frame using the new method with timeout handling
+                if not self.submit_frame(frame):
+                    # Handle submission failure (e.g., log, skip frame, slow down?)
+                    print("Capture thread: Failed to submit frame, buffer might be full or error occurred.")
+                    # Depending on requirements, might need to sleep or break here
+                    # time.sleep(0.01) # Example: small sleep if buffer is full
+
     def snapshot_thread(self):
+        """Waits for a signal, then peeks the latest frame from the shared buffer for analysis."""
         while self.running.is_set():
-            with self.snapshot_condition: # 防止多次触发但是只分析了一次的情况
-                self.snapshot_condition.wait()  # 等待快照开始信号
-                analysis_frame = self.ring_buffer.get_latest()
-                if not self.running.is_set() or analysis_frame is None:
-                    # print("Snapshot thread: No frame in buffer.") # 调试信息
+            with self.snapshot_condition:
+                self.snapshot_condition.wait()
+                if not self.running.is_set(): # Check running flag again after wait
+                    break
+
+                # Ensure shared_buffer is initialized before peeking
+                if self.shared_buffer is None:
+                    print("Snapshot thread: Error - Shared buffer is not initialized.")
                     continue
 
-                # 3. 调用 analyzer 的 submit_frame 接口
-                # print(f"Snapshot thread: Submitting frame {analysis_frame.shape}") # 调试信息
+                # Peek the latest frame (returns a copy)
+                analysis_frame = self.shared_buffer.peek_last_frame()
+
+                if analysis_frame is None:
+                    print("Snapshot thread: No frame available in shared buffer or buffer error.")
+                    continue
+
+                # Submit the frame copy to the analyzer
+                # print(f"Snapshot thread: Submitting frame {analysis_frame.shape}") # Debug info
                 self.analyzer.submit_frame(analysis_frame)
-                # 移除直接操作共享内存和条件变量的代码
-        
-    def encode_thread(self):
-        """
-        Thread that periodically retrieves frames from the ring buffer and submits them to the video encoder.
-        """
-        while self.running.is_set():
-            # Get all available frames from the ring buffer up to the latest
-            frames = self.ring_buffer.popleft_till_latest()
-            # The implementation here need to submit each frame timely (within 1/fps interval)
-            # this method will also omit the first frame in the final video.
-            # Actually, the all frames in RingBuffer is the same, due to RingBuffer store references only.
-            # TODO: Change RingBuffer (which store references of frames captured by Camera) to
-            #       ProcessSafeSharedRingBuffer (which store copies of frames) to avoid the problem.
-            
-            if frames:
-                print(f"Encode thread: Retrieved {len(frames)} frames from buffer. Submitting for encoding...")
-                # Submit each retrieved frame to the video encoder
-                for frame in frames:
-                    # The video_encoder.submit_frame method handles the cross-process communication
-                    self.video_encoder.submit_frame(frame)
-                print(f"Encode thread: Finished submitting {len(frames)} frames.")
-            # The TODO comment about encoding processing is now handled by the video_encoder.submit_frame call.
+
+    # encode_thread is removed. VideoEncoder worker reads directly from shared_buffer.
 
     def snapshot_and_analyze(self):
-        # Trigger snapshot_thread to perform analysis
+        """Triggers the snapshot thread and retrieves the analysis result."""
         with self.snapshot_condition:
             self.snapshot_condition.notify_all()  # 发送快照开始信号
 
@@ -116,41 +189,53 @@ class CameraSystem:
             return
         print("Starting CameraSystem threads...")
         self.running.set()
-        # 4. 移除 analyzer.start() 的调用，由外部管理
-        # self.analyzer.start()
+        # Analyzer and VideoEncoder start/stop are managed externally by the caller
+        # Ensure components are initialized before starting threads
+        if self.analyzer is None or self.video_encoder is None:
+             raise RuntimeError("Analyzer or VideoEncoder not initialized before starting CameraSystem threads.")
+
         self.thread_pool.append(Thread(target=self.capture_thread, name="CaptureThread"))
         self.thread_pool.append(Thread(target=self.snapshot_thread, name="SnapshotThread"))
-        self.thread_pool.append(Thread(target=self.encode_thread, name="EncodeThread"))
+        # self.thread_pool.append(Thread(target=self.encode_thread, name="EncodeThread")) # Removed
         for thread in self.thread_pool:
             thread.start()
-    
+
     def stop(self):
         """Stops the internal threads of the CameraSystem."""
         if not self.running.is_set():
             print("CameraSystem already stopped.")
             return
         print("Stopping CameraSystem threads...")
-        # 5. 移除 analyzer.stop() 的调用
-        # self.analyzer.stop()
-        self.running.clear() # 发送终止循环信号
-        with self.snapshot_condition: # 挂snapshot锁
-            self.snapshot_condition.notify_all() # 终止snapshot_thread的等待
+        # Analyzer and VideoEncoder stop are managed externally
+        self.running.clear()
+        with self.snapshot_condition:
+            self.snapshot_condition.notify_all() # Wake up snapshot_thread if waiting
         print("Waiting for CameraSystem threads to join...")
-        for thread in self.thread_pool: # 等待线程池结束
+        for thread in self.thread_pool:
             print(f"Joining {thread.name}...")
             thread.join()
             print(f"{thread.name} joined.")
-        # 6. 移除共享内存的清理 (由 Analyzer 管理)
-        # self.shared_mem.close()
-        # self.shared_mem.unlink()
+        self.thread_pool = [] # Clear thread pool
+
+        # Clean up the shared buffer created by CameraSystem
+        if self.shared_buffer:
+            print("Cleaning up CameraSystem's Shared Ring Buffer...")
+            try:
+                self.shared_buffer.close() # Close connection first
+                self.shared_buffer.unlink() # Then unlink
+                print("CameraSystem's Shared Ring Buffer cleaned up.")
+            except Exception as e:
+                print(f"Error cleaning up CameraSystem's Shared Ring Buffer: {e}")
+            finally:
+                self.shared_buffer = None # Clear reference
+
         print("CameraSystem stopped.")
-        self.thread_pool = [] # 清空列表
 
 
 if __name__ == "__main__":
-    # 导入具体实现用于测试
+    # Import specific implementations for testing in __main__
     from nnanalyzer import MySpecificNNAnalyzer
-    # 导入 numpy 用于计算 frame_bytes (虽然现在不需要了，但保留以防万一)
+    # numpy is likely needed by dependencies or for frame creation if camera mock is used
     import numpy as np
 
     '''
@@ -160,48 +245,57 @@ if __name__ == "__main__":
     DevList = mvsdk.CameraEnumerateDevice()
     camera = Camera(DevList[0])
     camera.open()
-    # 7. 在外部创建 Analyzer 和 VideoEncoder 实例
-    analyzer = None
-    video_encoder = None
-    camera_system = None
+    # Define configurations for components
+    analyzer_config = {}
+    video_encoder_config = {}
+    camera_system = None # Initialize camera_system to None
+
     try:
-        print("Creating Analyzer instance...")
-        # TODO: 从相机或配置获取正确的尺寸
-        frame_shape = (1024, 1280, 3)
-        analyzer = MySpecificNNAnalyzer(
-            model_path='example_path', # TODO: 使用配置
-            frame_size=frame_shape
-        )
-        print("Analyzer instance created.")
+        # --- Determine Frame Shape (once) ---
+        try:
+            width = camera.width
+            height = camera.height
+            main_frame_shape = (height, width, 3)
+        except AttributeError:
+            print("Warning: Camera object does not provide shape info for main. Using defaults.")
+            main_frame_shape = (1024, 1280, 3) # Default
 
-        print("Creating VideoEncoder instance...")
-        # TODO: 从相机或配置获取正确的尺寸和输出路径
-        output_video_path = 'output.mp4' # Example output path
-        video_encoder = X264Encoder(
-            output_path=output_video_path,
-            frame_size=frame_shape,
-            fps=25, # Example FPS
-            bitrate='800k', # Example bitrate
-            buffer_capacity=600,
-            batch_size=10,
-        )
-        print("VideoEncoder instance created.")
+        # --- Prepare Configurations ---
+        analyzer_config = {
+            'model_path': 'example_path', # TODO: Use actual config
+            'frame_size': main_frame_shape
+        }
+        video_encoder_config = {
+            'output_path': 'output.mp4', # Example output path
+            'fps': 25, # Example FPS
+            'bitrate': '800k', # Example bitrate
+            'batch_size': 10,
+            'frame_size': main_frame_shape,
+            # 'shared_buffer' will be added by CameraSystem.__init__
+        }
 
-
-        # 8. 在外部创建 CameraSystem 实例并注入 Analyzer 和 VideoEncoder
+        # --- Create CameraSystem (which creates components and buffer) ---
         print("Creating CameraSystem instance...")
-        camera_system = CameraSystem(camera, analyzer, video_encoder)
-        print("CameraSystem instance created.")
+        camera_system = CameraSystem(
+            camera=camera,
+            AnalyzerClass=MySpecificNNAnalyzer,
+            VideoEncoderClass=X264Encoder,
+            analyzer_config=analyzer_config,
+            video_encoder_config=video_encoder_config,
+            buffer_capacity=600 # Example capacity
+        )
+        print("CameraSystem instance created with internal components.")
 
-        # 9. 分别启动 Analyzer, VideoEncoder, 和 CameraSystem
+        # --- Start Components (Managed Externally) ---
+        # Start order: Analyzer and Encoder first, then CameraSystem threads
         print("Starting Analyzer...")
-        analyzer.start() # Analyzer 管理自己的启动和 IPC 创建
+        camera_system.analyzer.start()
         print("Starting VideoEncoder...")
-        video_encoder.start() # VideoEncoder 管理自己的启动和 IPC 创建
-        print("Starting CameraSystem...")
-        camera_system.start() # CameraSystem 只启动自己的线程
+        camera_system.video_encoder.start()
+        print("Starting CameraSystem internal threads...")
+        camera_system.start() # Starts capture and snapshot threads
 
-        # 等待用户输入以停止系统
+        # --- System Running ---
         print("System running. Press Enter to trigger snapshot and analyze.")
         time.sleep(1) # 等待线程启动
         input("Press Enter for first snapshot...")
@@ -213,18 +307,23 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
-        # 10. 分别停止 CameraSystem, VideoEncoder, 和 Analyzer
+        # --- Stop Components (Managed Externally) ---
+        # Stop order: Analyzer and Encoder first, then CameraSystem threads & buffer cleanup
         if camera_system:
-            print("Stopping CameraSystem...")
-            camera_system.stop()
-        if video_encoder:
-            print("Stopping VideoEncoder...")
-            video_encoder.stop() # VideoEncoder 管理自己的停止和 IPC 清理
-        if analyzer:
-            print("Stopping Analyzer...")
-            analyzer.stop() # Analyzer 管理自己的停止和 IPC 清理
+            # 1. Stop Analyzer and Encoder processes first
+            if camera_system.analyzer:
+                print("Stopping Analyzer...")
+                camera_system.analyzer.stop()
+            if camera_system.video_encoder:
+                print("Stopping VideoEncoder...")
+                camera_system.video_encoder.stop()
 
-        # 关闭相机
+            # 2. Stop CameraSystem internal threads (capture/snapshot)
+            #    and clean up the shared buffer
+            print("Stopping CameraSystem internal threads and cleaning buffer...")
+            camera_system.stop() # Stops threads, closes and unlinks buffer
+
+        # --- Close Camera ---
         print("Closing camera...")
         camera.close()
 

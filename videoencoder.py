@@ -9,32 +9,54 @@ from shared_ring_buffer import ProcessSafeSharedRingBuffer # Import the ring buf
 class BaseVideoEncoder(abc.ABC):
     """
     Abstract base class for a video encoder using multiprocessing.
-    Handles IPC resource creation, process management, and frame submission.
+    Handles IPC resource creation, process management, and frame processing from a shared buffer.
     Requires subclasses to implement the encoder initialization and frame encoding logic.
     """
     def __init__(self,
+                 shared_buffer: ProcessSafeSharedRingBuffer, # Accept shared buffer instance
                  output_path: str,
-                 frame_size: Tuple[int, int, int],
-                 buffer_capacity: int = 10,
-                 batch_size: int = 5): # Added batch_size parameter
+                 batch_size: int = 5,
+                 **kwargs): # Allow passing extra args to specific encoders
         """
-        Initialize the base encoder. IPC resources will be created in start().
+        Initialize the base encoder with a pre-created shared buffer instance.
+        The worker process will attach to this buffer in start().
         Args:
+            shared_buffer: (ProcessSafeSharedRingBuffer), the shared buffer instance created externally.
             output_path: (str), path to the output video file.
-            frame_size: (Tuple[int, int, int]), expected frame size (height, width, channel).
-            buffer_capacity: (int), capacity of the shared ring buffer. Defaults to 10.
             batch_size: (int), number of frames to get from the buffer at once. Defaults to 5.
+            **kwargs: Additional keyword arguments for specific encoder implementations.
         """
         self._output_path = output_path
-        self._frame_size = frame_size
-        self._buffer_capacity = buffer_capacity # Store buffer capacity
         self._batch_size = batch_size # Store batch size
+        self._ring_buffer = shared_buffer # Store the injected buffer instance for worker to use
 
         # Multiprocessing resources
         self._running = mp.Event()
         self._worker_process: Optional[mp.Process] = None
-        self._ring_buffer: Optional[ProcessSafeSharedRingBuffer] = None # Use ring buffer instead of shm and cond
         self._worker_ready = mp.Event() # Signals when the worker is ready for the next frame
+        # Store kwargs for potential use in subclasses _initialize_encoder
+        self._encoder_kwargs = kwargs
+
+    @property
+    def is_ready(self) -> bool:
+        """Checks if the encoder worker process has signaled it's ready."""
+        return self._worker_ready.is_set()
+
+    # Read properties from the injected buffer if needed (optional)
+    # Note: Accessing internal attributes like _frame_shape is generally discouraged.
+    # It's better if ProcessSafeSharedRingBuffer provides public properties.
+    # @property
+    # def frame_size(self) -> Tuple[int, int, int]:
+    #     if self._ring_buffer and hasattr(self._ring_buffer, '_frame_shape'): # Check attribute existence
+    #          return self._ring_buffer._frame_shape
+    #     raise ValueError("Shared buffer not initialized or frame shape unavailable.")
+
+    # @property
+    # def buffer_capacity(self) -> int:
+    #     if self._ring_buffer and hasattr(self._ring_buffer, '_buffer_capacity'): # Check attribute existence
+    #          return self._ring_buffer._buffer_capacity
+    #     raise ValueError("Shared buffer not initialized or capacity unavailable.")
+
 
     @abc.abstractmethod
     def _initialize_encoder(self):
@@ -166,16 +188,14 @@ class BaseVideoEncoder(abc.ABC):
 
         print("Starting VideoEncoder...")
         try:
-            # Create the shared ring buffer
-            print(f"Creating Shared Ring Buffer (capacity: {self._buffer_capacity}, frame_size: {self._frame_size})...")
-            # Assuming frames are uint8, adjust dtype if needed
-            self._ring_buffer = ProcessSafeSharedRingBuffer(
-                create=True,
-                buffer_capacity=self._buffer_capacity,
-                frame_shape=self._frame_size,
-                dtype=np.uint8
-            )
-            print("Shared Ring Buffer created.")
+            # Ensure shared buffer instance was provided during initialization
+            if self._ring_buffer is None:
+                raise ValueError("Shared buffer instance must be provided during initialization.")
+            if not isinstance(self._ring_buffer, ProcessSafeSharedRingBuffer):
+                 raise TypeError("Provided shared_buffer is not a ProcessSafeSharedRingBuffer instance.")
+
+            # The main process no longer creates or attaches to the buffer here.
+            # The worker process will attach using the provided instance.
 
             # Set running state and start worker process
             self._running.set()
@@ -191,48 +211,23 @@ class BaseVideoEncoder(abc.ABC):
 
             # Wait for worker to signal readiness
             print(f"Waiting for encoder worker ({self._worker_process.pid}) to be ready...")
-            self._worker_ready.wait()
+            # Add timeout to worker ready wait
+            if not self._worker_ready.wait(timeout=10.0): # e.g., 10 seconds timeout
+                 print(f"FATAL: Timeout waiting for encoder worker ({self._worker_process.pid}) to become ready.")
+                 self.stop() # Attempt cleanup if worker doesn't start
+                 raise TimeoutError("Encoder worker failed to initialize within timeout.")
             print(f"VideoEncoder started successfully with worker PID: {self._worker_process.pid}")
 
         except Exception as e:
             print(f"Error starting VideoEncoder: {e}")
             # If startup fails, clean up potentially created resources
             self.stop() # Use stop to ensure cleanup
+            raise # Re-raise the exception after cleanup attempt
 
 
-    def submit_frame(self, frame: np.ndarray):
-        """
-        Submits a frame for encoding by putting it into the shared ring buffer.
-        Args:
-            frame: (np.ndarray), the frame to submit.
-        """
-        # Check if encoder is running and ring buffer is initialized
-        if not self._running.is_set() or self._ring_buffer is None:
-            print("Warning: Encoder is not running or ring buffer not initialized. \n" \
-                  "         Call start() before submit_frame().")
-            return
-
-        # Wait for the worker to be ready before submitting the frame
-        # This ensures the worker has initialized the encoder and is ready to receive data.
-        if not self._worker_ready.is_set():
-            print("Waiting for encoder worker to be ready before submitting frame...")
-            # Wait with a timeout to prevent indefinite blocking
-            worker_is_ready = self._worker_ready.wait(timeout=5.0)
-
-            if not worker_is_ready:
-                print("Warning: Timeout waiting for encoder worker to be ready. Cannot submit frame.")
-                return # Return if timeout occurs
-
-        try:
-            # Put the frame into the ring buffer.
-            # The ring buffer handles copying to shared memory and notifying the worker.
-            # Use a timeout to prevent indefinite blocking if the buffer is full.
-            success = self._ring_buffer.put(np.expand_dims(frame, axis=0), timeout=5.0) # put expects (frame_num, ...)
-            if not success:
-                print("Warning: Timeout occurred while submitting frame to the ring buffer.")
-
-        except Exception as e:
-            print(f"Error submitting frame to ring buffer: {e}")
+    # submit_frame is removed as CameraSystem now writes directly to the buffer.
+    # TODO: Previously, submit_frame will check _worker_ready, but now CameraSystem
+    #       should manage this. Need to provide a method(property) to check worker status.
 
 
     def stop(self):
@@ -260,17 +255,21 @@ class BaseVideoEncoder(abc.ABC):
             print(f"Worker process ({self._worker_process.pid}) joined.")
             self._worker_process = None # Clear process reference
 
-        # Clean up shared ring buffer resources in the creator process
-        if self._ring_buffer:
-            print("Cleaning up Shared Ring Buffer...")
-            try:
-                self._ring_buffer.close() # Close connection in main process
-                self._ring_buffer.unlink() # Unlink shared memory segments
-                print("Shared Ring Buffer cleaned up.")
-            except Exception as e:
-                print(f"Error cleaning up Shared Ring Buffer: {e}")
-            finally:
-                 self._ring_buffer = None # Reset ring buffer reference
+        # Main process does not hold a connection to the buffer that needs closing here.
+        # The worker process closes its own connection upon exit (handled in _worker's finally block).
+        # Unlinking is handled by CameraSystem.
+        # if self._ring_buffer:
+        #     print("Closing VideoEncoder's connection to Shared Ring Buffer...")
+        #     try:
+        #         # Main process doesn't need to close the buffer connection itself
+        #         # self._ring_buffer.close()
+        #         print("VideoEncoder main process does not need to close buffer connection.")
+        #     except Exception as e:
+        #         print(f"Error related to buffer in VideoEncoder stop: {e}")
+        #     finally:
+        #          # Keep the reference until the object is destroyed, worker might still need it briefly?
+        #          # Or set to None if certain worker is done. Let's clear it.
+        #          self._ring_buffer = None # Reset ring buffer reference in main process
 
         # Reset worker_ready event
         self._worker_ready.clear()

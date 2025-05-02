@@ -2,7 +2,7 @@ import numpy as np
 import mvsdk
 import platform
 
-FRAME_TIME=40
+FRAME_TIME=16.67
 
 def enumerate_cameras():
     # 枚举相机
@@ -28,6 +28,14 @@ class Camera(object):
         self.hCamera = 0
         self.cap = None
         self.pFrameBuffer = 0
+
+    @property
+    def width(self):
+        return self.cap.sResolutionRange.iWidthMax
+
+    @property
+    def height(self):
+        return self.cap.sResolutionRange.iHeightMax
 
     def open(self):
         if self.hCamera > 0:
