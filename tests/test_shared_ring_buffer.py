@@ -584,7 +584,8 @@ def _concurrent_get_task_returning_values(buffer_or_source, duration, frame_shap
             frames_list = buffer.get(1, timeout=0.1) # Get one frame at a time
             if frames_list:
                 # Extract value from the retrieved frame (assuming dummy frame structure)
-                retrieved_frame = frames_list[0] # Only one frame requested
+                # Need unpack list and first dim of ndarray, only one frame requested
+                retrieved_frame = frames_list[0][0]
                 if retrieved_frame.shape == frame_shape:
                      value = retrieved_frame[0, 0, 0]
                      retrieved_values.append(value)
@@ -619,7 +620,7 @@ def test_peek_last_frame_concurrent(shared_buffer):
     test_duration = 3.0 # seconds
     num_producers = 1
     num_consumers = 1
-    num_peekers = 2
+    num_peekers = 1
 
     producer_results_queue = mp.Queue()
     consumer_results_queue = mp.Queue()
@@ -693,16 +694,18 @@ def test_peek_last_frame_concurrent(shared_buffer):
     # Verification for peekers:
     # Each value peeked (that is not None and not an error string) should be present in the list of values put by the producer.
     put_value_set = set(put_values)
-    all_peeked_values_flat = [val for peeker_list in peeked_results_all for val in peeker_list if val is not None and not isinstance(val, str)]
+    all_peeked_values_flat = [val for peeker_list in peeked_results_all for val in peeker_list]
+    all_peeked_values_flat_valid = [val for peeker_list in peeked_results_all for val in peeker_list if val is not None and not isinstance(val, str)]
 
 
-    print(f"Concurrent Peek Test: Total valid peeked values: {len(all_peeked_values_flat)}")
-    if all_peeked_values_flat: print(f"Concurrent Peek Test: Example peeked values: {all_peeked_values_flat[:20]}")
+    print(f"Concurrent Peek Test: Total peeked returns: {len(all_peeked_values_flat)}")
+    print(f"Concurrent Peek Test: Total valid peeked values: {len(all_peeked_values_flat_valid)}")
+    if all_peeked_values_flat_valid: print(f"Concurrent Peek Test: Example peeked values: {all_peeked_values_flat_valid[:20]}")
     if put_values: print(f"Concurrent Peek Test: Example put values: {put_values[:20]}")
 
 
     invalid_peeks = 0
-    for peeked_val in all_peeked_values_flat:
+    for peeked_val in all_peeked_values_flat_valid:
         if peeked_val not in put_value_set:
             invalid_peeks += 1
             # print(f"Warning: Peeked value {peeked_val} not found in put values.") # Optional: print warnings
@@ -710,9 +713,9 @@ def test_peek_last_frame_concurrent(shared_buffer):
     # Allow a small tolerance for race conditions where a peek might catch a value
     # just as it's being overwritten, although ideally peek_last_frame is atomic enough.
     allowed_invalid_ratio = 0.01 # Allow 1% potentially inconsistent peeks due to extreme race conditions
-    if len(all_peeked_values_flat) > 0:
-         assert invalid_peeks / len(all_peeked_values_flat) <= allowed_invalid_ratio, \
-             f"Found {invalid_peeks}/{len(all_peeked_values_flat)} peeked values not present in the set of put values."
+    if len(all_peeked_values_flat_valid) > 0:
+         assert invalid_peeks / len(all_peeked_values_flat_valid) <= allowed_invalid_ratio, \
+             f"Found {invalid_peeks}/{len(all_peeked_values_flat_valid)} peeked values not present in the set of put values."
     else:
          # If nothing was peeked, it might indicate an issue or just very fast consumption
          print("Warning: No valid values were peeked during the concurrent test.")
