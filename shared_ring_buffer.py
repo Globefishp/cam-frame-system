@@ -346,7 +346,7 @@ class ProcessSafeSharedRingBuffer:
                 read_ptr, write_ptr, occupied_count, last_get_count = self._get_pointers_metadata()
         # RELEASE Lock when data is copying
         # Access the data buffer directly
-        data_buffer = np.ndarray(self._data_buffer_size, dtype=np.uint8, buffer=self._data_shm.buf)
+        data_buffer = np.ndarray(self._data_buffer_size, dtype=self._dtype, buffer=self._data_shm.buf)
         # print(data_buffer) # Debugging print
 
         # Calculate the slots, offsets, handling the case where write_ptr wraps around
@@ -441,7 +441,7 @@ class ProcessSafeSharedRingBuffer:
                 read_ptr, write_ptr, occupied_count, last_get_count = self._get_pointers_metadata()
 
         # Create a view of data buffer where further slicing occurs.
-        data_buffer = np.ndarray(self._data_buffer_size, dtype=np.uint8, buffer=self._data_shm.buf)
+        data_buffer = np.ndarray(self._data_buffer_size, dtype=self._dtype, buffer=self._data_shm.buf)
         # print(data_buffer) # Debugging print
         frames_list = []
 
