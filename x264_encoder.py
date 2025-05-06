@@ -28,10 +28,19 @@ class X264Encoder(BaseVideoEncoder):
         super().__init__(shared_buffer, output_path, batch_size=batch_size, **kwargs)
         # The following attributes should now be accessed from self._encoder_kwargs
         self._fps = kwargs.get('fps', 30)
-        self._bitrate = kwargs.get('bitrate', '800k')
+        self._threads = kwargs.get('threads', 0) # 0: all available threads
+        self._preset = kwargs.get('preset', 'fast') # 'ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow', 'placebo'
+
         self._frame_size = kwargs.get('frame_size') # Assuming frame_size is required and passed in kwargs
         if self._frame_size is None:
              raise ValueError("frame_size must be provided in kwargs")
+
+        self._crf = kwargs.get('crf')
+        self._bitrate = kwargs.get('bitrate')
+        if self._crf is None and self._bitrate is None:
+             print("Warning: Neither crf nor bitrate provided. Using default CRF 23.")
+             self._crf = 23 # 设置默认 CRF
+
         # Attribute to hold the FFmpeg process
         self._ffmpeg_process: Optional[subprocess.Popen] = None
         # Attributes to hold reader threads
@@ -126,6 +135,7 @@ class X264Encoder(BaseVideoEncoder):
         # Assuming BGR format from OpenCV, adjust if needed
         pixel_format = 'bgr24'
 
+        # Construct FFmpeg command with parameters
         ffmpeg_cmd = [
             ffmpeg_executable, # Use the determined ffmpeg executable path
             '-f', 'rawvideo',
@@ -135,11 +145,18 @@ class X264Encoder(BaseVideoEncoder):
             '-i', 'pipe:',
             '-c:v', 'libx264',
             '-preset', 'fast', # Example preset
-            '-crf', '23', # Example CRF
-            '-threads', '1', # Use all available threads
+            '-threads', str(self._threads),
             '-y', # Overwrite output file without asking
-            self._output_path
         ]
+
+        # Favour CRF first, then consider using bitrate.
+        if self._crf is not None:
+            ffmpeg_cmd.extend(['-crf', str(self._crf)])
+        elif self._bitrate is not None:
+            ffmpeg_cmd.extend(['-b:v', str(self._bitrate)])
+        # If neither is provided, use default CRF 23 (specified in __init__)
+
+        ffmpeg_cmd.append(self._output_path)
 
         print(f"X264Encoder worker ({mp.current_process().pid}): Starting FFmpeg with command: {' '.join(ffmpeg_cmd)}")
 
