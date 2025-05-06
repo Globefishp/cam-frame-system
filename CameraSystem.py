@@ -297,12 +297,12 @@ if __name__ == "__main__":
         video_encoder_config = {
             'output_path': 'output.mp4', # Example output path
             'batch_size': 30,
-            'fps': 1000 / FRAME_TIME, # Example FPS
-            'preset': 'placebo', 
+            'fps': camera.actual_fps, # Using camera's actual fps (greater than target fps)
+            'preset': 'fast', 
             'crf': 23, # Constant Rate Factor for quality, 23 is a good balance
             # 'bitrate': '800k', # if crf is not specified, can use bitrate instead
             'frame_size': main_frame_shape,
-            'threads': 1, # Using all available threads
+            'threads': 2, # Using all available threads
             # 'shared_buffer' will be added by CameraSystem.__init__
         }
 
