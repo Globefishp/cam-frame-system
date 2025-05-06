@@ -28,7 +28,8 @@ class Camera(object):
         self.hCamera = 0
         self.cap = None
         self.pFrameBuffer = 0
-        self.exposure_time_ms = exposure_time_ms # Store exposure time
+        self.target_exposure_time_ms = exposure_time_ms # Store target exposure time
+        self.acutal_exposure_time_ms = None # Store actual exposure time
         # Store other kwargs if needed, e.g., self.other_params = kwargs
 
     @property
@@ -42,12 +43,25 @@ class Camera(object):
     @property
     def target_fps(self) -> float:
         """Returns the target FPS based on exposure time."""
-        if self.exposure_time_ms > 0:
-            return 1000.0 / self.exposure_time_ms
+        if self.target_exposure_time_ms > 0:
+            return 1000.0 / self.target_exposure_time_ms
         else:
             # Return a default or raise an error if exposure time is invalid
             print("Warning: Invalid exposure_time_ms (<= 0), cannot calculate target_fps.")
             return 0.0 # Or raise ValueError("Exposure time must be positive")
+    @property
+    def actual_fps(self) -> float:
+        """Returns the actual FPS based on exposure time."""
+        if self.acutal_exposure_time_ms is not None and self.acutal_exposure_time_ms > 0:
+            return 1000.0 / self.acutal_exposure_time_ms
+        elif self.acutal_exposure_time_ms is None:
+            # Return 0.0 if actual exposure time is not yet available
+            raise ValueError("Unexpected error in actual_fps: acutal_exposure_time_ms is "
+                             "not initialized yet. Call open() before get actual_fps.")
+        else:
+            # Keep the ValueError for invalid positive exposure time
+            raise ValueError("Unexpected error in actual_fps: Actual exposure time must be positive")
+
 
     def open(self):
         if self.hCamera > 0:
@@ -86,7 +100,17 @@ class Camera(object):
         # 手动曝光
         mvsdk.CameraSetAeState(hCamera, 0)
         # 设置曝光时间
-        mvsdk.CameraSetExposureTime(hCamera, self.exposure_time_ms * 1000)
+        mvsdk.CameraSetExposureTime(hCamera, self.target_exposure_time_ms * 1000)
+        # 读取实际的曝光时间
+        self.acutal_exposure_time_ms = mvsdk.CameraGetExposureTime(hCamera) / 1000.0  # Convert to ms
+
+        try:
+            # 切换为手动白平衡
+            mvsdk.CameraSetWbMode(hCamera, 0)
+            # 设置一次白平衡
+            mvsdk.CameraSetOnceWB(hCamera)
+        except mvsdk.CameraException as e:
+            print("CameraSetOnceWB Failed({}): {}".format(e.error_code, e.message) )
 
         # 让SDK内部取图线程开始工作
         mvsdk.CameraPlay(hCamera)
