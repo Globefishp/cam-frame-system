@@ -49,7 +49,9 @@ class Camera(object):
 
 		# 手动曝光，曝光时间16.66ms
 		mvsdk.CameraSetAeState(hCamera, 0)
-		mvsdk.CameraSetExposureTime(hCamera, 5 * 1000)
+		mvsdk.CameraSetExposureTime(hCamera, 8.3333 * 1000)
+
+		print("CameraSetExposureTime: {}".format(mvsdk.CameraGetExposureTime(hCamera)) )
 
 		# 让SDK内部取图线程开始工作
 		mvsdk.CameraPlay(hCamera)
