@@ -622,6 +622,11 @@ class ProcessSafeSharedRingBuffer:
             count = occupied_count - last_get_count
             count = max(0, count) # Ensure non-negative
             return count
+    
+    @property
+    def buffer_capacity(self) -> int:
+        """Returns the total capacity of the buffer."""
+        return self._buffer_capacity
 
     @property
     def occupied_count_debug(self) -> int:
