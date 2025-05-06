@@ -2,7 +2,7 @@ import numpy as np
 import mvsdk
 import platform
 
-FRAME_TIME=16.67
+FRAME_TIME = 5
 
 def enumerate_cameras():
     # 枚举相机
@@ -22,12 +22,14 @@ def enumerate_cameras():
             cams.append(cam)
 
 class Camera(object):
-    def __init__(self, DevInfo):
+    def __init__(self, DevInfo, exposure_time_ms: float = FRAME_TIME, **kwargs): # Added **kwargs
         super(Camera, self).__init__()
         self.DevInfo = DevInfo
         self.hCamera = 0
         self.cap = None
         self.pFrameBuffer = 0
+        self.exposure_time_ms = exposure_time_ms # Store exposure time
+        # Store other kwargs if needed, e.g., self.other_params = kwargs
 
     @property
     def width(self):
@@ -36,6 +38,16 @@ class Camera(object):
     @property
     def height(self):
         return self.cap.sResolutionRange.iHeightMax
+
+    @property
+    def target_fps(self) -> float:
+        """Returns the target FPS based on exposure time."""
+        if self.exposure_time_ms > 0:
+            return 1000.0 / self.exposure_time_ms
+        else:
+            # Return a default or raise an error if exposure time is invalid
+            print("Warning: Invalid exposure_time_ms (<= 0), cannot calculate target_fps.")
+            return 0.0 # Or raise ValueError("Exposure time must be positive")
 
     def open(self):
         if self.hCamera > 0:
@@ -71,9 +83,10 @@ class Camera(object):
         # 相机模式切换成连续采集
         mvsdk.CameraSetTriggerMode(hCamera, 0)
 
-        # 手动曝光，曝光时间16.67ms
+        # 手动曝光
         mvsdk.CameraSetAeState(hCamera, 0)
-        mvsdk.CameraSetExposureTime(hCamera, FRAME_TIME * 1000)
+        # 设置曝光时间
+        mvsdk.CameraSetExposureTime(hCamera, self.exposure_time_ms * 1000)
 
         # 让SDK内部取图线程开始工作
         mvsdk.CameraPlay(hCamera)
