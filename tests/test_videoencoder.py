@@ -1,3 +1,6 @@
+# This test is obsolete because of the update of videoencoder.py.
+# Unit test for videoencoder.py is temporarily not available.
+
 import unittest
 import numpy as np
 import hashlib
