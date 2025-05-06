@@ -304,23 +304,39 @@ if __name__ == "__main__":
     duration_seconds = 5
     total_frames = fps * duration_seconds
     batch_size = 10 # Example batch size
+    buffer_capacity = batch_size * 2 # Example buffer capacity
 
-    # 1. 创建 X264Encoder 实例
-    encoder = X264Encoder(
-        output_path=output_file,
-        frame_size=(frame_height, frame_width, frame_channels),
-        fps=fps,
-        batch_size=batch_size # Pass batch_size to the encoder
-    )
-
+    # 1. 创建 ProcessSafeSharedRingBuffer 实例
+    print("Creating shared ring buffer...")
+    shared_buffer = None
     try:
-        # 2. 启动编码器工作进程
+        shared_buffer = ProcessSafeSharedRingBuffer(
+            create=True,
+            buffer_capacity=buffer_capacity,
+            frame_shape=(frame_height, frame_width, frame_channels),
+            dtype=np.uint8
+        )
+        print(f"Shared ring buffer created: Metadata SHM: {shared_buffer.metadata_name}, Data SHM: {shared_buffer.data_name}")
+
+        # 2. 创建 X264Encoder 实例，并传入共享缓冲区
+        print("Creating X264Encoder instance...")
+        encoder = X264Encoder(
+            shared_buffer=shared_buffer, # Pass the shared buffer instance
+            output_path=output_file,
+            frame_size=(frame_height, frame_width, frame_channels),
+            fps=fps,
+            batch_size=batch_size,
+            camera_fps=fps # Pass camera_fps for speed calculation in BaseVideoEncoder
+        )
+        print("X264Encoder instance created.")
+
+        # 3. 启动编码器工作进程
         print("Starting encoder...")
         encoder.start()
         print("Encoder started.")
 
-        # 3. 生成并提交帧数据
-        print(f"Generating and submitting {total_frames} frames...")
+        # 4. 生成帧并放入共享缓冲区
+        print(f"Generating and putting {total_frames} frames into the shared buffer...")
         for i in range(total_frames):
             # 生成一个简单的黑色帧 (height, width, channels)
             frame = np.zeros((frame_height, frame_width, frame_channels), dtype=np.uint8)
@@ -332,19 +348,46 @@ if __name__ == "__main__":
             y = (i * 3) % (frame_height - square_size)
             frame[y:y+square_size, x:x+square_size, :] = 255 # White square
 
-            encoder.submit_frame(frame)
-            # print(f"Submitted frame {i+1}/{total_frames}")
+            # 将帧放入共享缓冲区
+            # put 方法期望一个 shape 为 (frame_num, h, w, c) 的 numpy 数组
+            if not shared_buffer.put(np.expand_dims(frame, axis=0), timeout=1.0):
+                 print(f"Warning: Timeout putting frame {i+1} into buffer.")
+                 # Depending on test requirements, might break here or continue
 
             # 模拟实时帧率
             time.sleep(1.0 / fps)
 
-        print("Finished submitting frames.")
+        print(f"Finished putting frames into the buffer. Total frames: {i+1}")
 
     except Exception as e:
-        print(f"An error occurred during encoding: {e}")
+        print(f"An error occurred during the test: {e}")
 
     finally:
-        # 4. 停止编码器并等待完成
+        # 5. 停止编码器
         print("Stopping encoder...")
-        encoder.stop()
-        print(f"Encoder stopped. Output saved to {output_file}")
+        if 'encoder' in locals() and encoder:
+            encoder.stop()
+            # The encoder should process all remaining frames after stop and then exit.
+            print(f"Encoder stopped. Output saved to {output_file}")
+        else:
+            print("Encoder instance was not created due to an error.")
+        
+        print(f"There are {shared_buffer.unread_count} frames left in the buffer.")
+
+        # 6. 关闭并解除链接共享缓冲区
+        print("Cleaning up shared memory...")
+        if shared_buffer:
+            try:
+                 shared_buffer.close()
+            except Exception as e:
+                 print(f"Error closing buffer in main: {e}")
+            try:
+                 shared_buffer.unlink()
+            except Exception as e:
+                 print(f"Error unlinking buffer in main: {e}")
+        else:
+            print("Shared buffer instance was not created due to an error.")
+
+    print("Test finished.")
+
+# 获取总帧数：ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nokey=1:noprint_wrappers=1 test_x264_encoder.mp4
