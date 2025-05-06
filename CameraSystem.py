@@ -19,6 +19,8 @@ import time
 
 import mvsdk
 
+FRAME_TIME = 8.3333 # 5ms = 200fps, a temp control here
+
 class CameraSystem:
     """
     Manages camera frame capture, analysis, and video encoding using separate threads.
@@ -87,8 +89,20 @@ class CameraSystem:
         print("CameraSystem: Analyzer instantiated.")
 
         print("CameraSystem: Instantiating VideoEncoder...")
-        # Inject the created shared buffer into the video encoder config
-        encoder_final_config = {**video_encoder_config, 'shared_buffer': self.shared_buffer}
+        # Get camera's target FPS
+        try:
+            camera_fps = self.camera.target_fps
+            print(f"CameraSystem: Camera target FPS is {camera_fps:.2f}")
+        except AttributeError:
+            print("Warning: Camera object does not have target_fps attribute. Using 0.")
+            camera_fps = 0.0 # Default or handle error
+
+        # Inject the created shared buffer and camera FPS into the video encoder config
+        encoder_final_config = {
+            **video_encoder_config,
+            'shared_buffer': self.shared_buffer,
+            'camera_fps': camera_fps # Add camera_fps here
+        }
         self.video_encoder = VideoEncoderClass(**encoder_final_config)
         print("CameraSystem: VideoEncoder instantiated.")
 
@@ -105,7 +119,7 @@ class CameraSystem:
             True if successful, False if timeout or error occurred.
         """
         if not self.running.is_set() or self.shared_buffer is None:
-            # print("Warning: CameraSystem not running or buffer not initialized.") # Optional
+            print("Submitting frame failed: CameraSystem not running or buffer not initialized.") # Optional
             return False
 
         try:
@@ -113,7 +127,7 @@ class CameraSystem:
             frame_batch = np.expand_dims(frame, axis=0)
             success = self.shared_buffer.put(frame_batch, timeout=timeout)
             if not success:
-                print(f"Warning: Timeout ({timeout}s) submitting frame to shared buffer.")
+                print(f"Submitting frame failed: Timeout ({timeout}s) submitting frame to shared buffer.")
                 # Consider adding more robust error handling/logging here
             return success
         except Exception as e:
@@ -125,17 +139,17 @@ class CameraSystem:
         while self.running.is_set():
             frame = self.camera.grab()
             # The grab method returns a *view* of ndarray
+            # So that submit_frame should NOT block, ensuring no skipping frames.
             if frame is not None:
                 # Check if encoder is ready before submitting
                 # Add a small initial delay or check only after first few frames if needed
                 if self.video_encoder and not self.video_encoder.is_ready:
-                    print("Capture thread: Warning - VideoEncoder worker is not ready. Frame submitted but might fill buffer.")
+                    print("Capture thread: Warning - VideoEncoder worker is not ready. Frame will submit but might fill buffer.")
                     # Optionally, could skip submission or sleep briefly if encoder not ready
-
-                # Submit frame using the new method with timeout handling
-                if not self.submit_frame(frame):
+                
+                if not self.submit_frame(frame, timeout=FRAME_TIME / 1000):
                     # Handle submission failure (e.g., log, skip frame, slow down?)
-                    print("Capture thread: Failed to submit frame, buffer might be full or error occurred.")
+                    print("Capture thread: Failed to submit frame, buffer might be full or error occurred. Frame dropped.")
                     # Depending on requirements, might need to sleep or break here
                     # time.sleep(0.01) # Example: small sleep if buffer is full
 
@@ -201,35 +215,50 @@ class CameraSystem:
             thread.start()
 
     def stop(self):
-        """Stops the internal threads of the CameraSystem."""
+        """
+        Stops the internal threads (capture, snapshot) of the CameraSystem.
+        This does NOT clean up resources like the shared buffer. Call close() for that.
+        """
         if not self.running.is_set():
-            print("CameraSystem already stopped.")
+            print("CameraSystem internal threads already stopped.")
             return
-        print("Stopping CameraSystem threads...")
+        print("Stopping CameraSystem internal threads...")
         # Analyzer and VideoEncoder stop are managed externally
         self.running.clear()
+        # Wake up snapshot_thread if it's waiting on the condition
         with self.snapshot_condition:
-            self.snapshot_condition.notify_all() # Wake up snapshot_thread if waiting
-        print("Waiting for CameraSystem threads to join...")
-        for thread in self.thread_pool:
-            print(f"Joining {thread.name}...")
-            thread.join()
-            print(f"{thread.name} joined.")
-        self.thread_pool = [] # Clear thread pool
+            self.snapshot_condition.notify_all()
+        print("Waiting for CameraSystem internal threads to join...")
 
+        while self.thread_pool:
+            thread = self.thread_pool.pop()
+            print(f"Joining {thread.name}...")
+            thread.join() # the thread must join.
+            print(f"{thread.name} joined.")
+        # self.thread_pool should be empty now
+
+        print("CameraSystem internal threads stopped.")
+
+    def close(self):
+        """
+        Cleans up resources managed by CameraSystem, specifically the shared ring buffer.
+        Should be called after stop() and after external components using the buffer are stopped.
+        """
         # Clean up the shared buffer created by CameraSystem
         if self.shared_buffer:
-            print("Cleaning up CameraSystem's Shared Ring Buffer...")
+            print("Closing and unlinking CameraSystem's Shared Ring Buffer...")
             try:
                 self.shared_buffer.close() # Close connection first
                 self.shared_buffer.unlink() # Then unlink
-                print("CameraSystem's Shared Ring Buffer cleaned up.")
+                print("CameraSystem's Shared Ring Buffer closed and unlinked.")
             except Exception as e:
                 print(f"Error cleaning up CameraSystem's Shared Ring Buffer: {e}")
             finally:
                 self.shared_buffer = None # Clear reference
+        else:
+            print("CameraSystem shared buffer already cleaned up or was not initialized.")
 
-        print("CameraSystem stopped.")
+        print("CameraSystem closed.")
 
 
 if __name__ == "__main__":
@@ -243,7 +272,7 @@ if __name__ == "__main__":
     '''
     # 枚举相机并选择
     DevList = mvsdk.CameraEnumerateDevice()
-    camera = Camera(DevList[0])
+    camera = Camera(DevList[0], FRAME_TIME)
     camera.open()
     # Define configurations for components
     analyzer_config = {}
@@ -267,10 +296,13 @@ if __name__ == "__main__":
         }
         video_encoder_config = {
             'output_path': 'output.mp4', # Example output path
-            'fps': 25, # Example FPS
-            'bitrate': '800k', # Example bitrate
-            'batch_size': 10,
+            'batch_size': 30,
+            'fps': 1000 / FRAME_TIME, # Example FPS
+            'preset': 'placebo', 
+            'crf': 23, # Constant Rate Factor for quality, 23 is a good balance
+            # 'bitrate': '800k', # if crf is not specified, can use bitrate instead
             'frame_size': main_frame_shape,
+            'threads': 1, # Using all available threads
             # 'shared_buffer' will be added by CameraSystem.__init__
         }
 
@@ -310,7 +342,11 @@ if __name__ == "__main__":
         # --- Stop Components (Managed Externally) ---
         # Stop order: Analyzer and Encoder first, then CameraSystem threads & buffer cleanup
         if camera_system:
-            # 1. Stop Analyzer and Encoder processes first
+            # 1. Stop CameraSystem internal threads (capture/snapshot)
+            print("Stopping CameraSystem internal threads...")
+            camera_system.stop() # Stops capture/snapshot threads
+
+            # 2. Stop Analyzer and Encoder processes first
             if camera_system.analyzer:
                 print("Stopping Analyzer...")
                 camera_system.analyzer.stop()
@@ -318,13 +354,12 @@ if __name__ == "__main__":
                 print("Stopping VideoEncoder...")
                 camera_system.video_encoder.stop()
 
-            # 2. Stop CameraSystem internal threads (capture/snapshot)
-            #    and clean up the shared buffer
-            print("Stopping CameraSystem internal threads and cleaning buffer...")
-            camera_system.stop() # Stops threads, closes and unlinks buffer
+            # 3. Clean up CameraSystem resources (shared buffer)
+            print("Closing CameraSystem resources (shared buffer)...")
+            camera_system.close() # Closes and unlinks buffer
 
         # --- Close Camera ---
-        print("Closing camera...")
+        print("Closing camera hardware...")
         camera.close()
 
         print("System shutdown complete.")
