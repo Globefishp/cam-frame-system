@@ -5,6 +5,7 @@ import multiprocessing.synchronize as mp_sync
 import numpy as np
 from typing import Tuple, Any, Optional, List
 from shared_ring_buffer import ProcessSafeSharedRingBuffer # Import the ring buffer class
+import time # Import time for speed calculation and warning throttling
 
 class BaseVideoEncoder(abc.ABC):
     """
@@ -40,7 +41,7 @@ class BaseVideoEncoder(abc.ABC):
     @property
     def is_ready(self) -> bool:
         """Checks if the encoder worker process has signaled it's ready."""
-        return self._worker_ready.is_set()
+        return self._worker_ready.is_set() and self._running.is_set()
 
     # Read properties from the injected buffer if needed (optional)
     # Note: Accessing internal attributes like _frame_shape is generally discouraged.
@@ -108,6 +109,17 @@ class BaseVideoEncoder(abc.ABC):
         # Attach to the shared ring buffer in the worker process
         ring_buffer = ProcessSafeSharedRingBuffer(create=False, source_buffer=source_ring_buffer)
 
+        # --- Speed Calculation Initialization ---
+        camera_fps = self._encoder_kwargs.get('camera_fps', 0.0) # Get camera FPS from config
+        if camera_fps <= 0:
+            print(f"Warning: Invalid or missing 'camera_fps' ({camera_fps}) in encoder config. Speed warning disabled.")
+        frame_count_since_last_check = 0
+        time_last_check = time.monotonic()
+        last_warning_time = 0
+        warning_interval = 5.0 # Seconds between warnings
+        measurement_interval = 2.0 # Seconds over which to measure average speed
+        # --- End Speed Calculation Initialization ---
+
         self._worker_ready.clear() # Ensure not set initially
         try:
             # 1. Initialize the specific encoder (once per process)
@@ -154,8 +166,40 @@ class BaseVideoEncoder(abc.ABC):
 
                     # Encode the batch of frames
                     if frames_list: # Only call if frames were received (after handling underflow)
-                        # Blocking method, Pass the list of frame views
+                        # --- Calculate number of frames processed in this batch ---
+                        num_frames_processed = sum(arr.shape[0] for arr in frames_list)
+                        if num_frames_processed == 0:
+                            continue # Skip speed calc if no frames were actually processed
+
+                        # --- Blocking method, Pass the list of frame views ---
+                        encode_start_time = time.monotonic()
                         self._encode_frames(frames_list)
+                        encode_end_time = time.monotonic()
+
+                        # --- Update Speed Calculation ---
+                        frame_count_since_last_check += num_frames_processed
+                        current_time = time.monotonic()
+                        time_elapsed = current_time - time_last_check
+
+                        # Check speed periodically
+                        if time_elapsed >= measurement_interval:
+                            if camera_fps > 0: # Only calculate and warn if camera_fps is valid
+                                encoding_speed = frame_count_since_last_check / time_elapsed
+                                # print(f"Debug: Avg encoding speed over {time_elapsed:.2f}s: {encoding_speed:.2f} FPS") # Optional debug
+
+                                # Check if speed is low and issue warning (throttled)
+                                if encoding_speed < camera_fps and (current_time - last_warning_time) > warning_interval:
+                                    print(f"Warning: VideoEncoder ({mp.current_process().pid}) encoding speed ({encoding_speed:.2f} FPS) "
+                                          f"is lower than camera target FPS ({camera_fps:.2f}). Frames might be dropped after buffer filled.")
+                                    print(f"Warning: Current buffer load: {ring_buffer.unread_count} frames, "
+                                          f"{ring_buffer.unread_count / ring_buffer.buffer_capacity * 100:.2f}%")
+                                    last_warning_time = current_time
+
+                            # Reset for next measurement interval
+                            frame_count_since_last_check = 0
+                            time_last_check = current_time
+                        # --- End Speed Calculation ---
+
 
                 except Exception as e:
                     # Catch errors during frame batch processing, print and continue loop
