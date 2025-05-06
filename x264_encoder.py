@@ -144,7 +144,7 @@ class X264Encoder(BaseVideoEncoder):
             '-r', str(self._fps),
             '-i', 'pipe:',
             '-c:v', 'libx264',
-            '-preset', 'fast', # Example preset
+            '-preset', self._preset,
             '-threads', str(self._threads),
             '-y', # Overwrite output file without asking
         ]
