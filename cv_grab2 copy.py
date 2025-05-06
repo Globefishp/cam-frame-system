@@ -49,7 +49,7 @@ class Camera(object):
 
 		# 手动曝光，曝光时间16.66ms
 		mvsdk.CameraSetAeState(hCamera, 0)
-		mvsdk.CameraSetExposureTime(hCamera, 16.67 * 1000)
+		mvsdk.CameraSetExposureTime(hCamera, 5 * 1000)
 
 		# 让SDK内部取图线程开始工作
 		mvsdk.CameraPlay(hCamera)
@@ -118,7 +118,7 @@ def main_loop():
 				frame_count += 1
 				# frame = cv2.resize(frame, (640,480), interpolation = cv2.INTER_LINEAR)
 				# cv2.imshow("{} Press q to end".format(cam.DevInfo.GetFriendlyName()), frame)
-				# 可以达到60fps取帧，但是要仔细考量如何处理这些帧。如果处理过慢则会丢帧。
+				# 可以达到200fps取帧，但是要仔细考量如何处理这些帧。如果处理过慢则会丢帧。
 
 	time_end = time.time()
 	print("FPS: {}".format(frame_count / (time_end - time_start)))
