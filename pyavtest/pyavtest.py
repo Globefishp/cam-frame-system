@@ -5,7 +5,7 @@ import numpy as np
 output = av.open('output_lookahead.mkv', 'w')
 stream = output.add_stream('libx264', rate=30)  # 占位帧率（实际由时间戳控制）
 
-# 正确设置编码器参数（关键修改！）
+# 正确设置编码器参数（关键修改！）在这里貌似只能用stream.codec_context.options
 stream.codec_context.options = {
     'preset': 'fast',
     'crf': '23',

@@ -18,7 +18,7 @@ import time # Import time for the example
 # Confirming file state after user feedback
 class X264Encoder(BaseVideoEncoder):
     """
-    Concrete implementation of BaseVideoEncoder for x264 encoding using FFmpeg via pipe.
+    Concrete implementation of BaseVideoEncoder for x264 encoding using x264.exe via pipe.
     """
     def __init__(self,
                  shared_buffer: ProcessSafeSharedRingBuffer,
@@ -41,153 +41,178 @@ class X264Encoder(BaseVideoEncoder):
              print("Warning: Neither crf nor bitrate provided. Using default CRF 23.")
              self._crf = 23 # 设置默认 CRF
 
-        # Attribute to hold the FFmpeg process
-        self._ffmpeg_process: Optional[subprocess.Popen] = None
+        # Attribute to hold the x264 process
+        self._x264_process: Optional[subprocess.Popen] = None
         # Attributes to hold reader threads
         self._stdout_thread: Optional[threading.Thread] = None
         self._stderr_thread: Optional[threading.Thread] = None
-        # Attributes to hold ffmpeg finished signal 
-        self._ffmpeg_finished: Optional[threading.Event] = None
+        # Attributes to hold x264 finished signal 
+        self._x264_finished: Optional[threading.Event] = None
         # These threading obj is only accessible in the _worker process.
         # and should be initialized in the `_initialize_encoder` method.
 
 
     def _read_stdout(self):
-        """Reads stdout from the FFmpeg process in a separate thread."""
-        if self._ffmpeg_process and self._ffmpeg_process.stdout:
+        """Reads stdout from the x264 process in a separate thread."""
+        if self._x264_process and self._x264_process.stdout:
             print(f"X264Encoder worker ({mp.current_process().pid}): Starting stdout reader thread.")
             try:
                 # Read line by line while the process is running and encoder is active.
-                # Use a timeout to periodically check self._running.
-                # Note: Blocking readline is used here, relying on FFmpeg to produce output.
-                # A more robust solution for non-blocking reads might be needed for production.
-                while self._running.is_set() and self._ffmpeg_process.poll() is None:
-                    line = self._ffmpeg_process.stdout.readline().decode().strip()
+                # Note: Blocking readline is used here.
+                # Daemon threads do not respond the exit signal (self._running)
+                while self._x264_process.poll() is None:
+                    line = self._x264_process.stdout.readline().decode().strip()
                     if line:
                         # Process or log stdout line (e.g., for debugging)
-                        # print(f"FFmpeg stdout: {line}")
+                        # print(f"x264 stdout: {line}")
                         pass # Discard stdout for now
                     # Add a small sleep to prevent tight loop if no output
                     time.sleep(0.01)
+            
+                # After the process has ended, read any remaining output
+                if self._x264_process and self._x264_process.stdout:
+                    print(f"X264Encoder worker ({mp.current_process().pid}): x264 process ended, try reading remaining stdout.")
+                    for line_bytes in iter(self._x264_process.stdout.readline, b''): # b'' means EOF
+                        line = line_bytes.decode().strip()
+                        if line:
+                            # Process or log stdout line (e.g., for debugging)
+                            # print(f"x264 stdout: {line}")
+                            pass # Discard stdout for now
+                    print(f"X264Encoder worker ({mp.current_process().pid}): Finished reading remaining stdout.")
+            
             except Exception as e:
-                print(f"Error reading FFmpeg stdout: {e}")
+                print(f"Error reading x264 stdout: {e}")
             finally:
-                if self._ffmpeg_process and self._ffmpeg_process.stdout:
-                    self._ffmpeg_process.stdout.close()
+                if self._x264_process and self._x264_process.stdout:
+                    self._x264_process.stdout.close()
                 print(f"X264Encoder worker ({mp.current_process().pid}): Stdout reader thread exiting.")
 
 
     def _read_stderr(self):
-        """Reads stderr from the FFmpeg process in a separate thread."""
-        if self._ffmpeg_process and self._ffmpeg_process.stderr:
+        """Reads stderr from the x264 process in a separate thread."""
+        if self._x264_process and self._x264_process.stderr:
             print(f"X264Encoder worker ({mp.current_process().pid}): Starting stderr reader thread.")
             try:
                 # Read line by line while the process is running and encoder is active.
-                # Use a timeout to periodically check self._running.
                 # Note: Blocking readline is used here.
-                # A more robust solution for non-blocking reads might be needed for production.
-                while self._running.is_set() and self._ffmpeg_process.poll() is None:
-                    line = self._ffmpeg_process.stderr.readline().decode().strip()
+                # Daemon threads do not respond the exit signal (self._running)
+                while self._x264_process.poll() is None:
+                    line = self._x264_process.stderr.readline().decode().strip()
                     if line:
                         # Process or log stderr line (e.g., for progress or errors)
-                        print(f"FFmpeg stderr: {line}") # Keep printing stderr for now
-                        # Check for a message indicating FFmpeg has finished writing the file
-                        if "video:" in line and "audio:" in line and "subtitle:" in line and "other streams:" in line and "global headers:" in line and "muxing overhead:" in line:
-                             print(f"X264Encoder worker ({mp.current_process().pid}): Detected FFmpeg completion message.")
-                             self._ffmpeg_finished.set() # Signal that FFmpeg has finished
+                        print(f"x264 stderr: {line}") # Keep printing stderr for now
+                        # Check for a message indicating x264 has finished writing the file
+                        # Example: "x264 [info]: encoded 150 frames, 29.97 fps, 1000.00 kb/s"
+                        if "encoded " in line and " frames, " in line and " kb/s" in line:
+                             print(f"X264Encoder worker ({mp.current_process().pid}): Detected x264 completion message.")
+                             self._x264_finished.set() # Signal that x264 has finished
 
                     # Add a small sleep to prevent tight loop if no output
                     time.sleep(0.01)
+
+                # After the process has ended, read any remaining output
+                if self._x264_process and self._x264_process.stderr:
+                    print(f"X264Encoder worker ({mp.current_process().pid}): x264 process ended, try reading remaining stderr.")
+                    for line_bytes in iter(self._x264_process.stderr.readline, b''): # b'' means EOF
+                        line = line_bytes.decode().strip()
+                        if line:
+                            # Process or log stderr line (e.g., for progress or errors)
+                            print(f"x264 stderr: {line}") # Keep printing stderr for now
+                            # Check for a message indicating x264 has finished writing the file
+                            # Example: "x264 [info]: encoded 150 frames, 29.97 fps, 1000.00 kb/s"
+                            if "encoded " in line and " frames, " in line and " kb/s" in line:
+                                if not self._x264_finished.is_set(): # Avoid re-setting if already set
+                                    print(f"X264Encoder worker ({mp.current_process().pid}): Detected x264 completion message in remaining stderr.")
+                                    self._x264_finished.set() # Signal that x264 has finished
+                    print(f"X264Encoder worker ({mp.current_process().pid}): Finished reading remaining stderr.")
+
             except Exception as e:
-                print(f"Error reading FFmpeg stderr: {e}")
+                print(f"Error reading x264 stderr: {e}")
             finally:
-                if self._ffmpeg_process and self._ffmpeg_process.stderr:
-                    self._ffmpeg_process.stderr.close()
+                if self._x264_process and self._x264_process.stderr:
+                    self._x264_process.stderr.close()
                 print(f"X264Encoder worker ({mp.current_process().pid}): Stderr reader thread exiting.")
 
 
     def _initialize_encoder(self):
         """
-        Initializes the x264 encoder by starting an FFmpeg process.
+        Initializes the x264 encoder by starting an x264.exe process.
         This runs in the worker process.
         """
-        print(f"X264Encoder worker ({mp.current_process().pid}): Initializing x264 encoder...")
+        print(f"X264Encoder worker ({mp.current_process().pid}): Initializing x264 encoder (using x264.exe)...")
 
         # Initialize process-specific attributes (called in `_worker process`)
-        self._ffmpeg_finished = threading.Event() # Event to signal FFmpeg completion
+        self._x264_finished = threading.Event() # Event to signal x264 completion
 
         # Get the directory of the current script
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        # Construct the potential path to ffmpeg in the same directory
-        ffmpeg_path_in_dir = os.path.join(script_dir, 'ffmpeg.exe') # Assuming 'ffmpeg' executable name
+        # Construct the potential path to x264.exe in the same directory
+        x264_path_in_dir = os.path.join(script_dir, 'x264.exe')
 
-        # Check if ffmpeg exists in the script directory, otherwise rely on PATH
-        if os.path.exists(ffmpeg_path_in_dir):
-            ffmpeg_executable = ffmpeg_path_in_dir
-            print(f"X264Encoder worker ({mp.current_process().pid}): Found ffmpeg in script directory: {ffmpeg_executable}")
+        # Check if x264.exe exists in the script directory, otherwise rely on PATH
+        if os.path.exists(x264_path_in_dir):
+            x264_executable = x264_path_in_dir
+            print(f"X264Encoder worker ({mp.current_process().pid}): Found x264.exe in script directory: {x264_executable}")
         else:
-            ffmpeg_executable = 'ffmpeg' # Rely on system PATH
-            print(f"X264Encoder worker ({mp.current_process().pid}): ffmpeg not found in script directory, relying on system PATH.")
+            x264_executable = 'x264' # Rely on system PATH (Windows will append .exe if needed)
+            print(f"X264Encoder worker ({mp.current_process().pid}): x264.exe not found in script directory, relying on system PATH.")
 
-
-        # Build FFmpeg command line
+        # Build x264 command line
         height, width, channels = self._frame_size
-        # Assuming BGR format from OpenCV, adjust if needed
-        pixel_format = 'bgr24'
 
-        # Construct FFmpeg command with parameters
-        ffmpeg_cmd = [
-            ffmpeg_executable, # Use the determined ffmpeg executable path
-            '-f', 'rawvideo',
-            '-pix_fmt', pixel_format,
-            '-s', f'{width}x{height}',
-            '-r', str(self._fps),
-            '-i', 'pipe:',
-            '-c:v', 'libx264',
-            '-preset', self._preset,
-            '-threads', str(self._threads),
-            '-y', # Overwrite output file without asking
+        # Construct x264 command with parameters
+        x264_cmd = [
+            x264_executable,
+            '--input-res', f'{width}x{height}',
+            '--fps', str(self._fps),
+            '--input-csp', 'bgr',       # Input color space
+            '--demuxer', 'raw',         # Expect raw video frames
+            '-',                        # Input from stdin
+            '--preset', self._preset,
+            '--threads', str(self._threads),
+            # '--quiet', # Optional: to reduce console output from x264 if needed
         ]
 
         # Favour CRF first, then consider using bitrate.
         if self._crf is not None:
-            ffmpeg_cmd.extend(['-crf', str(self._crf)])
+            x264_cmd.extend(['--crf', str(self._crf)])
         elif self._bitrate is not None:
-            ffmpeg_cmd.extend(['-b:v', str(self._bitrate)])
+            # x264.exe expects bitrate in kbps
+            bitrate_kbps = int(self._bitrate) // 1000
+            x264_cmd.extend(['--bitrate', str(bitrate_kbps)])
         # If neither is provided, use default CRF 23 (specified in __init__)
 
-        ffmpeg_cmd.append(self._output_path)
+        x264_cmd.extend(['--output', self._output_path])
+        # x264.exe typically overwrites by default, no explicit -y needed.
 
-        print(f"X264Encoder worker ({mp.current_process().pid}): Starting FFmpeg with command: {' '.join(ffmpeg_cmd)}")
+        print(f"X264Encoder worker ({mp.current_process().pid}): Starting x264.exe with command: {' '.join(x264_cmd)}")
 
         try:
-            # Start the FFmpeg process with pipes for stdin, stdout, and stderr
-            self._ffmpeg_process = subprocess.Popen(
-                ffmpeg_cmd,
+            # Start the x264.exe process with pipes for stdin, stdout, and stderr
+            self._x264_process = subprocess.Popen(
+                x264_cmd,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+                stdout=subprocess.PIPE, # x264 might not output much to stdout when outputting to file
+                stderr=subprocess.PIPE  # x264 outputs progress/info to stderr
             )
-            print(f"X264Encoder worker ({mp.current_process().pid}): FFmpeg process started with PID {self._ffmpeg_process.pid}")
+            print(f"X264Encoder worker ({mp.current_process().pid}): x264.exe process started with PID {self._x264_process.pid}")
 
             # Start separate threads to continuously read stdout and stderr.
-            # This prevents the FFmpeg process from potential blocking if its output buffers fill up.
-            # Daemon threads will exit automatically when the main process exits.
             self._stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
             self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
             self._stdout_thread.start()
             self._stderr_thread.start()
 
         except FileNotFoundError:
-            # Handle the case where the ffmpeg executable is not found
-            print(f"FATAL: FFmpeg command not found. Please ensure FFmpeg is installed and in your system's PATH, or place 'ffmpeg' executable in the same directory as the script.")
-            self._ffmpeg_process = None
+            # Handle the case where the x264 executable is not found
+            print(f"FATAL: x264.exe command not found. Please ensure x264.exe is in your system's PATH, or place 'x264.exe' in the same directory as the script.")
+            self._x264_process = None
             raise # Re-raise the exception to indicate initialization failure
 
         except Exception as e:
             # Handle other potential errors during process startup
-            print(f"FATAL: Error starting FFmpeg process: {e}")
-            self._ffmpeg_process = None
+            print(f"FATAL: Error starting x264.exe process: {e}")
+            self._x264_process = None
             raise # Re-raise the exception to indicate initialization failure
 
 
@@ -207,73 +232,73 @@ class X264Encoder(BaseVideoEncoder):
         #      print(f"Warning: Received empty frames list or arrays with 0 frames in _encode_frames.")
         #      return
 
-        # Write each array in the list to FFmpeg process stdin
-        if self._ffmpeg_process and self._ffmpeg_process.stdin:
+        # Write each array in the list to x264 process stdin
+        if self._x264_process and self._x264_process.stdin:
             try:
                 for frame_array in frames:
                     # The pipe write is blocking, providing flow control.
-                    # This call will block if the pipe buffer is full until FFmpeg reads data.
-                    self._ffmpeg_process.stdin.write(frame_array.tobytes())
-                self._ffmpeg_process.stdin.flush()
-                # print(f"X264Encoder worker ({mp.current_process().pid}): Wrote {total_frames_in_batch} frames to FFmpeg.")
+                    # This call will block if the pipe buffer is full until x264 reads data.
+                    self._x264_process.stdin.write(frame_array.tobytes())
+                self._x264_process.stdin.flush()
+                # print(f"X264Encoder worker ({mp.current_process().pid}): Wrote {total_frames_in_batch} frames to x264.")
 
             except BrokenPipeError:
-                print(f"Error: FFmpeg process pipe is broken. It might have terminated unexpectedly.")
+                print(f"Error: x264.exe process pipe is broken. It might have terminated unexpectedly.")
                 # The worker loop in the base class will handle exiting if _running is cleared
             except Exception as e:
-                print(f"Error writing frame to FFmpeg process: {e}")
+                print(f"Error writing frame to x264.exe process: {e}")
                 # The worker loop in the base class will handle exiting if _running is cleared
 
         else:
-            print("Error: FFmpeg process or stdin pipe not available in _encode_frames.")
+            print("Error: x264.exe process or stdin pipe not available in _encode_frames.")
             # The worker loop in the base class will handle exiting if _running is cleared
 
 
     def _uninitialize_encoder(self):
         """
-        Uninitializes the x264 encoder by stopping the FFmpeg process and reader threads.
+        Uninitializes the x264 encoder by stopping the x264.exe process and reader threads.
         This runs in the worker process.
         """
-        print(f"X264Encoder worker ({mp.current_process().pid}): Uninitializing x264 encoder...")
+        print(f"X264Encoder worker ({mp.current_process().pid}): Uninitializing x264 encoder (x264.exe)...")
 
-        # Signal FFmpeg to finish by closing stdin
-        if self._ffmpeg_process and self._ffmpeg_process.stdin:
-            print(f"X264Encoder worker ({mp.current_process().pid}): Closing FFmpeg stdin to signal end of stream.")
+        # Signal x264.exe to finish by closing stdin
+        if self._x264_process and self._x264_process.stdin:
+            print(f"X264Encoder worker ({mp.current_process().pid}): Closing x264.exe stdin to signal end of stream.")
             try:
-                self._ffmpeg_process.stdin.close()
+                self._x264_process.stdin.close()
             except Exception as e:
-                print(f"Error closing FFmpeg stdin: {e}")
+                print(f"Error closing x264.exe stdin: {e}")
 
-        # Wait for FFmpeg to finish encoding gracefully, with a timeout
-        print(f"X264Encoder worker ({mp.current_process().pid}): Waiting for FFmpeg to finish encoding...")
-        finished_gracefully = self._ffmpeg_finished.wait(timeout=10.0) # Wait for up to 10 seconds
+        # Wait for x264.exe to finish encoding gracefully, with a timeout
+        print(f"X264Encoder worker ({mp.current_process().pid}): Waiting for x264.exe to finish encoding...")
+        finished_gracefully = self._x264_finished.wait(timeout=3.0) # Wait for up to 3 seconds
 
         if finished_gracefully:
-            print(f"X264Encoder worker ({mp.current_process().pid}): FFmpeg finished encoding gracefully.")
+            print(f"X264Encoder worker ({mp.current_process().pid}): x264.exe finished encoding gracefully (detected completion message).")
         else:
-            print(f"Warning: FFmpeg did not signal completion within timeout.")
+            print(f"Warning: x264.exe did not signal completion via stderr message within timeout, or process ended before message.")
 
-        # Wait for a while
-        time.sleep(2.0) # Give FFmpeg some time to finish writing the file
-        # This is just for debugging. will remove this sleep.
-        # Terminate FFmpeg process if it's still running
-        if self._ffmpeg_process and self._ffmpeg_process.poll() is None:
-            print(f"X264Encoder worker ({mp.current_process().pid}): Terminating FFmpeg process {self._ffmpeg_process.pid}...")
+        # Wait for a while (optional, x264 should flush on stdin close)
+        # time.sleep(0.5) # Give x264 some time to finish writing the file if needed
+
+        # Terminate x264.exe process if it's still running
+        if self._x264_process and self._x264_process.poll() is None:
+            print(f"X264Encoder worker ({mp.current_process().pid}): Terminating x264.exe process {self._x264_process.pid}...")
             try:
-                self._ffmpeg_process.terminate()
-                self._ffmpeg_process.wait(timeout=5.0) # Wait a bit for termination
-                print(f"X264Encoder worker ({mp.current_process().pid}): FFmpeg process terminated.")
+                self._x264_process.terminate()
+                self._x264_process.wait(timeout=5.0) # Wait a bit for termination
+                print(f"X264Encoder worker ({mp.current_process().pid}): x264.exe process terminated.")
             except subprocess.TimeoutExpired:
-                print(f"Warning: FFmpeg process {self._ffmpeg_process.pid} did not terminate gracefully. Killing.")
-                self._ffmpeg_process.kill()
+                print(f"Warning: x264.exe process {self._x264_process.pid} did not terminate gracefully. Killing.")
+                self._x264_process.kill()
             except Exception as e:
-                print(f"Error terminating FFmpeg process: {e}")
+                print(f"Error terminating x264.exe process: {e}")
             finally:
-                self._ffmpeg_process = None # Clear process reference
-        elif self._ffmpeg_process:
+                self._x264_process = None # Clear process reference
+        elif self._x264_process:
              # Process already exited, just clear reference
-             print(f"X264Encoder worker ({mp.current_process().pid}): FFmpeg process {self._ffmpeg_process.pid} already exited.")
-             self._ffmpeg_process = None
+             print(f"X264Encoder worker ({mp.current_process().pid}): x264.exe process {self._x264_process.pid} already exited.")
+             self._x264_process = None
 
 
         # Signal reader threads to stop and join them

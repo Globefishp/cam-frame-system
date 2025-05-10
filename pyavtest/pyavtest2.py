@@ -15,15 +15,18 @@ stream.width = frame_width
 stream.height = frame_height
 stream.pix_fmt = 'yuv420p'  # 常用像素格式
 
-# 正确设置编码器参数（关键修改！）
+# 正确设置编码器参数（关键修改！）（在这里，貌似stream.codec_context.options和stream.options都可以）
 stream.codec_context.options = {
     'preset': 'fast',
     'crf': '23',
-    'x264-params': f"rc_lookahead=10:bframes=3",  # 通过 x264-params 传递
+    "rc-lookahead": "50",  # 增加Lookahead
+    #'x264-params': f"rc_lookahead=10:bframes=3",  # 也可以通过 x264-params 传递
 }
+
 # 关键设置：禁用固定帧率假设
-stream.codec_context.time_base = av.time_base  # 默认微秒级（1/1000000）
-stream.avg_frame_rate = av.Rational(0, 1)     # 明确标记为可变帧率
+stream.codec_context.time_base = av.time_base  # time_base=Fraction(1000000, 1), 需要取反
+stream.codec_context.time_base = 1 / stream.codec_context.time_base # 使用默认微秒级时间基（1/1000000）
+stream.codec_context.framerate = 0  # 直接赋值为0表示可变帧率
 
 print("开始编码（观察Lookahead导致的延迟输出）...")
 for i in range(total_frames):

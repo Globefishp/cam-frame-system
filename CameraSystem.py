@@ -13,13 +13,15 @@ from shared_ring_buffer import ProcessSafeSharedRingBuffer
 # No longer need specific analyzer import here
 # from nnanalyzer import MySpecificNNAnalyzer
 from nnanalyzer import NNAnalyzer # 导入基类用于类型提示
-from videoencoder import BaseVideoEncoder, X264Encoder # Import video encoder classes
+from videoencoder import BaseVideoEncoder # , X264Encoder # Import video encoder classes
+from x264_encoder_x264 import X264Encoder # Import video encoder classes
 
 import time
 
 import mvsdk
 
 FRAME_TIME = 8.3333 # 5ms = 200fps, a temp control here
+# 此时encode出来的视频实际fps是120.061，但是实际（拍摄时钟）计算得到的fps是120.47，未知原因。
 
 class CameraSystem:
     """
@@ -137,7 +139,7 @@ class CameraSystem:
     def capture_thread(self):
         """Captures frames from the camera and submits them to the shared buffer."""
         while self.running.is_set():
-            frame = self.camera.grab()
+            frame, tc = self.camera.grab(tc=True)
             # The grab method returns a *view* of ndarray
             # So that submit_frame should NOT block, ensuring no skipping frames.
             if frame is not None:
