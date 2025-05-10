@@ -1,6 +1,7 @@
 import numpy as np
 import mvsdk
 import platform
+from typing import Optional, Tuple, Union
 
 FRAME_TIME = 5
 
@@ -128,7 +129,14 @@ class Camera(object):
         mvsdk.CameraAlignFree(self.pFrameBuffer)
         self.pFrameBuffer = 0
 
-    def grab(self):
+    def grab(self, tc: bool=False) -> Union[Optional[np.ndarray], Tuple[Optional[np.ndarray], Optional[int]]]:
+        '''
+        从相机取一帧图片
+        Args:
+            tc: 是否输出时间戳
+        
+        Return: 图片数据，numpy数组，如果有时间戳，返回的是一个tuple，第一个元素是图片数据，第二个元素是时间戳
+        '''
         # 从相机取一帧图片
         hCamera = self.hCamera
         pFrameBuffer = self.pFrameBuffer
@@ -147,8 +155,14 @@ class Camera(object):
             frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(pFrameBuffer)
             frame = np.frombuffer(frame_data, dtype=np.uint8)
             frame = frame.reshape((FrameHead.iHeight, FrameHead.iWidth, 1 if FrameHead.uiMediaType == mvsdk.CAMERA_MEDIA_TYPE_MONO8 else 3) )
-            return frame
+            if tc:
+                return frame, FrameHead.uiTimeStamp
+            else:
+                return frame
         except mvsdk.CameraException as e:
             if e.error_code != mvsdk.CAMERA_STATUS_TIME_OUT:
                 print("CameraGetImageBuffer failed({}): {}".format(e.error_code, e.message) )
-            return None
+            if tc:
+                return None, None
+            else:
+                return None
