@@ -15,6 +15,9 @@ import os # Import os for path manipulation
 # Removed select import as it's not reliable for pipes on Windows
 import time # Import time for the example
 
+# Import functions and constants for timecode extraction
+from huateng_camera_tc import extract_tc_from_frames, TIMECODE_DTYPE, APPENDED_ROWS_FOR_TIMECODE
+
 # Confirming file state after user feedback
 class X264Encoder(BaseVideoEncoder):
     """
@@ -48,6 +51,13 @@ class X264Encoder(BaseVideoEncoder):
         self._stderr_thread: Optional[threading.Thread] = None
         # Attributes to hold x264 finished signal 
         self._x264_finished: Optional[threading.Event] = None
+        
+        # Timecode related attributes
+        self._timecode_extraction_attempt_possible: bool = False # Determined in _initialize_encoder
+        self._last_timecode_value: Optional[int] = None # For future use: checking monotonicity
+        self._timecode_file: Optional[Any] = None # File object for writing timecodes
+        self._frame_count_for_timecode: int = 0 # Frame counter for timecode file
+
         # These threading obj is only accessible in the _worker process.
         # and should be initialized in the `_initialize_encoder` method.
 
@@ -143,6 +153,41 @@ class X264Encoder(BaseVideoEncoder):
 
         # Initialize process-specific attributes (called in `_worker process`)
         self._x264_finished = threading.Event() # Event to signal x264 completion
+        self._frame_count_for_timecode = 0 # Reset frame count for each new encoding session
+        self._timecode_extraction_attempt_possible = False # Default, will be set based on frame heights
+
+        # --- Frame Height Check & Timecode Possibility Detection ---
+        # This check is now done here, using self._ring_buffer which is available
+        # as BaseVideoEncoder._worker passes it to its own ring_buffer instance.
+        # However, self._ring_buffer in the child process is a *new* instance
+        # that connects to the *same* shared memory. So, its attributes like
+        # frame_shape are correctly reflecting the shared buffer's configuration.
+        if self._ring_buffer is None or self._ring_buffer.frame_shape is None:
+            raise RuntimeError("X264Encoder: Shared ring buffer or its frame_shape is not available in _initialize_encoder.")
+        
+        buffer_frame_height = self._ring_buffer.frame_shape[0]
+        original_height, original_width, channels = self._frame_size # Original image dimensions
+
+        if buffer_frame_height > original_height:
+            self._timecode_extraction_attempt_possible = True
+            actual_appended_rows = buffer_frame_height - original_height
+            print(f"X264Encoder worker ({mp.current_process().pid}): Buffer frames H ({buffer_frame_height}) > Original H ({original_height}). Timecode extraction will be attempted.")
+            if actual_appended_rows != APPENDED_ROWS_FOR_TIMECODE:
+                print(f"X264Encoder worker ({mp.current_process().pid}): WARNING - Actual appended rows in buffer ({actual_appended_rows}) "
+                      f"does not match expected ({APPENDED_ROWS_FOR_TIMECODE}). Timecode extraction might be unreliable.")
+        elif buffer_frame_height == original_height:
+            self._timecode_extraction_attempt_possible = False
+            print(f"X264Encoder worker ({mp.current_process().pid}): Buffer frames H ({buffer_frame_height}) == Original H ({original_height}). No timecode data expected.")
+        else: # buffer_frame_height < original_height
+            error_msg = (f"X264Encoder worker ({mp.current_process().pid}): CRITICAL ERROR - Buffer frame height ({buffer_frame_height}) "
+                         f"is less than configured original frame height ({original_height}). This indicates a configuration mismatch.")
+            print(error_msg)
+            raise ValueError(error_msg)
+        # --- End Frame Height Check ---
+
+        # Prepare timecode log file path
+        base_path, ext = os.path.splitext(self._output_path)
+        timecode_log_path = base_path + "_timecode.txt"
 
         # Get the directory of the current script
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -203,6 +248,16 @@ class X264Encoder(BaseVideoEncoder):
             self._stdout_thread.start()
             self._stderr_thread.start()
 
+            # Open timecode log file and write header
+            try:
+                self._timecode_file = open(timecode_log_path, 'w')
+                self._timecode_file.write("# timecode format v2\n") # Write header
+                print(f"X264Encoder worker ({mp.current_process().pid}): Timecode log file opened at {timecode_log_path} and header written.")
+            except IOError as e:
+                print(f"X264Encoder worker ({mp.current_process().pid}): CRITICAL ERROR - Failed to open timecode log file {timecode_log_path}: {e}")
+                self._timecode_file = None # Ensure it's None if open fails
+                # Encoding will proceed, but timecodes won't be logged.
+
         except FileNotFoundError:
             # Handle the case where the x264 executable is not found
             print(f"FATAL: x264.exe command not found. Please ensure x264.exe is in your system's PATH, or place 'x264.exe' in the same directory as the script.")
@@ -216,43 +271,110 @@ class X264Encoder(BaseVideoEncoder):
             raise # Re-raise the exception to indicate initialization failure
 
 
-    def _encode_frames(self, frames: List[np.ndarray]):
+    def _encode_frames(self, frames_list: List[np.ndarray]):
         """
-        Encodes a batch of frames using the initialized x264 encoder via pipe.
-        This runs in the worker process.
+        Encodes a list of frame chunks using the initialized x264 encoder.
+        Each chunk in the list is an np.ndarray of frames.
+        This method processes each chunk: extracts timecodes (if applicable),
+        writes timecodes to a log, and writes image data frame-by-frame to the
+        x264 process's stdin.
+
         Args:
-            frames: (List[np.ndarray[f,h,w,c]]), a list of input frames to encode.
+            frames_list (List[np.ndarray]): A list of np.ndarray objects.
+                Each np.ndarray has a shape like (num_frames_in_chunk, H_buffer, W, C),
+                where H_buffer is the height of frames from the shared buffer (potentially
+                including appended timecode data).
         """
-        if not frames:
-            return # Nothing to encode
+        if not frames_list: # Check if the list itself is empty
+            print(f"X264Encoder worker ({mp.current_process().pid}): Received empty frames list.")
+            return
 
-        # Calculate the total number of frames in the batch (for logging/debugging if needed)
-        # total_frames_in_batch = sum(arr.shape[0] for arr in frames)
-        # if total_frames_in_batch == 0:
-        #      print(f"Warning: Received empty frames list or arrays with 0 frames in _encode_frames.")
-        #      return
+        if not self._x264_process or not self._x264_process.stdin or self._x264_process.stdin.closed:
+            print(f"X264Encoder worker ({mp.current_process().pid}): Error - x264 process or stdin not available/closed.")
+            return
 
-        # Write each array in the list to x264 process stdin
-        if self._x264_process and self._x264_process.stdin:
+        original_height, original_width, channels = self._frame_size
+
+        for frame_chunk_arr in frames_list: # Iterate over each ndarray in the list
+            if frame_chunk_arr is None or frame_chunk_arr.size == 0:
+                print(f"X264Encoder worker ({mp.current_process().pid}): Received empty or None frame_chunk_arr in list.")
+                continue # Skip this chunk
+
+            image_data_chunk_to_encode = None
+            extracted_timecodes_for_chunk = None
+
+            if self._timecode_extraction_attempt_possible:
+                try:
+                    image_data_chunk_to_encode, extracted_timecodes_for_chunk = extract_tc_from_frames(
+                        combined_frames=frame_chunk_arr,
+                        original_height=original_height,
+                        original_width=original_width,
+                        channels=channels,
+                        timecode_dtype=TIMECODE_DTYPE,
+                        expected_appended_rows=APPENDED_ROWS_FOR_TIMECODE
+                    )
+                except ValueError as ve:
+                    print(f"X264Encoder worker ({mp.current_process().pid}): ValueError during TC extraction for chunk: {ve}.")
+                    image_data_chunk_to_encode = frame_chunk_arr[:, :original_height, :, :] # Fallback image data
+                    extracted_timecodes_for_chunk = None
+                except Exception as e_extract:
+                    print(f"X264Encoder worker ({mp.current_process().pid}): Unexpected error during TC extraction for chunk: {e_extract}.")
+                    image_data_chunk_to_encode = frame_chunk_arr[:, :original_height, :, :] # Fallback image data
+                    extracted_timecodes_for_chunk = None
+            else: # No TC extraction attempt possible (e.g., buffer_H == original_H)
+                  # In this case, frame_chunk_arr should already be (N, original_H, W, C)
+                image_data_chunk_to_encode = frame_chunk_arr
+                extracted_timecodes_for_chunk = None
+            
+            if image_data_chunk_to_encode is None: # Should not happen if logic above is correct
+                 print(f"X264Encoder worker ({mp.current_process().pid}): CRITICAL - image_data_chunk_to_encode is None. Skipping chunk.")
+                 continue
+
+            # --- Write Timecodes to Log File for this chunk ---
+            if self._timecode_file:
+                num_frames_in_this_chunk = image_data_chunk_to_encode.shape[0]
+                for i in range(num_frames_in_this_chunk):
+                    current_frame_abs_idx = self._frame_count_for_timecode # For logging message
+                    if extracted_timecodes_for_chunk is not None and i < len(extracted_timecodes_for_chunk):
+                        current_tc = extracted_timecodes_for_chunk[i]
+                        self._timecode_file.write(f"{current_tc}\n")
+                        
+                    # Optional: Monotonicity check
+                        if self._last_timecode_value is not None and current_tc < self._last_timecode_value:
+                            print(f"X264Encoder worker ({mp.current_process().pid}): Warning - Timecode non-monotonic. Frame {current_frame_abs_idx}. Prev: {self._last_timecode_value}, Curr: {current_tc}")
+                        self._last_timecode_value = current_tc
+                    else:
+                        self._timecode_file.write(f"Missing timecode for frame: {current_frame_abs_idx}\n")
+                    self._frame_count_for_timecode += 1 # Increment for each frame processed
+            
+            # --- Write Image Data for this chunk to x264 stdin (frame by frame) ---
             try:
-                for frame_array in frames:
-                    # The pipe write is blocking, providing flow control.
-                    # This call will block if the pipe buffer is full until x264 reads data.
-                    self._x264_process.stdin.write(frame_array.tobytes())
-                self._x264_process.stdin.flush()
-                # print(f"X264Encoder worker ({mp.current_process().pid}): Wrote {total_frames_in_batch} frames to x264.")
-
+                for frame_idx_in_chunk in range(image_data_chunk_to_encode.shape[0]):
+                    single_frame_view = image_data_chunk_to_encode[frame_idx_in_chunk]
+                    # Each single_frame_view from a slice of a C-contiguous array along the first axis
+                    # is typically C-contiguous. See `extract_tc_from_frames`.
+                    # No np.ascontiguousarray needed here.
+                    # Check in case the array is not C-contiguous (should not happen)
+                    if not single_frame_view.flags["C_CONTIGUOUS"]:
+                        raise ValueError(f"X264Encoder worker ({mp.current_process().pid}): Non-contiguous array encountered.")
+                    self._x264_process.stdin.write(single_frame_view.tobytes())
+                # Deliberately not flushing after every chunk from the list to batch writes a bit more.
+                # Will flush once after all chunks in frames_list are processed.
             except BrokenPipeError:
-                print(f"Error: x264.exe process pipe is broken. It might have terminated unexpectedly.")
-                # The worker loop in the base class will handle exiting if _running is cleared
+                print(f"X264Encoder worker ({mp.current_process().pid}): BrokenPipeError while writing frame data for a chunk. Stopping encoder.")
+                self._running.clear() # Signal worker to stop
+                return # Exit _encode_frames, further chunks in frames_list won't be processed
             except Exception as e:
-                print(f"Error writing frame to x264.exe process: {e}")
-                # The worker loop in the base class will handle exiting if _running is cleared
+                print(f"X264Encoder worker ({mp.current_process().pid}): Error writing frame data for a chunk: {e}. Stopping encoder.")
+                self._running.clear() # Signal worker to stop
+                return # Exit _encode_frames
 
-        else:
-            print("Error: x264.exe process or stdin pipe not available in _encode_frames.")
-            # The worker loop in the base class will handle exiting if _running is cleared
-
+        # Flush once after all chunks in frames_list have been processed and written
+        if self._x264_process and self._x264_process.stdin and not self._x264_process.stdin.closed:
+            try:
+                self._x264_process.stdin.flush()
+            except OSError as e: # Catch errors if stdin is already closed (e.g. BrokenPipe)
+                print(f"X264Encoder worker ({mp.current_process().pid}): Error flushing stdin (possibly already closed): {e}")
 
     def _uninitialize_encoder(self):
         """
@@ -268,6 +390,16 @@ class X264Encoder(BaseVideoEncoder):
                 self._x264_process.stdin.close()
             except Exception as e:
                 print(f"Error closing x264.exe stdin: {e}")
+
+        # Close the timecode log file if it was opened
+        if self._timecode_file:
+            print(f"X264Encoder worker ({mp.current_process().pid}): Closing timecode log file.")
+            try:
+                self._timecode_file.close()
+            except Exception as e:
+                print(f"X264Encoder worker ({mp.current_process().pid}): Error closing timecode log file: {e}")
+            finally:
+                self._timecode_file = None
 
         # Wait for x264.exe to finish encoding gracefully, with a timeout
         print(f"X264Encoder worker ({mp.current_process().pid}): Waiting for x264.exe to finish encoding...")
