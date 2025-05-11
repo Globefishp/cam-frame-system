@@ -1,0 +1,358 @@
+import numpy as np
+import mvsdk
+import platform
+from typing import Optional, Tuple
+import ctypes # For memmove
+from typing import Tuple
+
+FRAME_TIME = 5
+TIMECODE_DTYPE = np.dtype("uint32") # Use numpy dtype for timecode
+TIMECODE_BYTES = TIMECODE_DTYPE.itemsize # Get size in bytes from dtype
+APPENDED_ROWS_FOR_TIMECODE = 1 # Number of extra rows to append for storing metadata
+
+def extract_tc_from_frames(
+    combined_frames: np.ndarray,
+    original_height: int,
+    original_width: int,
+    channels: int,
+    timecode_dtype: np.dtype = TIMECODE_DTYPE
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    从包含嵌入时间码的帧数据中提取原始图像和时间码。
+    时间码数据附加在帧末尾，以小端字节序存储。
+
+    Args:
+        combined_frames: 包含原始图像数据和附加时间码的 NumPy 数组 (n, H+appended, W, C)。
+                         n 是帧的数量，H 是原始图像高度，W 是宽度，C 是通道数。
+        original_height: 原始图像的高度。
+        original_width: 原始图像的宽度。
+        channels: 图像的通道数。
+        timecode_dtype: 时间码的 NumPy 数据类型 (默认为 np.uint32)。
+
+    Returns:
+        一个元组，包含：
+        - 原始图像数据 (np.ndarray)，形状为 (n, H, W, C)。
+        - 提取到的时间码 (np.ndarray)，形状为 (n,)，数据类型为 timecode_dtype。
+    """
+    if combined_frames.ndim != 4 or combined_frames.shape[3] != channels:
+        raise ValueError("Invalid combined_frames shape. Expected (n, H+appended, W, C).")
+
+    n_frames, combined_height, width, _ = combined_frames.shape
+    timecode_bytes = timecode_dtype.itemsize
+
+    # 验证输入数组的高度是否与原始高度加上附加行一致
+    expected_combined_height = original_height + APPENDED_ROWS_FOR_TIMECODE
+    if combined_height != expected_combined_height:
+         raise ValueError(f"Combined frame height ({combined_height}) does not match expected height ({expected_combined_height}) based on original height ({original_height}).")
+
+    if width != original_width:
+        raise ValueError(f"Combined frame width ({width}) does not match original width ({original_width}).")
+
+    # 计算 timecode 所在的偏移量在每个展平的帧中
+    offset_in_flat_frame = original_height * original_width * channels
+
+    # 计算每个帧的总大小（包括附加行）
+    total_frame_size = combined_height * width * channels
+
+    # 检查每个帧的大小是否足够包含 timecode
+    if total_frame_size < offset_in_flat_frame + timecode_bytes:
+         raise ValueError(f"Each combined frame size ({total_frame_size}) is too small to extract timecode at offset {offset_in_flat_frame}.")
+
+    # 提取原始图像数据部分
+    original_images = combined_frames[:, :original_height, :, :]
+
+    # 提取时间码
+    # 计算 timecode 在每个展平的帧中的起始和结束索引
+    start_index = offset_in_flat_frame
+    end_index = offset_in_flat_frame + timecode_bytes
+
+    # 使用 NumPy 切片和 reshape 提取 timecode 字节
+    # 将形状从 (n, H+appended, W, C) 变为 (n, (H+appended)*W*C)
+    combined_frames_flat_per_frame = combined_frames.reshape(n_frames, -1)
+
+    # 提取 timecode 字节块 for each frame
+    timecode_batch = combined_frames_flat_per_frame[:, start_index:end_index]
+
+    # 将字节块转换为 uint32 整数数组 (小端字节序)
+    # 使用 frombuffer 和 dtype=np.uint32 可以高效地进行转换
+
+    # Reshape the byte array to (n_frames, timecode_bytes) and then view as uint32
+    # Use .ravel() instead of .flatten() to avoid creating a copy if possible
+    extracted_timecodes = timecode_batch.view(timecode_dtype).ravel()
+
+    return original_images, extracted_timecodes
+
+
+def enumerate_cameras():
+    # 枚举相机
+    DevList = mvsdk.CameraEnumerateDevice()
+    nDev = len(DevList)
+    if nDev < 1:
+        print("No camera was found!")
+        return
+
+    for i, DevInfo in enumerate(DevList):
+        print("{}: {} {}".format(i, DevInfo.GetFriendlyName(), DevInfo.GetPortType()))
+
+    cams = []
+    for i in map(lambda x: int(x), input("Select cameras: ").split()):
+        cam = Camera(DevList[i])
+        if cam.open():
+            cams.append(cam)
+
+class Camera(object):
+    """
+    华腾相机，本文件中的 Camera 类根据 open 函数的 tc 参数决定是否返回帧末尾追加时间码的图像。
+    如果启用时间码，时间码以 uint32 小端字节序存储，存储在图像的最后一行（Height）。
+    """
+    def __init__(self, DevInfo, exposure_time_ms: float = FRAME_TIME, tc: bool = False, **kwargs):
+        super(Camera, self).__init__()
+        self.DevInfo = DevInfo
+        self.hCamera = 0
+        self.cap = None # Camera capabilities
+        self.pFrameBuffer = 0 # Pointer to the allocated frame buffer memory
+
+        self.target_exposure_time_ms = exposure_time_ms
+        self.acutal_exposure_time_ms = None
+
+        # 图像维度和缓冲区大小
+        self.image_width = 0
+        self.image_height = 0
+        self.image_channels = 0
+        self.actual_image_buffer_size = 0 # Size in bytes for HxWxC image data
+        
+        self.appended_rows = APPENDED_ROWS_FOR_TIMECODE
+        self.new_frame_height = 0 # image_height + appended_rows
+        self.total_allocated_buffer_size = 0 # 包含追加时间码的大小 (H+appended_rows)xWxC
+        self._timecode_enabled = tc
+
+    @property
+    def width(self) -> int:
+        return self.image_width
+
+    @property
+    def height(self) -> int:
+        return self.image_height
+    
+    @property
+    def channels(self) -> int:
+        return self.image_channels
+
+    @property
+    def output_frame_height(self) -> int: # 包含附加行在内的缓冲区高度
+        return self.new_frame_height
+
+    @property
+    def timecode_enabled(self) -> bool:
+        """Returns whether timecode fusion is enabled."""
+        return self._timecode_enabled
+
+    @property
+    def target_fps(self) -> float:
+        """根据目标曝光时间返回目标 FPS。"""
+        if self.target_exposure_time_ms > 0:
+            return 1000.0 / self.target_exposure_time_ms
+        else:
+            # 如果曝光时间无效，返回默认值或引发错误
+            print("Warning: Invalid exposure_time_ms (<= 0), cannot calculate target_fps.")
+            return 0.0 # Or raise ValueError("Exposure time must be positive")
+    @property
+    def actual_fps(self) -> float:
+        """根据实际曝光时间返回实际 FPS。"""
+        if self.acutal_exposure_time_ms is not None and self.acutal_exposure_time_ms > 0:
+            return 1000.0 / self.acutal_exposure_time_ms
+        elif self.acutal_exposure_time_ms is None:
+            # 如果实际曝光时间尚未可用，返回 0.0
+            raise ValueError("Unexpected error in actual_fps: acutal_exposure_time_ms is "
+                             "not initialized yet. Call open() before get actual_fps.")
+        else:
+            # 保留针对无效正曝光时间的 ValueError
+            raise ValueError("Unexpected error in actual_fps: Actual exposure time must be positive")
+
+
+    def open(self):
+        if self.hCamera > 0:
+            return True
+
+        # 打开相机
+        hCamera = 0
+        try:
+            hCamera = mvsdk.CameraInit(self.DevInfo, -1, -1)
+        except mvsdk.CameraException as e:
+            print("CameraInit Failed({}): {}".format(e.error_code, e.message) )
+            return False
+
+        # 获取相机特性描述
+        cap = mvsdk.CameraGetCapability(hCamera)
+
+        # 判断是黑白相机还是彩色相机
+        monoCamera = (cap.sIspCapacity.bMonoSensor != 0)
+
+        # 黑白相机让ISP直接输出MONO数据，而不是扩展成R=G=B的24位灰度
+        if monoCamera:
+            mvsdk.CameraSetIspOutFormat(hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO8)
+        else:
+            mvsdk.CameraSetIspOutFormat(hCamera, mvsdk.CAMERA_MEDIA_TYPE_BGR8)
+
+        # 获取相机特性描述
+        cap = mvsdk.CameraGetCapability(hCamera)
+        self.cap = cap # 存储相机特性
+
+        # 判断是黑白相机还是彩色相机
+        monoCamera = (cap.sIspCapacity.bMonoSensor != 0)
+
+        # ------- 分配buffer --------
+        # 设置图像的原始维度
+        self.image_width = cap.sResolutionRange.iWidthMax
+        self.image_height = cap.sResolutionRange.iHeightMax
+        self.image_channels = 1 if monoCamera else 3
+        
+        self.actual_image_buffer_size = self.image_height * self.image_width * self.image_channels
+
+        if self._timecode_enabled:
+            print(f"Camera.open: Original image HxWxC = {self.image_height}x{self.image_width}x{self.image_channels}")
+            print(f"Camera.open: Appending {self.appended_rows} row(s) for metadata.")
+
+            # 计算新的帧高度和总缓冲区大小
+            self.new_frame_height = self.image_height + self.appended_rows
+            self.total_allocated_buffer_size = self.new_frame_height * self.image_width * self.image_channels
+
+            # 检查增加后的附加区域是否足够
+            appended_area_size = self.total_allocated_buffer_size - self.actual_image_buffer_size
+            if appended_area_size < TIMECODE_DTYPE.itemsize:
+                print(f"Error: Appended area size ({appended_area_size} bytes) is too small to store timecode ({TIMECODE_DTYPE.itemsize} bytes).")
+                print("Please increase APPENDED_ROWS_FOR_TIMECODE or ensure image dimensions provide enough space.")
+                return False
+
+            print(f"Camera.open: New buffer H'xWxC = {self.new_frame_height}x{self.image_width}x{self.image_channels}")
+            print(f"Camera.open: Allocating total buffer size = {self.total_allocated_buffer_size} bytes.")
+
+            buffer_size_to_allocate = self.total_allocated_buffer_size
+        else:
+            # If timecode is not enabled, allocate only the original image buffer size
+            print(f"Camera.open: Timecode disabled. Allocating original image buffer size: {self.actual_image_buffer_size} bytes.")
+            self.new_frame_height = self.image_height # New frame height is just original height
+            self.total_allocated_buffer_size = self.actual_image_buffer_size # Total allocated is just original size
+            buffer_size_to_allocate = self.actual_image_buffer_size
+
+
+        # 黑白相机让ISP直接输出MONO数据，而不是扩展成R=G=B的24位灰度
+        if monoCamera:
+            mvsdk.CameraSetIspOutFormat(hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO8)
+        else:
+            mvsdk.CameraSetIspOutFormat(hCamera, mvsdk.CAMERA_MEDIA_TYPE_BGR8)
+
+        # 分配足够大的RGB buffer (图像 + 附加行 或 仅图像)
+        pFrameBuffer = mvsdk.CameraAlignMalloc(buffer_size_to_allocate, 16)
+
+        # (可选测试) 用模式填充附加行区域，以检查 SDK 对大于实际帧大小的缓冲区行为。
+        # 这有助于验证 CameraImageProcess 只写入缓冲区头部的图像部分。
+        # 仅在启用时间码时执行此填充
+        if self._timecode_enabled:
+            fill_pattern = 0xAA
+            appended_area_offset = self.actual_image_buffer_size
+            appended_area_size = self.total_allocated_buffer_size - self.actual_image_buffer_size # Recalculate for clarity
+            if appended_area_size > 0:
+                print(f"Camera.open: Filling appended area (offset: {appended_area_offset}, size: {appended_area_size} bytes) with pattern {hex(fill_pattern)} for testing.")
+                ctypes.memset(pFrameBuffer + appended_area_offset, fill_pattern, appended_area_size)
+        
+
+        # 相机模式切换成连续采集
+        mvsdk.CameraSetTriggerMode(hCamera, 0)
+
+        # 手动曝光
+        mvsdk.CameraSetAeState(hCamera, 0)
+        # 设置曝光时间
+        mvsdk.CameraSetExposureTime(hCamera, self.target_exposure_time_ms * 1000)
+        # 读取实际的曝光时间
+        self.acutal_exposure_time_ms = mvsdk.CameraGetExposureTime(hCamera) / 1000.0  # Convert to ms
+
+        # 切换为手动白平衡
+        mvsdk.CameraSetWbMode(hCamera, 0)
+        # 设置一次白平衡
+        mvsdk.CameraSetOnceWB(hCamera)
+
+        # 重置时间戳
+        mvsdk.CameraRstTimeStamp(hCamera)
+
+        # 让SDK内部取图线程开始工作
+        mvsdk.CameraPlay(hCamera)
+
+        self.hCamera = hCamera
+        self.pFrameBuffer = pFrameBuffer
+        # self.cap is already set
+        return True
+
+    def close(self):
+        if self.hCamera > 0:
+            mvsdk.CameraUnInit(self.hCamera)
+            self.hCamera = 0
+
+        if self.pFrameBuffer != 0: # Check if buffer was allocated
+            mvsdk.CameraAlignFree(self.pFrameBuffer)
+            self.pFrameBuffer = 0
+
+    def grab(self) -> Optional[np.ndarray]:
+        '''
+        抓取一帧。
+        如果 open 时 tc=True，则将时间码嵌入预分配缓冲区的附加行中，
+        并返回整个缓冲区的 NumPy 数组视图，重塑为 (H+appended, W, C)。
+        时间码 (uint32) 写入附加行区域的开头，little-endian。
+        时间码单位为 0.1ms，最大能记录119h。
+        如果 open 时 tc=False，则返回原始图像数据 (H, W, C)。
+        '''
+        if self.hCamera == 0 or self.pFrameBuffer == 0:
+            print("Error: Camera not opened or buffer not allocated.")
+            if self._timecode_enabled:
+                return None # Or return None, None if changing return type
+            else:
+                return None
+
+        hCamera = self.hCamera
+        pFrameBuffer = self.pFrameBuffer
+
+        try:
+            pRawData, FrameHead = mvsdk.CameraGetImageBuffer(hCamera, 200)
+            mvsdk.CameraImageProcess(hCamera, pRawData, pFrameBuffer, FrameHead)
+            mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
+
+            if platform.system() == "Windows":
+                # windows下取到的图像数据是上下颠倒的，以BMP格式存放。转换成opencv则需要上下翻转成正的
+                # linux下直接输出正的，不需要上下翻转
+                mvsdk.CameraFlipFrameBuffer(pFrameBuffer, FrameHead, 1)
+
+            if self._timecode_enabled:
+                # 将时间码嵌入保留空间 (附加行的开头)
+                timecode_value = FrameHead.uiTimeStamp # 这是 uint32
+                timecode_as_bytes = timecode_value.to_bytes(TIMECODE_BYTES, byteorder='little')
+
+                # 附加行数据起始位置的偏移量
+                timecode_write_offset = self.actual_image_buffer_size
+
+                # 写入时间码字节流
+                ctypes.memmove(pFrameBuffer + timecode_write_offset, timecode_as_bytes, TIMECODE_BYTES)
+
+                # Create a NumPy view of the entire buffer (image data + appended row(s) with timecode)
+                combined_data_ctypes = (mvsdk.c_ubyte * self.total_allocated_buffer_size).from_address(pFrameBuffer)
+                combined_frame_np_flat = np.frombuffer(combined_data_ctypes, dtype=np.uint8)
+
+                # Reshape to (H+appended, W, C)
+                output_frame = combined_frame_np_flat.reshape((self.new_frame_height, self.image_width, self.image_channels))
+
+                return output_frame
+            else:
+                # If timecode is not enabled, return the original image data
+                frame_data = (mvsdk.c_ubyte * self.actual_image_buffer_size).from_address(pFrameBuffer)
+                frame = np.frombuffer(frame_data, dtype=np.uint8)
+                frame = frame.reshape((self.image_height, self.image_width, self.image_channels))
+                return frame
+
+
+        except mvsdk.CameraException as e:
+            if e.error_code != mvsdk.CAMERA_STATUS_TIME_OUT:
+                print(f"Camera GetImageBuffer/Process failed ({e.error_code}): {e.message}")
+            if self._timecode_enabled:
+                return None # Or return None, None if changing return type
+            else:
+                return None
+
