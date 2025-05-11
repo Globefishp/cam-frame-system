@@ -32,6 +32,7 @@ class Camera(object):
         self.target_exposure_time_ms = exposure_time_ms # Store target exposure time
         self.acutal_exposure_time_ms = None # Store actual exposure time
         # Store other kwargs if needed, e.g., self.other_params = kwargs
+        self.frames_captured = 0 
 
     @property
     def width(self):
@@ -155,6 +156,8 @@ class Camera(object):
             frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(pFrameBuffer)
             frame = np.frombuffer(frame_data, dtype=np.uint8)
             frame = frame.reshape((FrameHead.iHeight, FrameHead.iWidth, 1 if FrameHead.uiMediaType == mvsdk.CAMERA_MEDIA_TYPE_MONO8 else 3) )
+
+            self.frames_captured += 1
             if tc:
                 return frame, FrameHead.uiTimeStamp
             else:

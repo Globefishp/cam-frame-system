@@ -138,6 +138,7 @@ class Camera(object):
         self.hCamera = 0
         self.cap = None # Camera capabilities
         self.pFrameBuffer = 0 # Pointer to the allocated frame buffer memory
+        self.frames_captured = 0 # stats for debug
 
         self.target_exposure_time_ms = exposure_time_ms
         self.acutal_exposure_time_ms = None
@@ -366,12 +367,15 @@ class Camera(object):
                 # Reshape to (H+appended, W, C)
                 output_frame = combined_frame_np_flat.reshape((self.new_frame_height, self.image_width, self.image_channels))
 
+                self.frames_captured += 1
                 return output_frame
             else:
                 # If timecode is not enabled, return the original image data
                 frame_data = (mvsdk.c_ubyte * self.actual_image_buffer_size).from_address(pFrameBuffer)
                 frame = np.frombuffer(frame_data, dtype=np.uint8)
                 frame = frame.reshape((self.image_height, self.image_width, self.image_channels))
+
+                self.frames_captured += 1
                 return frame
 
 
