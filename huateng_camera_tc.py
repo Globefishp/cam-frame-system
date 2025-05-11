@@ -15,11 +15,13 @@ def extract_tc_from_frames(
     original_height: int,
     original_width: int,
     channels: int,
-    timecode_dtype: np.dtype = TIMECODE_DTYPE
-) -> Tuple[np.ndarray, np.ndarray]:
+    timecode_dtype: np.dtype = TIMECODE_DTYPE,
+    expected_appended_rows: int = APPENDED_ROWS_FOR_TIMECODE
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     从包含嵌入时间码的帧数据中提取原始图像和时间码。
     时间码数据附加在帧末尾，以小端字节序存储。
+    如果无法提取时间码，则时间码部分返回 None。
 
     Args:
         combined_frames: 包含原始图像数据和附加时间码的 NumPy 数组 (n, H+appended, W, C)。
@@ -31,56 +33,81 @@ def extract_tc_from_frames(
 
     Returns:
         一个元组，包含：
-        - 原始图像数据 (np.ndarray)，形状为 (n, H, W, C)。
-        - 提取到的时间码 (np.ndarray)，形状为 (n,)，数据类型为 timecode_dtype。
+        - 原始图像数据 (np.ndarray)，形状为 (n, H, W, C) 或 (n, combined_H, W, C) 如果 combined_H < H。
+        - 提取到的时间码 (Optional[np.ndarray])，形状为 (n,)，数据类型为 timecode_dtype，如果无法提取则为 None。
     """
     if combined_frames.ndim != 4 or combined_frames.shape[3] != channels:
-        raise ValueError("Invalid combined_frames shape. Expected (n, H+appended, W, C).")
+        raise ValueError(f"Invalid combined_frames shape. Expected (n, H+appended, W, C), got {combined_frames.shape} with channels {channels}.")
 
     n_frames, combined_height, width, _ = combined_frames.shape
     timecode_bytes = timecode_dtype.itemsize
 
-    # 验证输入数组的高度是否与原始高度加上附加行一致
-    expected_combined_height = original_height + APPENDED_ROWS_FOR_TIMECODE
-    if combined_height != expected_combined_height:
-         raise ValueError(f"Combined frame height ({combined_height}) does not match expected height ({expected_combined_height}) based on original height ({original_height}).")
+    # 始终尝试提取原始图像部分，即使高度可能不符合预期
+    # 如果 combined_height 小于 original_height，我们仍然提取到 combined_height
+    # 这意味着图像数据可能不完整，但函数会返回它所拥有的。
+    # 调用者应该意识到这一点。
+    actual_original_height_to_slice = min(original_height, combined_height)
+    original_images = combined_frames[:, :actual_original_height_to_slice, :, :]
 
     if width != original_width:
+        # 宽度不匹配是更严重的问题，通常表明数据源配置错误
         raise ValueError(f"Combined frame width ({width}) does not match original width ({original_width}).")
 
-    # 计算 timecode 所在的偏移量在每个展平的帧中
-    offset_in_flat_frame = original_height * original_width * channels
+    if combined_height < original_height:
+        print(f"Warning in extract_tc_from_frames: Combined frame height ({combined_height}) is less than original height ({original_height}). "
+              f"Image data may be incomplete. No timecode can be extracted.")
+        return original_images, None
 
-    # 计算每个帧的总大小（包括附加行）
-    total_frame_size = combined_height * width * channels
+    if combined_height == original_height:
+        # print(f"Debug in extract_tc_from_frames: Combined frame height ({combined_height}) is equal to original height ({original_height}). "
+        #       f"No appended data for timecode.")
+        return original_images, None
 
-    # 检查每个帧的大小是否足够包含 timecode
-    if total_frame_size < offset_in_flat_frame + timecode_bytes:
-         raise ValueError(f"Each combined frame size ({total_frame_size}) is too small to extract timecode at offset {offset_in_flat_frame}.")
+    # At this point, combined_height > original_height, so there are appended rows.
+    actual_appended_rows = combined_height - original_height
+    if actual_appended_rows != expected_appended_rows:
+        print(f"Warning in extract_tc_from_frames: Actual appended rows ({actual_appended_rows}) "
+              f"does not match expected ({expected_appended_rows}). "
+              f"Will attempt to read TC from the expected location in the first appended row.")
+    
+    # 计算每个完整帧（包括所有附加行）的总字节大小
+    # total_bytes_per_combined_frame = combined_height * width * channels
+    
+    # 检查是否有足够的空间来读取一个时间码（从 offset_in_flat_frame 开始）
+    # 我们需要至少 timecode_bytes 的数据在 original_height * width * channels 之后。
+    # 附加区域的实际大小是 (combined_height - original_height) * width * channels
+    bytes_in_first_appended_row_segment = original_width * channels # 假设时间码在第一行的开头
+    if bytes_in_first_appended_row_segment < timecode_bytes:
+        print(f"Warning in extract_tc_from_frames: The first appended row segment (width*channels = {bytes_in_first_appended_row_segment} bytes) "
+              f"is too small to contain timecode ({timecode_bytes} bytes). Cannot extract timecode.")
+        return original_images, None
 
-    # 提取原始图像数据部分
-    original_images = combined_frames[:, :original_height, :, :]
+    try:
+        # 提取时间码
+        # 时间码位于原始图像数据之后，即在 combined_frames[n, original_height, 0:timecode_bytes_in_row, 0]
+        # 我们需要从每个帧的附加数据中 (索引 original_height:) 的开头提取 timecode_bytes。
+        
+        # 获取所有帧的所有附加数据
+        appended_data = combined_frames[:, original_height:, :, :] # Shape: (n, appended_rows, W, C)
+        
+        # 将每个帧的所有附加数据展平，并只取前面的部分，确保不会超出 timecode_bytes
+        # 将附加数据明确地转换为 uint8 类型视图，以便按字节处理
+        appended_data_uint8_view = appended_data.view(np.uint8)
 
-    # 提取时间码
-    # 计算 timecode 在每个展平的帧中的起始和结束索引
-    start_index = offset_in_flat_frame
-    end_index = offset_in_flat_frame + timecode_bytes
+        # Reshape the uint8 view to (n_frames, total_appended_bytes_per_frame) to easily slice the first timecode_bytes
+        appended_data_flat_uint8 = appended_data_uint8_view.reshape(n_frames, -1)
 
-    # 使用 NumPy 切片和 reshape 提取 timecode 字节
-    # 将形状从 (n, H+appended, W, C) 变为 (n, (H+appended)*W*C)
-    combined_frames_flat_per_frame = combined_frames.reshape(n_frames, -1)
+        # Slice the bytes for the timecode
+        timecode_byte_batch = appended_data_flat_uint8[:, :timecode_bytes] # Shape: (n, timecode_bytes)
 
-    # 提取 timecode 字节块 for each frame
-    timecode_batch = combined_frames_flat_per_frame[:, start_index:end_index]
+        # 将字节块转换为指定 dtype 的整数数组 (小端字节序)
+        extracted_timecodes = timecode_byte_batch.view(timecode_dtype).ravel() # .ravel() to make it (n,)
 
-    # 将字节块转换为 uint32 整数数组 (小端字节序)
-    # 使用 frombuffer 和 dtype=np.uint32 可以高效地进行转换
+        return original_images, extracted_timecodes
 
-    # Reshape the byte array to (n_frames, timecode_bytes) and then view as uint32
-    # Use .ravel() instead of .flatten() to avoid creating a copy if possible
-    extracted_timecodes = timecode_batch.view(timecode_dtype).ravel()
-
-    return original_images, extracted_timecodes
+    except Exception as e:
+        print(f"Error during timecode extraction in extract_tc_from_frames: {e}")
+        return original_images, None
 
 
 def enumerate_cameras():
@@ -355,4 +382,3 @@ class Camera(object):
                 return None # Or return None, None if changing return type
             else:
                 return None
-
