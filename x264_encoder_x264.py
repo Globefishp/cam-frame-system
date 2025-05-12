@@ -33,6 +33,7 @@ class X264Encoder(BaseVideoEncoder):
         self._fps = kwargs.get('fps', 30)
         self._threads = kwargs.get('threads', 0) # 0: all available threads
         self._preset = kwargs.get('preset', 'fast') # 'ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow', 'placebo'
+        self._rc_lookahead = kwargs.get('rc_lookahead', None) 
 
         self._frame_size = kwargs.get('frame_size') # Assuming frame_size is required and passed in kwargs
         if self._frame_size is None:
@@ -54,12 +55,16 @@ class X264Encoder(BaseVideoEncoder):
         
         # Timecode related attributes
         self._timecode_extraction_attempt_possible: bool = False # Determined in _initialize_encoder
+        self._timecode_timebase = kwargs.get('timebase', None) 
         self._last_timecode_value: Optional[int] = None # For future use: checking monotonicity
+        self._timecode_log_path: Optional[str] = None # File path for timecode logging.
         self._timecode_file: Optional[Any] = None # File object for writing timecodes
         self._frame_count_for_timecode: int = 0 # Frame counter for timecode file
 
         # These threading obj is only accessible in the _worker process.
         # and should be initialized in the `_initialize_encoder` method.
+
+        self._encoder_intermediates: Optional[str] = None # Intermediate file path for x264 encoder.
 
 
     def _read_stdout(self):
@@ -156,7 +161,7 @@ class X264Encoder(BaseVideoEncoder):
         self._frame_count_for_timecode = 0 # Reset frame count for each new encoding session
         self._timecode_extraction_attempt_possible = False # Default, will be set based on frame heights
 
-        # --- Frame Height Check & Timecode Possibility Detection ---
+        # --- Frame Height Check & Timecode Detection ---
         # This check is now done here, using self._ring_buffer which is available
         # as BaseVideoEncoder._worker passes it to its own ring_buffer instance.
         # However, self._ring_buffer in the child process is a *new* instance
@@ -183,11 +188,13 @@ class X264Encoder(BaseVideoEncoder):
                          f"is less than configured original frame height ({original_height}). This indicates a configuration mismatch.")
             print(error_msg)
             raise ValueError(error_msg)
-        # --- End Frame Height Check ---
+        # --- End Timecode Detection ---
 
         # Prepare timecode log file path
         base_path, ext = os.path.splitext(self._output_path)
-        timecode_log_path = base_path + "_timecode.txt"
+        self._timecode_log_path = base_path + "_timecode.txt"
+        self._encoder_intermediates = base_path + "_noTC.mp4"
+        
 
         # Get the directory of the current script
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -226,8 +233,11 @@ class X264Encoder(BaseVideoEncoder):
             bitrate_kbps = int(self._bitrate) // 1000
             x264_cmd.extend(['--bitrate', str(bitrate_kbps)])
         # If neither is provided, use default CRF 23 (specified in __init__)
+        
+        if self._rc_lookahead is not None:
+            x264_cmd.extend(['--rc-lookahead', str(self._rc_lookahead)])
 
-        x264_cmd.extend(['--output', self._output_path])
+        x264_cmd.extend(['--output', self._encoder_intermediates])
         # x264.exe typically overwrites by default, no explicit -y needed.
 
         print(f"X264Encoder worker ({mp.current_process().pid}): Starting x264.exe with command: {' '.join(x264_cmd)}")
@@ -250,11 +260,11 @@ class X264Encoder(BaseVideoEncoder):
 
             # Open timecode log file and write header
             try:
-                self._timecode_file = open(timecode_log_path, 'w')
+                self._timecode_file = open(self._timecode_log_path, 'w')
                 self._timecode_file.write("# timecode format v2\n") # Write header
-                print(f"X264Encoder worker ({mp.current_process().pid}): Timecode log file opened at {timecode_log_path} and header written.")
+                print(f"X264Encoder worker ({mp.current_process().pid}): Timecode log file opened at {self._timecode_log_path} and header written.")
             except IOError as e:
-                print(f"X264Encoder worker ({mp.current_process().pid}): CRITICAL ERROR - Failed to open timecode log file {timecode_log_path}: {e}")
+                print(f"X264Encoder worker ({mp.current_process().pid}): CRITICAL ERROR - Failed to open timecode log file {self._timecode_log_path}: {e}")
                 self._timecode_file = None # Ensure it's None if open fails
                 # Encoding will proceed, but timecodes won't be logged.
 
@@ -337,7 +347,9 @@ class X264Encoder(BaseVideoEncoder):
                     current_frame_abs_idx = self._frame_count_for_timecode # For logging message
                     if extracted_timecodes_for_chunk is not None and i < len(extracted_timecodes_for_chunk):
                         current_tc = extracted_timecodes_for_chunk[i]
-                        self._timecode_file.write(f"{current_tc}\n")
+                        # Rescale tc in timebase to ms(float) for timecode format v2
+                        current_tc_ms = current_tc * 1000.0 / self._timecode_timebase
+                        self._timecode_file.write(f"{current_tc_ms}\n")
                         
                     # Optional: Monotonicity check
                         if self._last_timecode_value is not None and current_tc < self._last_timecode_value:
@@ -403,7 +415,7 @@ class X264Encoder(BaseVideoEncoder):
 
         # Wait for x264.exe to finish encoding gracefully, with a timeout
         print(f"X264Encoder worker ({mp.current_process().pid}): Waiting for x264.exe to finish encoding...")
-        finished_gracefully = self._x264_finished.wait(timeout=3.0) # Wait for up to 3 seconds
+        finished_gracefully = self._x264_finished.wait(timeout=2.0) # Wait for up to 2 seconds
 
         if finished_gracefully:
             print(f"X264Encoder worker ({mp.current_process().pid}): x264.exe finished encoding gracefully (detected completion message).")
@@ -449,7 +461,53 @@ class X264Encoder(BaseVideoEncoder):
                  print("Warning: Stderr reader thread did not exit gracefully.")
             self._stderr_thread = None
 
+        self._mux_timecode(tc_file=self._timecode_log_path, mp4_file=self._encoder_intermediates, out_file=self._output_path)
+
         print(f"X264Encoder worker ({mp.current_process().pid}): X264 encoder uninitialized.")
+    
+    def _mux_timecode(self, tc_file, mp4_file, out_file) -> bool:
+        """
+        Muxes the timecode file with the encoded video file using mp4fpsmod.
+        """
+        print(f"X264Encoder worker ({mp.current_process().pid}): Starting timecode muxing with mp4fpsmod...")
+        # Get the directory of the current script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        mp4fpsmod_path_in_dir = os.path.join(script_dir, 'mp4fpsmod.exe')
+
+        if os.path.exists(mp4fpsmod_path_in_dir):
+            mp4fpsmod_executable = mp4fpsmod_path_in_dir
+            print(f"X264Encoder worker ({mp.current_process().pid}): Found mp4fpsmod.exe in script directory: {mp4fpsmod_executable}")
+        else:
+            mp4fpsmod_executable = 'mp4fpsmod' # Rely on system PATH (Windows will append .exe if needed)
+            print(f"X264Encoder worker ({mp.current_process().pid}): mp4fpsmod.exe not found in script directory, relying on system PATH.")
+        try:
+            # Run mp4fpsmod to mux the timecode file with the encoded video file
+            mp4fpsmod_cmd = [
+                mp4fpsmod_executable,
+                '-c', # fix non-zero of timecode head
+                '-t', tc_file,  # Timecode file path
+                '-o', out_file,  # Output file path
+                mp4_file,  # Input video file path
+            ]
+            print(f"X264Encoder worker ({mp.current_process().pid}): Running mp4fpsmod with command: {' '.join(mp4fpsmod_cmd)}")
+            subprocess.run(mp4fpsmod_cmd, check=True)
+            print(f"X264Encoder worker ({mp.current_process().pid}): Timecode muxing completed successfully.")
+        except subprocess.CalledProcessError as e:
+            print(f"X264Encoder worker ({mp.current_process().pid}): Error running mp4fpsmod: {e}")
+            print(f"X264Encoder worker ({mp.current_process().pid}): mp4fpsmod stderr: {e.stderr.decode()}")
+            # raise  # Re-raise the exception to indicate muxing failure
+            return False
+        except FileNotFoundError:
+            # Handle the case where the mp4fpsmod executable is not found
+            print(f"FATAL: mp4fpsmod command not found. Please ensure mp4fpsmod.exe is in your system's PATH, or place 'mp4fpsmod.exe' in the same directory as the script.")
+            # raise  # Re-raise the exception to indicate initialization failure
+            return False
+        except Exception as e:
+            # Handle other potential errors during muxing
+            print(f"FATAL: Error running mp4fpsmod: {e}")
+            # raise  # Re-raise the exception to indicate muxing failure
+            return False
+        return True
 
 
 if __name__ == "__main__":
@@ -586,6 +644,9 @@ if __name__ == "__main__":
         """A mock object for ProcessSafeSharedRingBuffer for isolated testing."""
         def __init__(self):
             pass
+        @property
+        def frame_shape(self):
+            return (frame_height, frame_width, frame_channels)
 
     mock_shared_buffer = MockSharedRingBuffer()
 
