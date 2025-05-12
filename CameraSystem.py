@@ -7,7 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from collections import deque
 from typing import List, Optional, Any, Type # Import Type for class hints
 
-from huateng_camera import Camera
+from huateng_camera_tc import Camera
 # from ringbuffer import RingBuffer # No longer needed
 from shared_ring_buffer import ProcessSafeSharedRingBuffer
 # No longer need specific analyzer import here
@@ -60,23 +60,34 @@ class CameraSystem:
 
         # --- Create Shared Buffer ---
         try:
-            width = self.camera.width
-            height = self.camera.height
-            frame_shape = (height, width, 3) # Assuming 3 channels
+            original_width = self.camera.width
+            original_height = self.camera.height # This is the original image height
+            # Get the output frame height from the camera, which includes appended rows for timecode
+            output_frame_height = self.camera.output_frame_height 
+            channels = self.camera.channels # Assuming camera provides channels, else default to 3
+            
+            # frame_shape for the shared buffer should use the full output height
+            frame_shape_for_buffer = (output_frame_height, original_width, channels)
             dtype = np.uint8 # Assuming uint8
-            print(f"CameraSystem: Determined frame shape {frame_shape}, dtype {dtype}")
-        except AttributeError:
-            print("Warning: Camera object does not provide shape/dtype info. Using defaults.")
-            frame_shape = (1024, 1280, 3) # Default
-            dtype = np.uint8
-            print(f"CameraSystem: Using default frame shape {frame_shape}, dtype {dtype}")
+            # print(f"CameraSystem: Original image HxWxC: {original_height}x{original_width}x{channels}")
+            # print(f"CameraSystem: Output frame H'xWxC (with timecode space): {output_frame_height}x{original_width}x{channels}")
+            print(f"CameraSystem: Determined frame shape for shared buffer: {frame_shape_for_buffer}, dtype {dtype}")
 
-        print(f"CameraSystem: Creating Shared Ring Buffer (capacity: {buffer_capacity}, shape: {frame_shape}, dtype: {dtype})...")
+        except AttributeError as e:
+            print(f"Warning: Camera object missing attributes (width, height, output_frame_height, or channels): {e}. Using defaults.")
+            # Define defaults if camera attributes are not available
+            original_width, original_height, output_frame_height, channels = 1280, 1024, 1025, 3
+            frame_shape_for_buffer = (output_frame_height, original_width, channels)
+            dtype = np.uint8
+            print(f"CameraSystem: Using default frame shape for shared buffer {frame_shape_for_buffer}, dtype {dtype}")
+
+
+        print(f"CameraSystem: Creating Shared Ring Buffer (capacity: {buffer_capacity}, shape: {frame_shape_for_buffer}, dtype: {dtype})...")
         try:
             self.shared_buffer = ProcessSafeSharedRingBuffer(
                 create=True,
                 buffer_capacity=buffer_capacity,
-                frame_shape=frame_shape,
+                frame_shape=frame_shape_for_buffer, # Use the correctly determined shape
                 dtype=dtype
             )
             print("CameraSystem: Shared Ring Buffer created.")
@@ -94,16 +105,38 @@ class CameraSystem:
         # Get camera's target FPS
         try:
             camera_fps = self.camera.target_fps
-            print(f"CameraSystem: Camera target FPS is {camera_fps:.2f}")
+            try: 
+                camera_actual_fps = self.camera.actual_fps
+                print(f"CameraSystem: Camera target FPS is {camera_fps:.2f}, actual FPS is {camera_actual_fps:.2f}. Using actual FPS.")
+                camera_fps = camera_actual_fps # Use actual FPS if available
+            except AttributeError:
+                print(f"CameraSystem: Camera target FPS is {camera_fps:.2f}, actual FPS is unknown. Using target FPS.")
         except AttributeError:
             print("Warning: Camera object does not have target_fps attribute. Using 0.")
             camera_fps = 0.0 # Default or handle error
 
-        # Inject the created shared buffer and camera FPS into the video encoder config
+        # Get timebase for timecode from the camera.
+        try:
+            timebase = self.camera.timecode_timebase # This should be a float or int representing timebase.
+            print(f"CameraSystem: Camera timebase is {timebase}.")
+        except AttributeError:
+            print("Warning: Camera object does not have timebase attribute. Using 10000.")
+            timebase = 10000 # Default or handle error
+        
+        # The 'frame_size' passed to VideoEncoderClass should be the ORIGINAL image size,
+        # as the encoder itself will handle stripping any appended data like timecodes.
+        # This was already handled in the __main__ example, but good to be explicit.
+        # We assume video_encoder_config already contains the original 'frame_size'.
+        # If not, it should be added here based on self.camera.height, self.camera.width.
+        # For now, we trust it's correctly set by the caller or in __main__.
+
+        # Inject the created shared buffer, camera FPS and timebase of timecode
+        # into the video encoder config
         encoder_final_config = {
-            **video_encoder_config,
+            **video_encoder_config, # This should contain 'frame_size' as original dimensions
             'shared_buffer': self.shared_buffer,
-            'camera_fps': camera_fps # Add camera_fps here
+            'camera_fps': camera_fps,
+            'timebase': timebase,
         }
         self.video_encoder = VideoEncoderClass(**encoder_final_config)
         print("CameraSystem: VideoEncoder instantiated.")
@@ -139,17 +172,18 @@ class CameraSystem:
     def capture_thread(self):
         """Captures frames from the camera and submits them to the shared buffer."""
         while self.running.is_set():
-            frame, tc = self.camera.grab(tc=True)
+            # huateng_camera_tc.Camera.grab() returns a single frame with timecode appended
+            combined_frame = self.camera.grab() 
             # The grab method returns a *view* of ndarray
             # So that submit_frame should NOT block, ensuring no skipping frames.
-            if frame is not None:
+            if combined_frame is not None:
                 # Check if encoder is ready before submitting
                 # Add a small initial delay or check only after first few frames if needed
                 if self.video_encoder and not self.video_encoder.is_ready:
                     print("Capture thread: Warning - VideoEncoder worker is not ready. Frame will submit but might fill buffer.")
                     # Optionally, could skip submission or sleep briefly if encoder not ready
                 
-                if not self.submit_frame(frame, timeout=FRAME_TIME / 1000):
+                if not self.submit_frame(combined_frame, timeout=FRAME_TIME / 1000): # Submit the combined frame
                     # Handle submission failure (e.g., log, skip frame, slow down?)
                     print("Capture thread: Failed to submit frame, buffer might be full or error occurred. Frame dropped.")
                     # Depending on requirements, might need to sleep or break here
@@ -176,8 +210,23 @@ class CameraSystem:
                     continue
 
                 # Submit the frame copy to the analyzer
-                # print(f"Snapshot thread: Submitting frame {analysis_frame.shape}") # Debug info
-                self.analyzer.submit_frame(analysis_frame)
+                # The analysis_frame contains the timecode. Analyzer needs to handle it or it needs to be stripped here.
+                # Assuming analyzer_config['frame_size'] is original, we should strip timecode here.
+                try:
+                    original_height = self.camera.height # Original height without timecode
+                    if analysis_frame.shape[0] > original_height:
+                        image_for_analyzer = analysis_frame[:original_height, :, :]
+                        # print(f"Snapshot thread: Submitting stripped frame {image_for_analyzer.shape} to analyzer.") # Debug
+                        self.analyzer.submit_frame(image_for_analyzer)
+                    else: # Frame is already original size or smaller (error?)
+                        # print(f"Snapshot thread: Submitting frame {analysis_frame.shape} (as-is or error) to analyzer.") # Debug
+                        self.analyzer.submit_frame(analysis_frame) # Submit as-is if no appended data detected
+                except AttributeError:
+                    print("Snapshot thread: Warning - Camera object missing 'height' attribute. Submitting frame as-is.")
+                    self.analyzer.submit_frame(analysis_frame) # Fallback
+                except Exception as e:
+                    print(f"Snapshot thread: Error preparing frame for analyzer: {e}. Submitting as-is.")
+                    self.analyzer.submit_frame(analysis_frame) # Fallback
 
     # encode_thread is removed. VideoEncoder worker reads directly from shared_buffer.
 
@@ -274,38 +323,50 @@ if __name__ == "__main__":
     '''
     # 枚举相机并选择
     DevList = mvsdk.CameraEnumerateDevice()
-    camera = Camera(DevList[0], FRAME_TIME)
-    camera.open()
+    if not DevList:
+        print("No cameras found. Exiting test.")
+        exit()
+    # Use huateng_camera_tc.Camera which appends timecode
+    camera = Camera(DevList[0], exposure_time_ms=FRAME_TIME, tc=True) # Use exposure_time_ms as per huateng_camera_tc
+    if not camera.open():
+        print("Failed to open camera. Exiting test.")
+        exit()
+
     # Define configurations for components
     analyzer_config = {}
     video_encoder_config = {}
     camera_system = None # Initialize camera_system to None
 
     try:
-        # --- Determine Frame Shape (once) ---
+        # --- Determine Original Frame Shape (for config) ---
         try:
-            width = camera.width
-            height = camera.height
-            main_frame_shape = (height, width, 3)
+            original_width = camera.width
+            original_height = camera.height # This is the original image height
+            channels = camera.channels
+            original_frame_shape = (original_height, original_width, channels)
+            print(f"CameraSystem __main__: Original camera frame HxWxC: {original_height}x{original_width}x{channels}")
         except AttributeError:
-            print("Warning: Camera object does not provide shape info for main. Using defaults.")
-            main_frame_shape = (1024, 1280, 3) # Default
+            print("CameraSystem __main__: Warning: Camera object does not provide full shape info. Using defaults for config.")
+            original_height, original_width, channels = 1024, 1280, 3
+            original_frame_shape = (original_height, original_width, channels) # Default
 
         # --- Prepare Configurations ---
+        # Analyzer expects original frame size
         analyzer_config = {
             'model_path': 'example_path', # TODO: Use actual config
-            'frame_size': main_frame_shape
+            'frame_size': original_frame_shape 
         }
+        # VideoEncoder also expects original frame size in its config
         video_encoder_config = {
             'output_path': 'output.mp4', # Example output path
             'batch_size': 30,
-            'fps': camera.actual_fps, # Using camera's actual fps (greater than target fps)
+            'fps': camera.actual_fps, 
             'preset': 'fast', 
-            'crf': 23, # Constant Rate Factor for quality, 23 is a good balance
-            # 'bitrate': '800k', # if crf is not specified, can use bitrate instead
-            'frame_size': main_frame_shape,
-            'threads': 2, # Using all available threads
-            # 'shared_buffer' will be added by CameraSystem.__init__
+            'crf': 23, 
+            'frame_size': original_frame_shape, # IMPORTANT: This is the ORIGINAL frame size
+            'threads': 2, 
+            'rc_lookahead': 60,
+            # 'shared_buffer' and 'camera_fps' will be added by CameraSystem.__init__
         }
 
         # --- Create CameraSystem (which creates components and buffer) ---
@@ -361,6 +422,7 @@ if __name__ == "__main__":
             camera_system.close() # Closes and unlinks buffer
 
         # --- Close Camera ---
+        print(f"Camera got {camera.frames_captured} frames in total.")
         print("Closing camera hardware...")
         camera.close()
 
