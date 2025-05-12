@@ -174,6 +174,11 @@ class Camera(object):
     def timecode_enabled(self) -> bool:
         """Returns whether timecode fusion is enabled."""
         return self._timecode_enabled
+    
+    @property
+    def timecode_timebase(self) -> int:
+        """Returns the timebase (denominator) for timecode. 1/timebase = time per tick."""
+        return 10000 # 0.1ms
 
     @property
     def target_fps(self) -> float:
