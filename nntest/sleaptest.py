@@ -11,7 +11,11 @@ import matplotlib
 import matplotlib.pyplot as plt
 import time # for profiling
 
+
+start_time = time.time()
 model = tf.keras.models.load_model('nntest/best_model.h5', compile=False)
+load_time = time.time() - start_time
+print(f'Load time: {load_time:.3f}s')
 
 # Profile the model inference time.
 start_time = time.time()
@@ -38,6 +42,8 @@ for i in range(10):
     predict_time_again = time.time() - start_time
     print(f'Inference time again: {predict_time_again:.3f}s')
 
+# Post-processing: find local peak
+
 plt.figure(figsize=(10, 6))
 plt.subplot(1, 2, 1)
 plt.imshow(out[0])
@@ -51,3 +57,5 @@ plt.show()
 # Preprocessing 16 ms, First Inference 170 ms, 
 # Subsequent Inference 90 ms.
 # TODO: test post-processing time.
+
+# 60fps x264 encoding would not affect the inference time.
