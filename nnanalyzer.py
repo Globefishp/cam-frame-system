@@ -44,7 +44,7 @@ class NNAnalyzer(abc.ABC):
     #     pass
 
     @abc.abstractmethod
-    def _initialize_worker(self):
+    def _initialize_analyzer(self):
         """
         Initialize the worker process. This method MUST be implemented by
         subclasses and is called once when the worker process starts.
@@ -54,7 +54,7 @@ class NNAnalyzer(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def analyze(self, frame: np.ndarray) -> Any:
+    def _analyze(self, frame: np.ndarray) -> Any:
         """
         Analyze the frame using the specific NN model.
         This method MUST be implemented by subclasses.
@@ -64,22 +64,32 @@ class NNAnalyzer(abc.ABC):
             Analysis result.
         """
         raise NotImplementedError
+    
+    @abc.abstractmethod
+    def _uninitialize_analyzer(self):
+        """
+        Uninitialize the analyzer. This method MUST be implemented by
+        subclasses and is called once when the worker process ends. 
+        It should handle any cleanup tasks, and be a blocking function.
+        """
+        raise NotImplementedError
+
 
     def submit_frame(self, frame: np.ndarray):
         """
         Submits a frame for analysis by copying it to shared memory
         and notifying the worker process.
         Args:
-            frame: (np.ndarray), the frame to submit.
+            frame: (np.ndarray), a frame to submit.
         """
         # 4. 添加检查确保 IPC 资源已初始化
         if not self.working.is_set() or self.shm is None or self.shm_cond is None:
-            print("Warning: Analyzer is not running or IPC not initialized, cannot submit frame.")
+            print("Warning: NNAnalyzer is not running or IPC not initialized, cannot submit frame.")
             print("Please call start() before submit_frame().")
             return
         # 检查 worker 是否正在等待帧
         if not self.worker_ready.is_set():
-            print("Warning: Analyzer worker is not waiting for frames yet, Waiting...")
+            print("Warning: NNAnalyzer worker is not waiting for frames yet, Waiting...")
             self.worker_ready.wait()
             return
         try:
@@ -91,7 +101,7 @@ class NNAnalyzer(abc.ABC):
                                   buffer=self.shm.buf)
                 # 确保帧尺寸匹配
                 if frame.shape != self.frame_size or frame.dtype != np.uint8:
-                     print(f"Error: Frame shape/dtype mismatch. Expected {self.frame_size} {np.uint8}, got {frame.shape} {frame.dtype}")
+                     print(f"Error in submitting a frame to NNAnalyzer: Frame shape/dtype mismatch. Expected {self.frame_size} {np.uint8}, got {frame.shape} {frame.dtype}")
                      # 可以选择抛出异常或返回错误
                      return # 或者 raise ValueError("Frame shape/dtype mismatch")
 
@@ -102,7 +112,7 @@ class NNAnalyzer(abc.ABC):
             print(f"Error submitting frame: {e}")
 
 
-    def get_result(self, timeout: Optional[float] = None) -> Any:
+    def get_result(self, timeout: Optional[float] = None) -> Optional[Any]:
         """
         Retrieves the next analysis result from the result queue.
         Args:
@@ -115,7 +125,7 @@ class NNAnalyzer(abc.ABC):
         return self.result_queue.get(timeout=timeout)
 
 
-    def worker(self):
+    def _worker(self):
         """
         The main function executed by this background worker process.
 
@@ -132,46 +142,55 @@ class NNAnalyzer(abc.ABC):
         self.worker_ready.clear() # 确保最开始没有在waiting
         try:
             # 1. 初始化 (只执行一次)
-            print(f"Worker process ({mp.current_process().pid}) initializing...")
-            self._initialize_worker()
-            print(f"Worker process ({mp.current_process().pid}) initialized successfully.")
+            print(f"NNAnalyzer worker process ({mp.current_process().pid}) initializing...")
+            self._initialize_analyzer()
+            print(f"NNAnalyzer worker process ({mp.current_process().pid}) initialized successfully.")
         except Exception as e:
-            print(f"FATAL: Worker process ({mp.current_process().pid}) failed to initialize: {e}")
+            print(f"FATAL: NNAnalyzer worker process ({mp.current_process().pid}) failed to initialize: {e}")
             # 初始化失败，工作进程无法继续
             return # 退出 worker 函数
 
         # 2. 主处理循环
-        while self.working.is_set():
-            try: # 将 try...except 移到循环内部，处理单次迭代的错误
-                frame_to_analyze = None
-                with self.shm_cond:  # Acquire condition lock
-                    self.worker_ready.set() # 此时，worker才真正准备好接收帧。
-                    # 等待 submit_frame 的通知
-                    notified = self.shm_cond.wait(timeout=1.0) # 添加超时避免永久阻塞
+        try:
+            while self.working.is_set():
+                try: # 将 try...except 移到循环内部，处理单次迭代的错误
+                    frame_to_analyze = None
+                    with self.shm_cond:  # Acquire condition lock
+                        self.worker_ready.set() # 此时，worker才真正准备好接收帧。
+                        # 等待 submit_frame 的通知
+                        notified = self.shm_cond.wait(timeout=1.0) # 添加超时避免永久阻塞
 
-                    if not notified or not self.working.is_set():
-                        continue # 超时或收到停止信号
+                        if not notified or not self.working.is_set():
+                            continue # 超时或收到停止信号
 
-                    # Read frame from shared memory only after notification
-                    frame_to_analyze = np.ndarray(
-                        self.frame_size,
-                        dtype=np.uint8,
-                        buffer=self.shm.buf
-                    ).copy() # 拷贝是重要的，避免在分析时共享内存被覆盖
+                        # Read frame from shared memory only after notification
+                        frame_to_analyze = np.ndarray(
+                            self.frame_size,
+                            dtype=np.uint8,
+                            buffer=self.shm.buf
+                        ).copy() # 拷贝是重要的，避免在分析时共享内存被覆盖
 
-                if frame_to_analyze is not None:
-                    # received frame
-                    results = self.analyze(frame_to_analyze) # 调用子类实现的 analyze
-                    # 检查 analyze 是否返回 None (例如模型未加载)
-                    if results is not None:
-                        self.result_queue.put(results)
-                    else:
-                        print(f"Worker ({mp.current_process().pid}): Analysis returned None, skipping result queue.")
+                    if frame_to_analyze is not None:
+                        # received frame
+                        results = self._analyze(frame_to_analyze) # 调用子类实现的 analyze
+                        # 检查 analyze 是否返回 None (例如模型未加载)
+                        if results is not None:
+                            self.result_queue.put(results)
+                        else:
+                            print(f"NNAnalyzer worker ({mp.current_process().pid}): Analysis returned None, skipping result queue.")
 
+                except Exception as e:
+                    # 捕获处理单帧时的错误，打印并继续循环
+                    print(f"Error during frame processing in analyzer worker ({mp.current_process().pid}): {e}")
+                    # 根据需要，可以添加更复杂的错误处理逻辑，比如重试或跳过
+        finally:
+        # 3. 清理
+            print(f"NNAnalyzer worker process ({mp.current_process().pid}) uninitializing...")
+            try:
+                self._uninitialize_analyzer()
             except Exception as e:
-                # 捕获处理单帧时的错误，打印并继续循环
-                print(f"Error during frame processing in worker ({mp.current_process().pid}): {e}")
-                # 根据需要，可以添加更复杂的错误处理逻辑，比如重试或跳过
+                print(f"Error uninitializing NNAnalyzer worker process ({mp.current_process().pid}): {e}")
+            print(f"NNAnalyzer worker process ({mp.current_process().pid}) uninitialized successfully.")
 
         print(f"NNAnalyzer worker ({mp.current_process().pid}) exiting loop.")
 
@@ -205,7 +224,7 @@ class NNAnalyzer(abc.ABC):
             # 6. 设置运行状态并启动工作进程
             self.working.set()
             print("Starting worker process...")
-            process = mp.Process(target=self.worker, name="NNAnalyzerWorker")
+            process = mp.Process(target=self._worker, name="NNAnalyzerWorker")
             self.worker_processes.append(process)
             process.start()
             # 等待 worker 进入等待状态
@@ -288,7 +307,7 @@ class MySpecificNNAnalyzer(NNAnalyzer):
         # __init__ 不再负责加载模型或打印信息
 
     # 实现抽象方法 _initialize_worker
-    def _initialize_worker(self):
+    def _initialize_analyzer(self):
         """
         Load the specific model and perform warmup for MySpecificNNAnalyzer.
         """
@@ -315,7 +334,7 @@ class MySpecificNNAnalyzer(NNAnalyzer):
 
 
     # 实现抽象方法 analyze
-    def analyze(self, frame: np.ndarray) -> Any:
+    def _analyze(self, frame: np.ndarray) -> Any:
         """
         Placeholder analysis: returns the frame shape.
         Replace this with actual model inference.
@@ -336,3 +355,9 @@ class MySpecificNNAnalyzer(NNAnalyzer):
         return frame.shape # 保持原有逻辑作为示例
 
     # 移除被注释掉的 warmup 方法块以修复 Pylance 错误
+
+    def _uninitialize_analyzer(self):
+        """
+        Clean up resources for MySpecificNNAnalyzer.
+        """
+        print(f"MySpecificNNAnalyzer ({mp.current_process().pid}) uninitializing...")

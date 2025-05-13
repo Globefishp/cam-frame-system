@@ -93,6 +93,7 @@ class SleapAnalyzer(NNAnalyzer):
         try:
             self.model = tf.keras.models.load_model(self.model_path, compile=False)
             print(f"SleapAnalyzer ({mp.current_process().pid if 'mp' in globals() else 'main'}): Model loaded from {self.model_path}")
+            # TODO: Maybe we can extract model_input_shape and padding_target_shape from model?
 
             # Perform a warmup inference
             # Create a dummy frame matching the model's expected input dimensions and type
