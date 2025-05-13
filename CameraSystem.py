@@ -20,7 +20,7 @@ import time
 
 import mvsdk
 
-FRAME_TIME = 8.3333 # 5ms = 200fps, a temp control here
+FRAME_TIME = 16.6666 # 5ms = 200fps, a temp control here
 # 此时encode出来的视频实际fps是120.061，但是实际（拍摄时钟）计算得到的fps是120.47，未知原因。
 
 class CameraSystem:

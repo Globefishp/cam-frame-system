@@ -187,10 +187,10 @@ class BaseVideoEncoder(abc.ABC):
                                 encoding_speed = frame_count_since_last_check / time_elapsed
                                 # print(f"Debug: Avg encoding speed over {time_elapsed:.2f}s: {encoding_speed:.2f} FPS") # Optional debug
 
-                                # Check if speed is low and issue warning (throttled)
-                                if encoding_speed < camera_fps and (current_time - last_warning_time) > warning_interval:
+                                # Check if speed is noticeably low and issue warning (throttled)
+                                if encoding_speed < camera_fps * 0.9 and (current_time - last_warning_time) > warning_interval:
                                     print(f"Warning: VideoEncoder ({mp.current_process().pid}) encoding speed ({encoding_speed:.2f} FPS) "
-                                          f"is lower than camera target FPS ({camera_fps:.2f}). Frames might be dropped after buffer filled.")
+                                          f"is noticeably lower than camera target FPS ({camera_fps:.2f}). Frames might be dropped after buffer filled.")
                                     print(f"Warning: Current buffer load: {ring_buffer.unread_count} frames, "
                                           f"{ring_buffer.unread_count / ring_buffer.buffer_capacity * 100:.2f}%")
                                     last_warning_time = current_time
