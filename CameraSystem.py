@@ -13,6 +13,7 @@ from shared_ring_buffer import ProcessSafeSharedRingBuffer
 # No longer need specific analyzer import here
 # from nnanalyzer import MySpecificNNAnalyzer
 from nnanalyzer import NNAnalyzer # 导入基类用于类型提示
+from sleap_analyzer import SleapAnalyzer # 导入SLEAPAnalyzer类
 from videoencoder import BaseVideoEncoder # , X264Encoder # Import video encoder classes
 from x264_encoder_x264 import X264Encoder # Import video encoder classes
 
@@ -47,6 +48,7 @@ class CameraSystem:
             AnalyzerClass (Type[NNAnalyzer]): The class of the NN analyzer to use.
             VideoEncoderClass (Type[BaseVideoEncoder]): The class of the video encoder to use.
             analyzer_config (dict): Configuration dictionary for the analyzer.
+                                         Should include 'needs_timecode' (bool).
             video_encoder_config (dict): Configuration dictionary for the video encoder.
                                          Must include 'output_path', 'batch_size', etc.
                                          It should NOT include 'shared_buffer'.
@@ -57,6 +59,11 @@ class CameraSystem:
         self.camera = camera
         self.thread_pool = []
         self.shared_buffer: Optional[ProcessSafeSharedRingBuffer] = None # Initialize as None
+
+        # Read analyzer configuration
+        # Pop 'needs_timecode' since the analyzer do not need it.
+        self._analyzer_needs_timecode = analyzer_config.pop('needs_timecode', False)
+        print(f"CameraSystem: Analyzer needs timecode: {self._analyzer_needs_timecode}")
 
         # --- Create Shared Buffer ---
         try:
@@ -210,17 +217,21 @@ class CameraSystem:
                     continue
 
                 # Submit the frame copy to the analyzer
-                # The analysis_frame contains the timecode. Analyzer needs to handle it or it needs to be stripped here.
-                # Assuming analyzer_config['frame_size'] is original, we should strip timecode here.
                 try:
-                    original_height = self.camera.height # Original height without timecode
-                    if analysis_frame.shape[0] > original_height:
-                        image_for_analyzer = analysis_frame[:original_height, :, :]
-                        # print(f"Snapshot thread: Submitting stripped frame {image_for_analyzer.shape} to analyzer.") # Debug
-                        self.analyzer.submit_frame(image_for_analyzer)
-                    else: # Frame is already original size or smaller (error?)
-                        # print(f"Snapshot thread: Submitting frame {analysis_frame.shape} (as-is or error) to analyzer.") # Debug
-                        self.analyzer.submit_frame(analysis_frame) # Submit as-is if no appended data detected
+                    if self._analyzer_needs_timecode:
+                        # Submit the full frame including timecode rows
+                        print(f"Snapshot thread: Submitting full frame {analysis_frame.shape} to analyzer (needs timecode).") # Debug
+                        self.analyzer.submit_frame(analysis_frame)
+                    else:
+                        # Strip timecode rows and submit only the original image part
+                        original_height = self.camera.height # Original height without timecode
+                        if analysis_frame.shape[0] > original_height:
+                            image_for_analyzer = analysis_frame[:original_height, :, :]
+                            print(f"Snapshot thread: Submitting stripped frame {image_for_analyzer.shape} to analyzer (does not need timecode).") # Debug
+                            self.analyzer.submit_frame(image_for_analyzer)
+                        else: # Frame is already original size or smaller (error?)
+                            print(f"Snapshot thread: Submitting frame {analysis_frame.shape} (as-is or error) to analyzer (does not need timecode).") # Debug
+                            self.analyzer.submit_frame(analysis_frame) # Submit as-is if no appended data detected
                 except AttributeError:
                     print("Snapshot thread: Warning - Camera object missing 'height' attribute. Submitting frame as-is.")
                     self.analyzer.submit_frame(analysis_frame) # Fallback
@@ -343,18 +354,27 @@ if __name__ == "__main__":
             original_width = camera.width
             original_height = camera.height # This is the original image height
             channels = camera.channels
+            output_frame_height = camera.output_frame_height
             original_frame_shape = (original_height, original_width, channels)
+            output_frame_shape = (output_frame_height, original_width, channels) # This is the full output frame shape with timecode
             print(f"CameraSystem __main__: Original camera frame HxWxC: {original_height}x{original_width}x{channels}")
+            print(f"CameraSystem __main__: Output frame H'xWxC (with timecode space): {output_frame_shape}")
         except AttributeError:
             print("CameraSystem __main__: Warning: Camera object does not provide full shape info. Using defaults for config.")
             original_height, original_width, channels = 1024, 1280, 3
             original_frame_shape = (original_height, original_width, channels) # Default
+            output_frame_shape = (original_height + 1, original_width, channels) # Default with timecode space
 
         # --- Prepare Configurations ---
         # Analyzer expects original frame size
         analyzer_config = {
-            'model_path': 'example_path', # TODO: Use actual config
-            'frame_size': original_frame_shape 
+            'needs_timecode': True,
+            'model_path': 'nntest/best_model.h5',
+            'frame_shape': output_frame_shape,
+            'effective_image_shape': original_frame_shape,
+            'timecode_timebase': camera.timecode_timebase, # Use camera's timebase
+            'padding_target_shape': (1024, 1280), # Example padding target shape
+            'model_input_shape': (512, 640), # TODO: Try to get this from model directly
         }
         # VideoEncoder also expects original frame size in its config
         video_encoder_config = {
@@ -373,7 +393,7 @@ if __name__ == "__main__":
         print("Creating CameraSystem instance...")
         camera_system = CameraSystem(
             camera=camera,
-            AnalyzerClass=MySpecificNNAnalyzer,
+            AnalyzerClass=SleapAnalyzer,
             VideoEncoderClass=X264Encoder,
             analyzer_config=analyzer_config,
             video_encoder_config=video_encoder_config,
