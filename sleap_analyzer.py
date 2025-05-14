@@ -1,3 +1,6 @@
+# Requirements: tensorflow=2.7.0, tensorboard=2.11.2, numpy<2.0
+# Tested in python=3.9.22
+
 import time
 import numpy as np
 import tensorflow as tf

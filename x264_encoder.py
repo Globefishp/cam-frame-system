@@ -1,3 +1,6 @@
+# Requirements:
+#    ffmpeg.exe (in the same folder, tested with 7.1.1)
+
 import abc
 import multiprocessing as mp
 import multiprocessing.shared_memory as mp_shm

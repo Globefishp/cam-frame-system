@@ -1,3 +1,8 @@
+# Requirements:
+#   In the same folder:
+#       x264.exe (recommended: https://github.com/Patman86/x264-Mod-by-Patman)
+#       mp4fpsmod.exe (from https://github.com/nu774/mp4fpsmod)
+
 import abc
 import multiprocessing as mp
 import multiprocessing.shared_memory as mp_shm

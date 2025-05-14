@@ -1,3 +1,9 @@
+# The system code relies on multiprocessing.shared_buffer in ProcessSafeSharedRingBuffer,
+# which requires python>3.8
+# The type hinting are wrotes in formats that requires python>3.9.
+# Requirements:
+#   python>=3.9
+
 import numpy as np
 from threading import Thread, Event, Lock, Condition
 

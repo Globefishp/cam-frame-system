@@ -1,3 +1,6 @@
+# The codes are extracted from SLEAP v1.4.1a2. Thanks for their great work!
+# Origin: sleap.nn.peak_finding, sleap.nn.data.instance_cropping
+
 import tensorflow as tf
 from typing import Optional, Tuple
 

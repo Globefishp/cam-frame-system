@@ -1,3 +1,6 @@
+# Requirements:
+#    pyav (tested with 14.2.0)
+
 import abc
 import multiprocessing as mp
 import multiprocessing.shared_memory as mp_shm

@@ -1,5 +1,6 @@
 # Sketched by Google Gemini 2.5 Flash exp, 
 # Manually corrected by Haiyun Huang 2025.
+
 # Update log: 
 #   - v1: Basic function
 #   - v2: Add peek_last_frame (read while blocking put/get), 
@@ -9,6 +10,9 @@
 #         performance than v2)
 #         Potential future improvement: split _get/set_pointer_metadata to smaller functions,
 #         return less items (split according to the use case)
+
+# Requirements: python > 3.9
+
 import multiprocessing as mp
 import multiprocessing.shared_memory as mp_shm
 import multiprocessing.synchronize as mp_sync
