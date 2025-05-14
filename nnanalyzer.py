@@ -15,15 +15,15 @@ class NNAnalyzer(abc.ABC):
     # 1. 修改 __init__ 参数，移除 IPC 资源
     def __init__(self,
                  model_path: str,
-                 frame_size: tuple[int, int, int]):
+                 frame_shape: tuple[int, int, int]):
         '''
         Initialize the base analyzer. IPC resources will be created in start().
         Args:
             model_path: (str), path to the model file (used by subclasses).
-            frame_size: (tuple[int, int, int]), expected frame size (height, width, channel).
+            frame_shape: (tuple[int, int, int]), expected frame size (height, width, channel).
         '''
         self.model_path = model_path
-        self.frame_size = frame_size
+        self.frame_shape = frame_shape
         # 2. 在内部创建 Queue
         self.result_queue = mp.Queue()
         # 3. 初始化 IPC 资源为 None，将在 start() 中创建
@@ -94,14 +94,15 @@ class NNAnalyzer(abc.ABC):
             return
         try:
             # 使用 self.shm_cond
-            with self.shm_cond: # 加锁
+            with self.shm_cond: # 加锁，如果正在分析中，会阻塞直到分析完成。
+                # TODO: 改成显式控制锁，增加超时设置。
                 # 将分析帧写入共享内存 (使用 self.shm)
-                dest = np.ndarray(self.frame_size,
+                dest = np.ndarray(self.frame_shape,
                                   dtype=np.uint8,
                                   buffer=self.shm.buf)
                 # 确保帧尺寸匹配
-                if frame.shape != self.frame_size or frame.dtype != np.uint8:
-                     print(f"Error in submitting a frame to NNAnalyzer: Frame shape/dtype mismatch. Expected {self.frame_size} {np.uint8}, got {frame.shape} {frame.dtype}")
+                if frame.shape != self.frame_shape or frame.dtype != np.uint8:
+                     print(f"Error in submitting a frame to NNAnalyzer: Frame shape/dtype mismatch. Expected {self.frame_shape} {np.uint8}, got {frame.shape} {frame.dtype}")
                      # 可以选择抛出异常或返回错误
                      return # 或者 raise ValueError("Frame shape/dtype mismatch")
 
@@ -165,19 +166,21 @@ class NNAnalyzer(abc.ABC):
 
                         # Read frame from shared memory only after notification
                         frame_to_analyze = np.ndarray(
-                            self.frame_size,
+                            self.frame_shape,
                             dtype=np.uint8,
                             buffer=self.shm.buf
                         ).copy() # 拷贝是重要的，避免在分析时共享内存被覆盖
 
-                    if frame_to_analyze is not None:
-                        # received frame
-                        results = self._analyze(frame_to_analyze) # 调用子类实现的 analyze
-                        # 检查 analyze 是否返回 None (例如模型未加载)
-                        if results is not None:
-                            self.result_queue.put(results)
-                        else:
-                            print(f"NNAnalyzer worker ({mp.current_process().pid}): Analysis returned None, skipping result queue.")
+                        # 目前，让我们把分析过程放入锁内，防止高频提交下未预期的结果与提交不同步
+                        # TODO: 未来会有更好的方式执行同步（如多分析进程并发？利用RingBuffer排队（但是破坏实时性））
+                        if frame_to_analyze is not None:
+                            # received frame
+                            results = self._analyze(frame_to_analyze) # 调用子类实现的 analyze
+                            # 检查 analyze 是否返回 None (例如模型未加载)
+                            if results is not None:
+                                self.result_queue.put(results)
+                            else:
+                                print(f"NNAnalyzer worker ({mp.current_process().pid}): Analysis returned None, skipping result queue.")
 
                 except Exception as e:
                     # 捕获处理单帧时的错误，打印并继续循环
@@ -212,7 +215,7 @@ class NNAnalyzer(abc.ABC):
         print("Starting NNAnalyzer...")
         try:
             # 5. 创建共享内存和条件变量
-            frame_bytes = np.prod(self.frame_size) * np.dtype(np.uint8).itemsize
+            frame_bytes = np.prod(self.frame_shape) * np.dtype(np.uint8).itemsize
             # 考虑为共享内存增加一些buffer，例如存储少量帧
             buffer_factor = 10 # 至少能存一帧，这里设为10帧的空间
             shared_mem_size = int(frame_bytes * buffer_factor)

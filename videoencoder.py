@@ -320,4 +320,4 @@ class BaseVideoEncoder(abc.ABC):
 
         print("VideoEncoder stopped.")
 
-from x264_encoder import X264Encoder # Import X264Encoder from the new file
+from x264_encoder_x264 import X264Encoder # Import X264Encoder from the new file
