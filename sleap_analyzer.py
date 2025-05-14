@@ -4,7 +4,8 @@ import tensorflow as tf
 import multiprocessing as mp
 from nnanalyzer import NNAnalyzer
 from huateng_camera_tc import extract_tc_from_frames
-from typing import Optional, Any # 引入类型提示
+from sleap_peak_postprocessing import find_local_peaks
+from typing import Optional, Tuple # 引入类型提示
 
 class SleapAnalyzer(NNAnalyzer):
     """
@@ -26,7 +27,8 @@ class SleapAnalyzer(NNAnalyzer):
                  effective_image_shape: Optional[tuple[int, int, int]] = None, # H, W, C of the image itself
                  timecode_timebase: Optional[int] = None, # Denominator of timebase.
                  padding_target_shape: tuple[int, int] = (1024, 1280),
-                 model_input_shape: tuple[int, int] = (512, 640)):
+                 model_input_shape: tuple[int, int] = (512, 640),  # TODO: Try to get this from model directly
+                 ):
         """
         Initializes the SleapAnalyzer.
 
@@ -104,7 +106,8 @@ class SleapAnalyzer(NNAnalyzer):
             dummy_frame = np.zeros(dummy_input_shape, dtype=np.float32)
             
             print(f"SleapAnalyzer ({mp.current_process().pid if 'mp' in globals() else 'main'}): Performing warmup inference...")
-            _ = self.model.predict(dummy_frame)
+            dummy_prediction = self.model.predict(dummy_frame)
+            _, _, _, _ = find_local_peaks(dummy_prediction)
             print(f"SleapAnalyzer ({mp.current_process().pid if 'mp' in globals() else 'main'}): Warmup inference complete.")
             print(f"SleapAnalyzer ({mp.current_process().pid if 'mp' in globals() else 'main'}): Initialization complete.")
 
@@ -113,7 +116,7 @@ class SleapAnalyzer(NNAnalyzer):
             self.model = None # Ensure model is None if loading fails
             raise # Re-raise the exception to signal failure to the NNAnalyzer base class
 
-    def _analyze(self, input_frame: np.ndarray) -> tuple[Any, Optional[int]]:
+    def _analyze(self, input_frame: np.ndarray) -> Tuple[Optional[Tuple], Optional[int]]:
         """
         Analyzes a single frame using the loaded SLEAP model.
         Extracts image data and possible timecode (determined by __init__), 
@@ -125,9 +128,11 @@ class SleapAnalyzer(NNAnalyzer):
                                                 Shape: (H (with_tc), W, C).
 
         Returns:
-            tuple[Any, np.uint32]: A tuple containing:
-                - predictions: The output from the SLEAP model.
-                - new_timecode: The updated timecode (int) after adding analysis duration.
+            tuple[Tuple, int]: A tuple containing:
+                - peak_point: The coordinate of the detected peak (tuple), 
+                              or None if no peak is found.
+                - new_timecode: The updated timecode (int) after adding analysis duration, 
+                                or None if no timecode is provided in input.
         """
         if self.model is None:
             print(f"SleapAnalyzer ({mp.current_process().pid if 'mp' in globals() else 'main'}): Error - Model not loaded. Cannot analyze.")
@@ -140,63 +145,97 @@ class SleapAnalyzer(NNAnalyzer):
         # 1. Extract image data and original timecode
         original_timecode: Optional[int] = None
         new_timecode: Optional[int] = None
+        peak_point: Optional[Tuple] = None # Initialize peak_point
 
-        if self._is_timecode_appended:
-            # Use extract_tc_from_frames to get image and timecode
-            original_images_batch, tc_array = extract_tc_from_frames(
-                np.expand_dims(input_frame, axis=0),
-                self.effective_image_height,
-                self.effective_image_width,
-                self.channels
-            )
-
-            if tc_array is not None and tc_array.size > 0:
-                original_timecode = int(tc_array[0]) # Convert numpy uint32 to Python int
+        try:
+            # 1. Extract image data and original timecode
+            if self._is_timecode_appended:
+                original_images_batch, tc_array = extract_tc_from_frames(
+                    np.expand_dims(input_frame, axis=0),
+                    self.effective_image_height,
+                    self.effective_image_width,
+                    self.channels
+                )
+                if tc_array is not None and tc_array.size > 0:
+                    original_timecode = int(tc_array[0])
+                else:
+                    print(f"SleapAnalyzer ({mp.current_process().pid if 'mp' in globals() else 'main'}): Warning - extract_tc_from_frames returned None or empty timecode.")
+                    original_timecode = None
+                frame_image = original_images_batch[0]
             else:
-                print(f"SleapAnalyzer ({mp.current_process().pid if 'mp' in globals() else 'main'}): Warning - extract_tc_from_frames returned None or empty.")
-                original_timecode = None
+                frame_image = input_frame[:self.effective_image_height, :, :]
+                # Timecodes remain None
 
-            # Use the extracted original image
-            frame_image = original_images_batch[0]
-        else:
-            # If timecode is not appended, the whole frame is the image
-            frame_image = input_frame[:self.effective_image_height, :, :]
-            # Timecodes remain None
+        except Exception as e:
+            print(f"SleapAnalyzer ({mp.current_process().pid if 'mp' in globals() else 'main'}): Error during timecode/image extraction: {e}")
+            # If extraction fails, we cannot proceed with analysis
+            return None, None
 
-        # 2. Preprocess the image (frame_image)
-        h, w, _ = frame_image.shape
+        try:
+            # 2. Preprocess the image (frame_image)
+            h, w, _ = frame_image.shape
+            pad_h = max(0, self.padding_target_shape[0] - h)
+            pad_w = max(0, self.padding_target_shape[1] - w)
+            padded_frame = np.pad(frame_image, ((0, pad_h), (0, pad_w), (0, 0)), 'constant', constant_values=0)
+            expanded_frame = np.expand_dims(padded_frame, axis=0)
+            normalized_frame = expanded_frame / 255.0
+            input_tensor = tf.image.resize(tf.convert_to_tensor(normalized_frame, dtype=tf.float32), self.model_input_shape)
 
-        pad_h = max(0, self.padding_target_shape[0] - h)
-        pad_w = max(0, self.padding_target_shape[1] - w)
+        except Exception as e:
+            print(f"SleapAnalyzer ({mp.current_process().pid if 'mp' in globals() else 'main'}): Error during image preprocessing: {e}")
+            return None, None # Cannot proceed if preprocessing fails
 
-        padded_frame = np.pad(frame_image, ((0, pad_h), (0, pad_w), (0, 0)), 'constant', constant_values=0)
+        predictions = None # Initialize predictions outside try block
+        try:
+            # 3. Perform inference
+            predictions = self.model.predict(input_tensor)
 
-        expanded_frame = np.expand_dims(padded_frame, axis=0) # Add batch dimension
-        normalized_frame = expanded_frame / 255.0 # Normalize to 0-1
+        except Exception as e:
+            print(f"SleapAnalyzer ({mp.current_process().pid if 'mp' in globals() else 'main'}): Error during model inference: {e}")
+            # If inference fails, predictions will be None or incomplete, handle in post-processing or return None
+            return None, None # Return None if inference fails
 
-        # Resize to model's expected input size
-        # tf.image.resize expects float input
-        input_tensor = tf.image.resize(tf.convert_to_tensor(normalized_frame, dtype=tf.float32), self.model_input_shape)
+        try:
+            # 4. Post-processing to get coordinates
+            if predictions is not None:
+                peak_points, peak_vals, peak_sample_inds, peak_channel_inds = find_local_peaks(predictions)
+                if len(peak_points) > 1:
+                    print(f"SleapAnalyzer ({mp.current_process().pid if'mp' in globals() else'main'}): Found {len(peak_points)} peaks. Returning the one with max probability.")
+                    peak_point = tuple(peak_points[np.argmax(peak_vals)])
+                elif len(peak_points) == 1:
+                    print(f"SleapAnalyzer ({mp.current_process().pid if'mp' in globals() else'main'}): Found 1 peak.")
+                    peak_point = tuple(peak_points[0])
+                else:
+                    print(f"SleapAnalyzer ({mp.current_process().pid if'mp' in globals() else'main'}): No peaks found.")
+                    peak_point = None
+            else:
+                 # This case should ideally be caught by the inference try block, but as a safeguard:
+                print(f"SleapAnalyzer ({mp.current_process().pid if'mp' in globals() else'main'}): Error - Predictions were None after inference.")
+                peak_point = None # Ensure peak_point is None
 
-        # 3. Perform inference
-        predictions = self.model.predict(input_tensor)
+        except Exception as e:
+            print(f"SleapAnalyzer ({mp.current_process().pid if'mp' in globals() else'main'}): Error during post-processing: {e}")
+            peak_point = None # Ensure peak_point is None if post-processing fails
 
-        # 4. Calculate new timecode (after inference)
+        # 5. Calculate new timecode (after inference) - This part is less likely to fail
+        # but could be included in a broader try block if desired.
+        # For now, assuming time calculation itself is robust.
         analysis_end_time = time.perf_counter()
         analysis_duration_seconds = analysis_end_time - analysis_start_time
 
-        if original_timecode is not None:
-            # Using timebase property to calculate ticks.
-            analysis_duration_ticks = int(analysis_duration_seconds * self.timecode_timebase)
-            # If the original timecode was already close to uint32 max, adding duration might
-            # exceed the uint32 max, making it not suitable for downstream `C`-style codes.
-            # Let's keep it as int for flexibility.
-            new_timecode = original_timecode + analysis_duration_ticks
+        if original_timecode is not None and self.timecode_timebase is not None:
+             try:
+                analysis_duration_ticks = int(analysis_duration_seconds * self.timecode_timebase)
+                new_timecode = original_timecode + analysis_duration_ticks
+             except Exception as e:
+                print(f"SleapAnalyzer ({mp.current_process().pid if 'mp' in globals() else 'main'}): Error calculating new timecode: {e}")
+                new_timecode = None
         else:
-            new_timecode = None # No original timecode, no new timecode
+            print(f"SleapAnalyzer ({mp.current_process().pid if'mp' in globals() else'main'}): No timecode available or timebase not set.")
+            new_timecode = None
 
-        # 5. Return predictions and new timecode
-        return predictions, new_timecode
+        # 6. Return predictions and new timecode
+        return peak_point, new_timecode
 
     def _uninitialize_analyzer(self):
         """
@@ -296,22 +335,20 @@ if __name__ == '__main__':
 
         if predictions is not None:
             print(f"Analysis successful. Predictions shape: {predictions.shape if hasattr(predictions, 'shape') else 'N/A'}")
-            # Check if new_timecode is not None and print it
-            if new_timecode is not None:
-                 print(f"New timecode: {new_timecode}")
-                 # Example: Check if new_timecode is greater than original (it should be)
-                 # Note: Comparison is now between Python int and numpy uint32 (dummy_tc_value)
-                 if new_timecode > int(dummy_tc_value[0]):
-                     print("New timecode is greater than original, as expected.")
-                 else:
-                     print("Warning: New timecode is not greater than original.")
-            else:
-                 print("New timecode: None (Timecode not extracted or calculated)")
-
             print(f"Time taken for _analyze call: {end_analysis_test - start_analysis_test:.4f} seconds")
-
         else:
             print("Analysis returned None, check logs for errors.")
+        # Check if new_timecode is not None and print it
+        if new_timecode is not None:
+                print(f"New timecode: {new_timecode}")
+                # Example: Check if new_timecode is greater than original (it should be)
+                # Note: Comparison is now between Python int and numpy uint32 (dummy_tc_value)
+                if new_timecode > int(dummy_tc_value[0]):
+                    print("New timecode is greater than original, as expected.")
+                else:
+                    print("Warning: New timecode is not greater than original.")
+        else:
+                print("New timecode: None (Timecode not extracted or calculated)")
 
     except Exception as e:
         print(f"Error during manual analysis test: {e}")
