@@ -1,10 +1,12 @@
-import abc # 引入 abc 模块
+import abc
 import multiprocessing as mp
 import multiprocessing.synchronize as mp_sync
 from multiprocessing.shared_memory import SharedMemory
-from typing import Optional, Any # 引入类型提示
-
+from multiprocessing.sharedctypes import Synchronized
+from typing import Optional, Any, Tuple
 import numpy as np
+import time # Import time for perf_counter
+import ctypes # Import ctypes for memory operations
 
 class NNAnalyzer(abc.ABC):
     '''
@@ -12,18 +14,24 @@ class NNAnalyzer(abc.ABC):
     Handles IPC resource creation, process management, and communication.
     Requires subclasses to implement the analysis logic.
     '''
+    # Define appended submission timestamp bytes and data type
+    _submission_timestamp_dtype: np.dtype = np.dtype("uint64") # Use uint64 for microsecond timestamp
+
     # 1. 修改 __init__ 参数，移除 IPC 资源
     def __init__(self,
                  model_path: str,
-                 frame_shape: tuple[int, int, int]):
+                 frame_shape: tuple[int, int, int],
+                 frame_dtype: np.dtype = np.dtype("uint8")):
         '''
         Initialize the base analyzer. IPC resources will be created in start().
         Args:
             model_path: (str), path to the model file (used by subclasses).
             frame_shape: (tuple[int, int, int]), expected frame size (height, width, channel).
+            frame_dtype: (np.dtype), expected frame data type.
         '''
         self.model_path = model_path
         self.frame_shape = frame_shape
+        self.frame_dtype = np.dtype(frame_dtype) # Store frame dtype
         # 2. 在内部创建 Queue
         self.result_queue = mp.Queue()
         # 3. 初始化 IPC 资源为 None，将在 start() 中创建
@@ -35,13 +43,14 @@ class NNAnalyzer(abc.ABC):
         self.working = mp.Event()
         # 将 initialized 事件改为 worker_waiting, 表示 worker 正在等待帧
         self.worker_ready = mp.Event()
+        # Shared flag to indicate if shared memory is filled with a frame
+        self._shm_is_filled: Optional[Synchronized[bool]] = None
         # Model placeholder - will be loaded by subclass in worker process via _initialize_worker
         self.model = None
 
-    # 移除基类的 warmup 方法，初始化由子类的 _initialize_worker 负责
-    # def warmup(self):
-    #     """Optional warmup routine for subclasses."""
-    #     pass
+        # Calculate total bytes including appended submission timestamp
+        self._frame_data_bytes = int(np.prod(self.frame_shape) * self.frame_dtype.itemsize)
+        self._total_frame_bytes = int(self._frame_data_bytes + self._submission_timestamp_dtype.itemsize)
 
     @abc.abstractmethod
     def _initialize_analyzer(self):
@@ -75,45 +84,103 @@ class NNAnalyzer(abc.ABC):
         raise NotImplementedError
 
 
-    def submit_frame(self, frame: np.ndarray):
+    def submit_frame(self, frame: np.ndarray, timeout: Optional[float] = None) -> Optional[int]:
         """
-        Submits a frame for analysis by copying it to shared memory
-        and notifying the worker process.
+        Submits a frame for analysis by copying it to shared memory.
+        This method will block and wait for the shared memory buffer to be empty
+        before writing the new frame. Appends the submission timestamp
+        in microseconds to the frame data in shared memory.
         Args:
-            frame: (np.ndarray), a frame to submit.
+            frame: (np.ndarray), a frame to submit (original image data).
+            timeout: (Optional[float]), seconds to wait for the shared memory buffer to be empty.
+                     If None, waits indefinitely.
+                     If 0, returns immediately if the buffer is not empty.
+        Returns:
+            The submission timestamp in microseconds if successful, None if in other case (e.g., timeout).
         """
+        # Get submission timestamp in microseconds
+        submission_timestamp_us = time.perf_counter_ns() // 1000
+        print(f"Submitting frame with submission timestamp (us): {submission_timestamp_us}") # Debug print
+
         # 4. 添加检查确保 IPC 资源已初始化
         if not self.working.is_set() or self.shm is None or self.shm_cond is None:
             print("Warning: NNAnalyzer is not running or IPC not initialized, cannot submit frame.")
             print("Please call start() before submit_frame().")
-            return
+            return None
+
         # 检查 worker 是否正在等待帧
         if not self.worker_ready.is_set():
             print("Warning: NNAnalyzer worker is not waiting for frames yet, Waiting...")
-            self.worker_ready.wait()
-            return
+            if timeout is not None:
+                if not self.worker_ready.wait(timeout=timeout):
+                    print("Warning: Timeout waiting for worker to be ready.")
+                    return None
+            else:
+                self.worker_ready.wait()
+
+
         try:
-            # 使用 self.shm_cond
-            with self.shm_cond: # 加锁，如果正在分析中，会阻塞直到分析完成。
-                # TODO: 改成显式控制锁，增加超时设置。
-                # 将分析帧写入共享内存 (使用 self.shm)
+            # Use condition variable to wait for shared memory to be empty
+            with self.shm_cond:
+                # Wait for _shm_is_filled to be False (shared memory is empty)
+                # Use wait_for with timeout, which waits until predicate becomes True.
+                # Will not affect much by Condition.notify(). Will also wait for the lock
+                # with timeout after predicate becomes True.
+                notified = self.shm_cond.wait_for(lambda: not self._shm_is_filled.value, timeout=timeout)
+
+                if not notified:
+                    # Timeout occurred while waiting for shared memory to be empty
+                    print(f"Warning: submit_frame timed out after {timeout} seconds while waiting for shared memory to be empty.")
+                    return None
+
+                # Shared memory will be filled, set _shm_is_filled to True
+                self._shm_is_filled.value = True
+
+                # Copy frame data to shared memory
+                # 1. Create a NumPy array view for the image data part
                 dest = np.ndarray(self.frame_shape,
-                                  dtype=np.uint8,
-                                  buffer=self.shm.buf)
-                # 确保帧尺寸匹配
-                if frame.shape != self.frame_shape or frame.dtype != np.uint8:
-                     print(f"Error in submitting a frame to NNAnalyzer: Frame shape/dtype mismatch. Expected {self.frame_shape} {np.uint8}, got {frame.shape} {frame.dtype}")
-                     # 可以选择抛出异常或返回错误
-                     return # 或者 raise ValueError("Frame shape/dtype mismatch")
+                                dtype=self.frame_dtype, # Use frame_dtype
+                                buffer=self.shm.buf)
+                # Ensure frame dimensions and dtype match
+                if frame.shape != self.frame_shape or frame.dtype != self.frame_dtype:
+                    print(f"Error in submitting a frame to NNAnalyzer: Frame shape/dtype mismatch. Expected {self.frame_shape} {self.frame_dtype}, got {frame.shape} {frame.dtype}")
+                    # Need to reset _shm_is_filled if we don't write
+                    self._shm_is_filled.value = False
+                    self.shm_cond.notify() # Notify worker in case it was waiting
+                    return None
 
                 np.copyto(dest, frame)
-                # 通知分析进程
-                self.shm_cond.notify() # 通常通知任何一个等待者即可
+
+                # 2. Create a NumPy array view for the timestamp part
+                #    The buffer is self.shm.buf, offset is self._frame_data_bytes,
+                #    shape is (1,) because it's a single timestamp, dtype is self._submission_timestamp_dtype.
+                shm_timestamp_array = np.ndarray(
+                    (1,), # Shape for a single scalar value
+                    dtype=self._submission_timestamp_dtype,
+                    buffer=self.shm.buf,
+                    offset=self._frame_data_bytes
+                )
+                # 3. Write the timestamp directly
+                shm_timestamp_array[0] = submission_timestamp_us
+
+                # Notify the worker process that a new frame is available
+                self.shm_cond.notify()
+
         except Exception as e:
             print(f"Error submitting frame: {e}")
+            # In case of other errors, try to reset the flag and notify
+            # We need to acquire the lock here before accessing _shm_is_filled and notifying
+            if self.shm_cond: # Check if shm_cond was initialized
+                 with self.shm_cond:
+                      if self._shm_is_filled and self._shm_is_filled.value: # Check if _shm_is_filled was initialized and is True
+                           self._shm_is_filled.value = False
+                           self.shm_cond.notify()
+            return None
+
+        return submission_timestamp_us
 
 
-    def get_result(self, timeout: Optional[float] = None) -> Optional[Any]:
+    def get_result(self, timeout: Optional[float] = None) -> Optional[Tuple[Any, int, int]]:
         """
         Retrieves the next analysis result from the result queue.
         Args:
@@ -121,21 +188,35 @@ class NNAnalyzer(abc.ABC):
                      If None, waits indefinitely.
                      If 0, returns immediately (may raise Empty exception).
         Returns:
-            The analysis result, or potentially raises queue.Empty.
+            A tuple containing (analysis result, submission timestamp in us, total analysis duration in us),
+            or potentially raises queue.Empty, or returns None on timeout (if implemented).
         """
-        return self.result_queue.get(timeout=timeout)
+        try:
+            # get() will raise queue.Empty if timeout is 0 and queue is empty
+            # If timeout is None, it waits indefinitely
+            # If timeout is > 0, it waits for that many seconds
+            result = self.result_queue.get(timeout=timeout)
+            print(f"Received result with timestamp (us): {result[1]}, analysis duration: {result[2]} us.") # Debug print
+            return result
+        except mp.queues.Empty:
+            # Handle timeout specifically if needed, though get() with timeout=0 handles it
+            # For timeout > 0, get() returns None on timeout
+            return None
+        except Exception as e:
+            print(f"Error getting result: {e}")
+            return None
 
 
     def _worker(self):
         """
         The main function executed by this background worker process.
-
         This method first calls the subclass's `_initialize_worker` method
         to load the model and perform any necessary setup. Then, it enters
-        a loop where it waits for a notification on the shared memory condition
-        variable (`shm_cond`), reads the frame data from shared memory (`shm`),
-        calls the subclass's `analyze` method to process the frame, and puts
-        the result into the shared result queue (`result_queue`).
+        a loop where it waits for the shared memory to be filled with a new frame
+        (indicated by the `_shm_is_filled` flag), reads the frame data from 
+        shared memory (`shm`), calls the subclass's `analyze` method, and 
+        puts the result into the shared result queue (`result_queue`). After
+        processing, it signals that the shared memory is empty.
 
         The loop continues until the `working` event is cleared by the main process.
         Includes error handling for initialization and per-frame processing.
@@ -152,42 +233,77 @@ class NNAnalyzer(abc.ABC):
             return # 退出 worker 函数
 
         # 2. 主处理循环
+        self.worker_ready.set() # 将worker_ready信号在此处置True，后面的流将由shm_cond和_shm_is_filled控制
         try:
             while self.working.is_set():
-                try: # 将 try...except 移到循环内部，处理单次迭代的错误
+                try:
                     frame_to_analyze = None
+                    submission_timestamp_us = None
                     with self.shm_cond:  # Acquire condition lock
-                        self.worker_ready.set() # 此时，worker才真正准备好接收帧。
-                        # 等待 submit_frame 的通知
-                        notified = self.shm_cond.wait(timeout=1.0) # 添加超时避免永久阻塞
+                        # Wait for _shm_is_filled to be True (shared memory is filled)
+                        # Add a timeout to wait_for to prevent infinite blocking if working is cleared
+                        notified = self.shm_cond.wait_for(lambda: self._shm_is_filled.value, timeout=1.0)
 
-                        if not notified or not self.working.is_set():
-                            continue # 超时或收到停止信号
+                        if not notified:
+                            # Timeout occurred while waiting for shared memory to be filled
+                            continue # Continue loop to check working.is_set()
 
-                        # Read frame from shared memory only after notification
-                        frame_to_analyze = np.ndarray(
+                        if not self.working.is_set():
+                            # Working event was cleared while waiting
+                            break # Exit the main processing loop
+
+                        # TODO: 按照目前的逻辑，这里的共享缓存似乎可以被一个queue代替。
+                        # 但也许实际上不能，使用一片内存可控性更好。
+                        # Shared memory is filled, read data
+                        shm_image_array = np.ndarray(
                             self.frame_shape,
-                            dtype=np.uint8,
+                            dtype=self.frame_dtype, # Use frame_dtype
                             buffer=self.shm.buf
-                        ).copy() # 拷贝是重要的，避免在分析时共享内存被覆盖
+                        )
+                        frame_to_analyze = shm_image_array.copy() # 拷贝是重要的，避免在分析时共享内存被覆盖
 
-                        # 目前，让我们把分析过程放入锁内，防止高频提交下未预期的结果与提交不同步
-                        # TODO: 未来会有更好的方式执行同步（如多分析进程并发？利用RingBuffer排队（但是破坏实时性））
-                        if frame_to_analyze is not None:
-                            # received frame
-                            results = self._analyze(frame_to_analyze) # 调用子类实现的 analyze
-                            # 检查 analyze 是否返回 None (例如模型未加载)
-                            if results is not None:
-                                self.result_queue.put(results)
-                            else:
-                                print(f"NNAnalyzer worker ({mp.current_process().pid}): Analysis returned None, skipping result queue.")
+                        # Read timestamp
+                        shm_timestamp_array = np.ndarray(
+                            (1,),
+                            dtype=self._submission_timestamp_dtype,
+                            buffer=self.shm.buf,
+                            offset=self._frame_data_bytes
+                        )
+                        submission_timestamp_us = shm_timestamp_array[0] # Will return a copy of _submission_timestamp_dtype
+                        print(f"NNAnalyzer worker ({mp.current_process().pid}): Got data with submission timestamp (us): {submission_timestamp_us}")
+
+                        # Reset _shm_is_filled to False, indicating shared memory is now empty
+                        self._shm_is_filled.value = False
+
+                        # Notify submitter that shared memory is empty
+                        self.shm_cond.notify()
+
+                    # Analyze the frame outside the lock
+                    if frame_to_analyze is not None:
+                        # Record analysis start time (optional, for more granular timing)
+                        # analysis_start_time_us = time.perf_counter_ns() // 1000
+
+                        results = self._analyze(frame_to_analyze) # Call subclass analyze
+
+                        # Record analysis end time (result production time)
+                        result_production_time_us = time.perf_counter_ns() // 1000
+
+                        # Calculate total duration from submission to result production
+                        total_duration_us = result_production_time_us - submission_timestamp_us
+
+                        # Check if analyze returned None
+                        if results is not None:
+                            # Put result, submission timestamp, and duration into the result queue
+                            self.result_queue.put((results, submission_timestamp_us, total_duration_us))
+                        else:
+                            print(f"NNAnalyzer worker ({mp.current_process().pid}): Analysis returned None, skipping result queue.")
 
                 except Exception as e:
-                    # 捕获处理单帧时的错误，打印并继续循环
+                    # Catch errors during single frame processing, print and continue loop
                     print(f"Error during frame processing in analyzer worker ({mp.current_process().pid}): {e}")
-                    # 根据需要，可以添加更复杂的错误处理逻辑，比如重试或跳过
+                    # Add more complex error handling if needed (e.g., retry, skip)
         finally:
-        # 3. 清理
+        # 3. Cleanup
             print(f"NNAnalyzer worker process ({mp.current_process().pid}) uninitializing...")
             try:
                 self._uninitialize_analyzer()
@@ -215,14 +331,14 @@ class NNAnalyzer(abc.ABC):
         print("Starting NNAnalyzer...")
         try:
             # 5. 创建共享内存和条件变量
-            frame_bytes = np.prod(self.frame_shape) * np.dtype(np.uint8).itemsize
-            # 考虑为共享内存增加一些buffer，例如存储少量帧
-            buffer_factor = 10 # 至少能存一帧，这里设为10帧的空间
-            shared_mem_size = int(frame_bytes * buffer_factor)
+            # Use the calculated total frame bytes including appended timestamp
+            shared_mem_size = self._total_frame_bytes # A single frame buffer
             print(f"Creating SharedMemory (size: {shared_mem_size} bytes)...")
             self.shm = SharedMemory(create=True, size=shared_mem_size)
             print("Creating Condition...")
             self.shm_cond = mp.Condition()
+            print("Creating _shm_is_filled flag...")
+            self._shm_is_filled = mp.Value('b', False)
 
             # 6. 设置运行状态并启动工作进程
             self.working.set()
