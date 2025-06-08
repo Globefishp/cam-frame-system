@@ -189,7 +189,7 @@ class NNAnalyzer(abc.ABC):
                      If 0, returns immediately (may raise Empty exception).
         Returns:
             A tuple containing (analysis result, submission timestamp in us, total analysis duration in us),
-            or potentially raises queue.Empty, or returns None on timeout (if implemented).
+            or returns None on timeout (alternatively, raises queue.Empty ?).
         """
         try:
             # get() will raise queue.Empty if timeout is 0 and queue is empty
@@ -204,6 +204,7 @@ class NNAnalyzer(abc.ABC):
             return None
         except Exception as e:
             print(f"Error getting result: {e}")
+            raise e # Re-raise the exception if needed
             return None
 
 
@@ -214,7 +215,7 @@ class NNAnalyzer(abc.ABC):
         to load the model and perform any necessary setup. Then, it enters
         a loop where it waits for the shared memory to be filled with a new frame
         (indicated by the `_shm_is_filled` flag), reads the frame data from 
-        shared memory (`shm`), calls the subclass's `analyze` method, and 
+        shared memory (`shm`), calls the subclass's `_analyze` method, and 
         puts the result into the shared result queue (`result_queue`). After
         processing, it signals that the shared memory is empty.
 
