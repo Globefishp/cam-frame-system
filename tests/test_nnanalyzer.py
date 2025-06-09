@@ -29,6 +29,19 @@ class MockNNAnalyzer(NNAnalyzer):
         self._initialized.set()
         print(f"MockNNAnalyzer ({mp.current_process().pid}) initialized.")
 
+    def _set_test_value(self, frame: np.ndarray, value: Any) -> Tuple[Any, Any]:
+        """A test method to set an internal value and return it, along with frame sum for verification."""
+        self._current_test_value = value
+        frame_sum = np.sum(frame)
+        print(f"MockNNAnalyzer ({mp.current_process().pid}): _set_test_value called with {value}, frame sum: {frame_sum}")
+        return (value, frame_sum)
+
+    def _add_numbers(self, frame: np.ndarray, a: int, b: int) -> Tuple[int, Any]:
+        """A test method to add two numbers and return the sum, along with frame sum for verification."""
+        frame_sum = np.sum(frame)
+        print(f"MockNNAnalyzer ({mp.current_process().pid}): _add_numbers called with a={a}, b={b}, frame sum: {frame_sum}")
+        return (a + b, frame_sum)
+
     def _analyze(self, frame: np.ndarray) -> Any:
         """Mock analysis: returns the sum of the frame data."""
         if self.model is None:
@@ -193,3 +206,64 @@ def test_get_result_timeout(mock_analyzer):
 
     mock_analyzer.stop()
 
+def test_submit_frame_with_custom_target_and_kwargs(mock_analyzer, frame_params):
+    """Test submitting a frame with a custom target method and kwargs, verifying frame data."""
+    mock_analyzer.start()
+    test_frame = np.full(frame_params["frame_shape"], 42, dtype=frame_params["frame_dtype"]) # Predictable frame
+    expected_frame_sum = np.sum(test_frame)
+    expected_value = "test_string_value"
+
+    # Submit a command to call _set_test_value with a custom argument
+    submission_timestamp = mock_analyzer.submit_frame(test_frame, target='_set_test_value', value=expected_value)
+    assert submission_timestamp is not None
+
+    # Give the worker some time to process the command and put the result
+    time.sleep(0.2)
+
+    result_tuple = mock_analyzer.get_result(timeout=5)
+    assert result_tuple is not None
+    result, received_timestamp, duration = result_tuple
+
+    assert result[0] == expected_value # Verify the custom value
+    assert result[1] == expected_frame_sum # Verify the frame sum
+    assert received_timestamp == submission_timestamp # Timestamp should still be from submit_frame
+    assert duration >= 0
+
+    mock_analyzer.stop()
+
+def test_submit_frame_invalid_target(mock_analyzer, frame_params):
+    """Test submitting a frame with an invalid target method."""
+    mock_analyzer.start()
+    frame = np.random.randint(0, 256, size=frame_params["frame_shape"], dtype=frame_params["frame_dtype"])
+
+    # Submit a command to call a non-existent method
+    submission_timestamp = mock_analyzer.submit_frame(frame, target='_non_existent_method')
+    assert submission_timestamp is not None # Command should still be submitted
+
+    # Give the worker some time to process the command (and log an error)
+    time.sleep(0.2)
+
+    # Expect no result in the queue because the method call failed
+    result_tuple = mock_analyzer.get_result(timeout=0.1) # Use a short timeout
+    assert result_tuple is None # Should be None as no valid result was put
+
+    mock_analyzer.stop()
+
+def test_submit_frame_target_type_error(mock_analyzer, frame_params):
+    """Test submitting a frame with a target method that receives incorrect argument types, verifying frame data."""
+    mock_analyzer.start()
+    test_frame = np.full(frame_params["frame_shape"], 10, dtype=frame_params["frame_dtype"]) # Predictable frame
+    expected_frame_sum = np.sum(test_frame)
+
+    # Submit a command to call _add_numbers with incorrect argument type
+    submission_timestamp = mock_analyzer.submit_frame(test_frame, target='_add_numbers', a=1, b="not_an_int")
+    assert submission_timestamp is not None # Command should still be submitted
+
+    # Give the worker some time to process the command (and log a TypeError)
+    time.sleep(0.2)
+
+    # Expect no result in the queue because the method call failed
+    result_tuple = mock_analyzer.get_result(timeout=0.1) # Use a short timeout
+    assert result_tuple is None # Should be None as no valid result was put
+
+    mock_analyzer.stop()
