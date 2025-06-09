@@ -13,6 +13,18 @@ class NNAnalyzer(abc.ABC):
     Abstract base class for a neural network analyzer using multiprocessing.
     Handles IPC resource creation, process management, and communication.
     Requires subclasses to implement the analysis logic.
+
+    For any analysis executing method ("backend", e.g. `_analyze()`), the first position argument 
+    should accept the frame with shape (self.frame_shape) and dtype (self.frame_dtype). Other 
+    keyword arguments can be added if needed, and will be passed by the `submit_frame()` method.
+
+    Synchronization Protocol for Frame/Command Submission:
+    Any method submitting a frame or command ("entry point", e.g., `submit_frame()`, or future
+    subclass methods) MUST acquire the `self.shm_cond` lock. Within this lock, it should first 
+    write frame data to shared memory (if applicable), then put the corresponding command
+    (e.g., `('_analyze', {})`) into `self.command_queue`. This ensures that the state
+    of the shared memory and the command queue are synchronized (both "filled" or "empty" together).
+    The worker process will then check `self.shm_cond` to proceed.
     '''
     # Define appended submission timestamp bytes and data type
     _submission_timestamp_dtype: np.dtype = np.dtype("uint64") # Use uint64 for microsecond timestamp
@@ -32,9 +44,10 @@ class NNAnalyzer(abc.ABC):
         self.model_path = model_path
         self.frame_shape = frame_shape
         self.frame_dtype = np.dtype(frame_dtype) # Store frame dtype
-        # 2. 在内部创建 Queue
+        # 2. Create internal queues
         self.result_queue = mp.Queue()
-        # 3. 初始化 IPC 资源为 None，将在 start() 中创建
+        self.command_queue: Optional[mp.Queue] = None # Queue for worker commands
+        # 3. Initialize IPC resources to None, will be created in start()
         self.shm: Optional[SharedMemory] = None
         self.shm_cond: Optional[mp_sync.Condition] = None
         # worker processes
@@ -84,17 +97,24 @@ class NNAnalyzer(abc.ABC):
         raise NotImplementedError
 
 
-    def submit_frame(self, frame: np.ndarray, timeout: Optional[float] = None) -> Optional[int]:
+    def submit_frame(self, frame: np.ndarray, target: str = '_analyze', timeout: Optional[float] = None, **kwargs) -> Optional[int]:
         """
-        Submits a frame for analysis by copying it to shared memory.
+        Submits a frame to the `target` function for analysis,
+        by copying it to shared memory and sending a command to the worker.
+
         This method will block and wait for the shared memory buffer to be empty
         before writing the new frame. Appends the submission timestamp
         in microseconds to the frame data in shared memory.
+
         Args:
             frame: (np.ndarray), a frame to submit (original image data).
+            target: (str), the name of the method in the worker to call. Defaults to '_analyze'.
             timeout: (Optional[float]), seconds to wait for the shared memory buffer to be empty.
                      If None, waits indefinitely.
                      If 0, returns immediately if the buffer is not empty.
+            **kwargs: Arbitrary keyword arguments that will be passed to the `target` method
+                      executed by the worker.
+
         Returns:
             The submission timestamp in microseconds if successful, None if in other case (e.g., timeout).
         """
@@ -163,6 +183,10 @@ class NNAnalyzer(abc.ABC):
                 # 3. Write the timestamp directly
                 shm_timestamp_array[0] = submission_timestamp_us
 
+                # If command_queue is initialized, put the command with target and kwargs
+                if self.command_queue:
+                    self.command_queue.put((target, kwargs)) # Command to trigger target method with kwargs
+
                 # Notify the worker process that a new frame is available
                 self.shm_cond.notify()
 
@@ -207,6 +231,31 @@ class NNAnalyzer(abc.ABC):
             raise e # Re-raise the exception if needed
             return None
 
+    def _execute_command(self, method_name: str, frame: np.ndarray, **kwargs):
+        """
+        Executes a method dynamically based on its name and keyword arguments.
+        Args:
+            method_name: (str), the name of the method to execute.
+            frame: (np.ndarray), the frame data to pass to the method, with a shape of
+                   `self.frame_shape`. The first arg of the method should accept it.
+            kwargs: (dict), keyword arguments to pass to the method.
+        """
+        try:
+            method = getattr(self, method_name)
+            if callable(method):
+                return method(frame, **kwargs)
+            else:
+                print(f"Error in NNAnalyzer worker ({mp.current_process().pid}): '{method_name}' is not a callable method.")
+                return None
+        except AttributeError:
+            print(f"Error in NNAnalyzer worker ({mp.current_process().pid}): Method '{method_name}' not found.")
+            return None
+        except TypeError as e:
+            print(f"Error in NNAnalyzer worker ({mp.current_process().pid}): calling method '{method_name}' with arguments {kwargs}: {e}")
+            return None
+        except Exception as e:
+            print(f"An unexpected error occurred in NNAnalyzer worker ({mp.current_process().pid}) while executing command '{method_name}': {e}")
+            return None
 
     def _worker(self):
         """
@@ -252,7 +301,8 @@ class NNAnalyzer(abc.ABC):
                         if not self.working.is_set():
                             # Working event was cleared while waiting
                             break # Exit the main processing loop
-
+                        
+                        # --- Logics to handle shared memory ---
                         # TODO: 按照目前的逻辑，这里的共享缓存似乎可以被一个queue代替。
                         # 但也许实际上不能，使用一片内存可控性更好。
                         # Shared memory is filled, read data
@@ -273,35 +323,66 @@ class NNAnalyzer(abc.ABC):
                         submission_timestamp_us = shm_timestamp_array[0] # Will return a copy of _submission_timestamp_dtype
                         print(f"NNAnalyzer worker ({mp.current_process().pid}): Got data with submission timestamp (us): {submission_timestamp_us}")
 
+                        # --- Logics to handle command queue ---
+                        # Process command from queue if available, otherwise default to _analyze
+                        command_method = '_analyze'
+                        command_kwargs = {}
+
+                        if self.command_queue:
+                            try:
+                                # Get command from queue. This should be blocking as per synchronization protocol.
+                                # A small timeout is added to allow checking self.working.is_set()
+                                command_method, command_kwargs = self.command_queue.get(timeout=0.1)
+                            except mp.queues.Empty:
+                                # This case should ideally not happen if submit_frame always puts a command
+                                # when shm is filled. But for robustness, we default to _analyze.
+                                print(f"Warning in NNAnalyzer worker ({mp.current_process().pid}): Command queue empty after shared memory filled. Defaulting to _analyze.")
+                                command_method = '_analyze'
+                                command_kwargs = {}
+                            except Exception as e:
+                                print(f"Error in NNAnalyzer worker ({mp.current_process().pid}): getting command from queue: {e}. Defaulting to _analyze.")
+                                command_method = '_analyze'
+                                command_kwargs = {}
+
+                        # --- Ready to release the lock ---
+
                         # Reset _shm_is_filled to False, indicating shared memory is now empty
                         self._shm_is_filled.value = False
 
                         # Notify submitter that shared memory is empty
                         self.shm_cond.notify()
+                        # Release the Condition Lock.
 
-                    # Analyze the frame outside the lock
-                    if frame_to_analyze is not None:
-                        # Record analysis start time (optional, for more granular timing)
-                        # analysis_start_time_us = time.perf_counter_ns() // 1000
+                    # Execute the command outside the lock
+                    results = None
+                    # Record analysis start time (optional, for more granular timing)
+                    # analysis_start_time_us = time.perf_counter_ns() // 1000
 
-                        results = self._analyze(frame_to_analyze) # Call subclass analyze
-
-                        # Record analysis end time (result production time)
-                        result_production_time_us = time.perf_counter_ns() // 1000
-
-                        # Calculate total duration from submission to result production
-                        total_duration_us = result_production_time_us - submission_timestamp_us
-
-                        # Check if analyze returned None
-                        if results is not None:
-                            # Put result, submission timestamp, and duration into the result queue
-                            self.result_queue.put((results, submission_timestamp_us, total_duration_us))
+                    if self.command_queue is None:
+                        if frame_to_analyze is not None:
+                            results = self._analyze(frame_to_analyze) # Call subclass analyze (blocking)
                         else:
-                            print(f"NNAnalyzer worker ({mp.current_process().pid}): Analysis returned None, skipping result queue.")
+                            print(f"Warning in NNAnalyzer worker ({mp.current_process().pid}): _analyze command received but frame_to_analyze is None.")
+                    else:
+                        # For user defined command, call _execute_command with frame and their specific kwargs
+                        results = self._execute_command(command_method, frame=frame_to_analyze, **command_kwargs)
+
+                    # Record analysis end time (result production time)
+                    result_production_time_us = time.perf_counter_ns() // 1000
+
+                    # Calculate total duration from submission to result production
+                    total_duration_us = result_production_time_us - submission_timestamp_us
+
+                    # Check if analyze returned None
+                    if results is not None:
+                        # Put result, submission timestamp, and duration into the result queue
+                        self.result_queue.put((results, submission_timestamp_us, total_duration_us))
+                    else:
+                        print(f"NNAnalyzer worker ({mp.current_process().pid}): Analysis returned None, skipping result queue.")
 
                 except Exception as e:
                     # Catch errors during single frame processing, print and continue loop
-                    print(f"Error during frame processing in analyzer worker ({mp.current_process().pid}): {e}")
+                    print(f"Error during command processing in analyzer worker ({mp.current_process().pid}): {e}")
                     # Add more complex error handling if needed (e.g., retry, skip)
         finally:
         # 3. Cleanup
@@ -340,8 +421,12 @@ class NNAnalyzer(abc.ABC):
             self.shm_cond = mp.Condition()
             print("Creating _shm_is_filled flag...")
             self._shm_is_filled = mp.Value('b', False)
+            print("Creating command_queue...")
+            self.command_queue = mp.Queue()
+            # The code may already compatible with self.command_queue = None.
+            # In this case, the `_worker` will fallback to `_analyze()`. Just comment it if needed.
 
-            # 6. 设置运行状态并启动工作进程
+            # 6. Set running state and start worker process
             self.working.set()
             print("Starting worker process...")
             process = mp.Process(target=self._worker, name="NNAnalyzerWorker")
@@ -411,8 +496,11 @@ class NNAnalyzer(abc.ABC):
             finally:
                  self.shm = None # Reset shm reference
 
-        # Reset condition variable reference
+        # Reset condition variable and command queue references
         self.shm_cond = None
+        if self.command_queue:
+            self.command_queue.close()
+            self.command_queue = None
 
         print("NNAnalyzer stopped.")
 
