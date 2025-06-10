@@ -5,9 +5,9 @@ import time
 import numpy as np
 import tensorflow as tf
 import multiprocessing as mp
-from nnanalyzer import NNAnalyzer
-from huateng_camera_tc import extract_tc_from_frames
-from sleap_peak_postprocessing import find_local_peaks
+from analyzers.nnanalyzer import NNAnalyzer
+from camera.huateng_camera_tc import extract_tc_from_frames
+from analyzers.sleap_peak_postprocessing import find_local_peaks
 from typing import Optional, Tuple # 引入类型提示
 
 class SleapAnalyzer(NNAnalyzer):
@@ -256,7 +256,7 @@ if __name__ == '__main__':
     print("SleapAnalyzer Example Usage (Main Thread - for testing structure)")
 
     # --- Configuration ---
-    MODEL_PATH = 'nntest/best_model.h5' # Path to your .h5 model
+    MODEL_PATH = 'nntests/best_model.h5' # Path to your .h5 model
     
     # Frame dimensions (example, replace with actual dimensions from camera)
     ORIGINAL_IMG_HEIGHT = 720

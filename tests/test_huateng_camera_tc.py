@@ -10,8 +10,8 @@ if __name__ == "__main__":
     # 将项目根目录添加到Python路径
     sys.path.insert(0, project_root)
 
-import mvsdk
-from huateng_camera_tc import extract_tc_from_frames, Camera, TIMECODE_BYTES, TIMECODE_DTYPE, APPENDED_ROWS_FOR_TIMECODE
+import camera.mvsdk as mvsdk
+from camera.huateng_camera_tc import extract_tc_from_frames, Camera, TIMECODE_BYTES, TIMECODE_DTYPE, APPENDED_ROWS_FOR_TIMECODE
 import numpy as np
 import pytest
 

@@ -9,8 +9,8 @@ import multiprocessing.shared_memory as mp_shm
 import multiprocessing.synchronize as mp_sync
 import numpy as np
 from typing import Tuple, Any, Optional, List
-from shared_ring_buffer import ProcessSafeSharedRingBuffer
-from videoencoder import BaseVideoEncoder # Import BaseVideoEncoder
+from ringbuffers.shared_ring_buffer import ProcessSafeSharedRingBuffer
+from encoders.videoencoder import BaseVideoEncoder # Import BaseVideoEncoder
 
 # Add imports for subprocess, sys, threading, and os here
 import subprocess
@@ -21,7 +21,7 @@ import os # Import os for path manipulation
 import time # Import time for the example
 
 # Import functions and constants for timecode extraction
-from huateng_camera_tc import extract_tc_from_frames, TIMECODE_DTYPE, APPENDED_ROWS_FOR_TIMECODE
+from camera.huateng_camera_tc import extract_tc_from_frames, TIMECODE_DTYPE, APPENDED_ROWS_FOR_TIMECODE
 
 # Confirming file state after user feedback
 class X264Encoder(BaseVideoEncoder):
@@ -201,14 +201,16 @@ class X264Encoder(BaseVideoEncoder):
         self._encoder_intermediates = base_path + "_noTC.mp4"
         
 
-        # Get the directory of the current script
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        # Construct the potential path to x264.exe in the same directory
-        x264_path_in_dir = os.path.join(script_dir, 'x264.exe')
+        # Get the directory of the current module
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        # Get the project root directory (one level up from 'encoders')
+        project_root_dir = os.path.dirname(module_dir)
+        # Construct the potential path to x264.exe in the 'tools' directory
+        x264_path_in_tools = os.path.join(project_root_dir, 'tools', 'x264.exe')
 
         # Check if x264.exe exists in the script directory, otherwise rely on PATH
-        if os.path.exists(x264_path_in_dir):
-            x264_executable = x264_path_in_dir
+        if os.path.exists(x264_path_in_tools):
+            x264_executable = x264_path_in_tools
             print(f"X264Encoder worker ({mp.current_process().pid}): Found x264.exe in script directory: {x264_executable}")
         else:
             x264_executable = 'x264' # Rely on system PATH (Windows will append .exe if needed)
@@ -475,16 +477,17 @@ class X264Encoder(BaseVideoEncoder):
         Muxes the timecode file with the encoded video file using mp4fpsmod.
         """
         print(f"X264Encoder worker ({mp.current_process().pid}): Starting timecode muxing with mp4fpsmod...")
-        # Get the directory of the current script
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        mp4fpsmod_path_in_dir = os.path.join(script_dir, 'mp4fpsmod.exe')
+        # Get the directory of the current module
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root_dir = os.path.dirname(module_dir)
+        mp4fpsmod_path_in_tools = os.path.join(project_root_dir, 'tools', 'mp4fpsmod.exe')
 
-        if os.path.exists(mp4fpsmod_path_in_dir):
-            mp4fpsmod_executable = mp4fpsmod_path_in_dir
-            print(f"X264Encoder worker ({mp.current_process().pid}): Found mp4fpsmod.exe in script directory: {mp4fpsmod_executable}")
+        if os.path.exists(mp4fpsmod_path_in_tools):
+            mp4fpsmod_executable = mp4fpsmod_path_in_tools
+            print(f"X264Encoder worker ({mp.current_process().pid}): Found mp4fpsmod.exe in tools directory: {mp4fpsmod_executable}")
         else:
             mp4fpsmod_executable = 'mp4fpsmod' # Rely on system PATH (Windows will append .exe if needed)
-            print(f"X264Encoder worker ({mp.current_process().pid}): mp4fpsmod.exe not found in script directory, relying on system PATH.")
+            print(f"X264Encoder worker ({mp.current_process().pid}): mp4fpsmod.exe not found in tools directory, relying on system PATH.")
         try:
             # Run mp4fpsmod to mux the timecode file with the encoded video file
             mp4fpsmod_cmd = [

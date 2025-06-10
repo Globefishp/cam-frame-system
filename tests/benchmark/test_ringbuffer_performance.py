@@ -2,7 +2,7 @@ import pytest
 import time
 import threading
 import statistics
-from ringbuffer import RingBuffer
+from ringbuffers.ringbuffer import RingBuffer
 
 # @pytest.mark.benchmark
 @pytest.mark.parametrize("buffer_size,producers,consumers,timing_consumers", [

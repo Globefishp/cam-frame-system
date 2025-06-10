@@ -13,9 +13,9 @@ import pytest # Import pytest
 from typing import List, Optional, Tuple
 
 # Assuming videoencoder.py and shared_ring_buffer.py are in the parent directory or accessible in the Python path
-from videoencoder import BaseVideoEncoder
-from shared_ring_buffer import ProcessSafeSharedRingBuffer
-from videoencoder import X264Encoder # Import X264Encoder from the new file
+from encoders.videoencoder import BaseVideoEncoder
+from ringbuffers.shared_ring_buffer import ProcessSafeSharedRingBuffer
+from encoders.videoencoder import X264Encoder # Import X264Encoder from the new file
 
 # Define a simple dummy encoder for testing
 class DummyVideoEncoder(BaseVideoEncoder):

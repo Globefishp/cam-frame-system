@@ -119,8 +119,8 @@ class NNAnalyzer(abc.ABC):
             The submission timestamp in microseconds if successful, None if in other case (e.g., timeout).
         """
         # Get submission timestamp in microseconds
-        submission_timestamp_us = time.perf_counter_ns() // 1000
-        print(f"Submitting frame with submission timestamp (us): {submission_timestamp_us}") # Debug print
+        submission_timestamp_us = time.time_ns() // 1000 # To sync across all processes, use time()/time_ns() (Low Res)
+        print(f"Process ({mp.current_process().pid}) is submitting frame with submission timestamp (us): {submission_timestamp_us}") # Debug print
 
         # 4. 添加检查确保 IPC 资源已初始化
         if not self.working.is_set() or self.shm is None or self.shm_cond is None:
@@ -320,7 +320,8 @@ class NNAnalyzer(abc.ABC):
                             buffer=self.shm.buf,
                             offset=self._frame_data_bytes
                         )
-                        submission_timestamp_us = shm_timestamp_array[0] # Will return a copy of _submission_timestamp_dtype
+                        submission_timestamp_us: int = int(shm_timestamp_array[0]) 
+                        # shm_timestamp_array[0]: np.uint64, will return a copy of _submission_timestamp_dtype
                         print(f"NNAnalyzer worker ({mp.current_process().pid}): Got data with submission timestamp (us): {submission_timestamp_us}")
 
                         # --- Logics to handle command queue ---
@@ -368,10 +369,10 @@ class NNAnalyzer(abc.ABC):
                         results = self._execute_command(command_method, frame=frame_to_analyze, **command_kwargs)
 
                     # Record analysis end time (result production time)
-                    result_production_time_us = time.perf_counter_ns() // 1000
+                    result_production_time_us: int = time.time_ns() // 1000
 
                     # Calculate total duration from submission to result production
-                    total_duration_us = result_production_time_us - submission_timestamp_us
+                    total_duration_us: int = result_production_time_us - submission_timestamp_us
 
                     # Check if analyze returned None
                     if results is not None:
@@ -510,8 +511,8 @@ class MySpecificNNAnalyzer(NNAnalyzer):
     A concrete implementation of NNAnalyzer using a placeholder analysis.
     """
     # 8. 更新子类 __init__ 的 super() 调用
-    def __init__(self, model_path: str, frame_size: tuple[int, int, int]):
-        super().__init__(model_path, frame_size)
+    def __init__(self, model_path: str, frame_shape: tuple[int, int, int], **kwargs):
+        super().__init__(model_path, frame_shape)
         # __init__ 不再负责加载模型或打印信息
 
     # 实现抽象方法 _initialize_worker

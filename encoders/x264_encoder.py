@@ -7,8 +7,8 @@ import multiprocessing.shared_memory as mp_shm
 import multiprocessing.synchronize as mp_sync
 import numpy as np
 from typing import Tuple, Any, Optional, List
-from shared_ring_buffer import ProcessSafeSharedRingBuffer
-from videoencoder import BaseVideoEncoder # Import BaseVideoEncoder
+from ringbuffers.shared_ring_buffer import ProcessSafeSharedRingBuffer
+from encoders.videoencoder import BaseVideoEncoder # Import BaseVideoEncoder
 
 # Add imports for subprocess, sys, threading, and os here
 import subprocess
@@ -119,18 +119,20 @@ class X264Encoder(BaseVideoEncoder):
         # Initialize process-specific attributes (called in `_worker process`)
         self._ffmpeg_finished = threading.Event() # Event to signal FFmpeg completion
 
-        # Get the directory of the current script
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        # Construct the potential path to ffmpeg in the same directory
-        ffmpeg_path_in_dir = os.path.join(script_dir, 'ffmpeg.exe') # Assuming 'ffmpeg' executable name
+        # Get the directory of the current module
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        # Get the project root directory (one level up from 'encoders')
+        project_root_dir = os.path.dirname(module_dir)
+        # Construct the potential path to ffmpeg in the 'tools' directory under the project root
+        ffmpeg_path_in_tools = os.path.join(project_root_dir, 'tools', 'ffmpeg.exe') # Assuming 'ffmpeg' executable name
 
-        # Check if ffmpeg exists in the script directory, otherwise rely on PATH
-        if os.path.exists(ffmpeg_path_in_dir):
-            ffmpeg_executable = ffmpeg_path_in_dir
-            print(f"X264Encoder worker ({mp.current_process().pid}): Found ffmpeg in script directory: {ffmpeg_executable}")
+        # Check if ffmpeg exists in the 'tools' directory, otherwise rely on PATH
+        if os.path.exists(ffmpeg_path_in_tools):
+            ffmpeg_executable = ffmpeg_path_in_tools
+            print(f"X264Encoder worker ({mp.current_process().pid}): Found ffmpeg in tools directory: {ffmpeg_executable}")
         else:
             ffmpeg_executable = 'ffmpeg' # Rely on system PATH
-            print(f"X264Encoder worker ({mp.current_process().pid}): ffmpeg not found in script directory, relying on system PATH.")
+            print(f"X264Encoder worker ({mp.current_process().pid}): ffmpeg not found in tools directory, relying on system PATH.")
 
 
         # Build FFmpeg command line

@@ -11,13 +11,13 @@ import queue # For communication between preview thread and main thread (optiona
 from typing import Optional, Tuple
 
 # Import necessary classes from existing files
-import mvsdk
-from huateng_camera_tc import Camera, enumerate_cameras, APPENDED_ROWS_FOR_TIMECODE # Import APPENDED_ROWS_FOR_TIMECODE
+import camera.mvsdk as mvsdk
+from camera.huateng_camera_tc import Camera, enumerate_cameras, APPENDED_ROWS_FOR_TIMECODE # Import APPENDED_ROWS_FOR_TIMECODE
 from CameraSystem import CameraSystem
-from x264_encoder_x264 import X264Encoder
-from nnanalyzer import NNAnalyzer # Or a specific analyzer like SleapAnalyzer
-from sleap_analyzer import SleapAnalyzer # Import SleapAnalyzer explicitly
-from shared_ring_buffer import ProcessSafeSharedRingBuffer # Needed for cleanup
+from encoders.x264_encoder_x264 import X264Encoder
+from analyzers.nnanalyzer import NNAnalyzer # Or a specific analyzer like SleapAnalyzer
+from analyzers.sleap_analyzer import SleapAnalyzer # Import SleapAnalyzer explicitly
+from ringbuffer.shared_ring_buffer import ProcessSafeSharedRingBuffer # Needed for cleanup
 
 # Configuration (can be loaded from file or command line args)
 # Example configuration structure

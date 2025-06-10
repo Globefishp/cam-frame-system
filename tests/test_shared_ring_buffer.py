@@ -3,7 +3,7 @@ import numpy as np
 import multiprocessing as mp
 import multiprocessing.shared_memory as mp_shm # Import mp_shm
 import time
-from shared_ring_buffer import ProcessSafeSharedRingBuffer
+from ringbuffers.shared_ring_buffer import ProcessSafeSharedRingBuffer
 
 # Define buffer parameters for testing
 BUFFER_CAPACITY = 5

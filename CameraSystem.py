@@ -13,21 +13,21 @@ from multiprocessing.shared_memory import SharedMemory
 from collections import deque
 from typing import List, Optional, Any, Type # Import Type for class hints
 
-from huateng_camera_tc import Camera
+from camera.huateng_camera_tc import Camera
 # from ringbuffer import RingBuffer # No longer needed
-from shared_ring_buffer import ProcessSafeSharedRingBuffer
+from ringbuffers.shared_ring_buffer import ProcessSafeSharedRingBuffer
 # No longer need specific analyzer import here
 # from nnanalyzer import MySpecificNNAnalyzer
-from nnanalyzer import NNAnalyzer # 导入基类用于类型提示
-from sleap_analyzer import SleapAnalyzer # 导入SLEAPAnalyzer类
-from videoencoder import BaseVideoEncoder # , X264Encoder # Import video encoder classes
-from x264_encoder_x264 import X264Encoder # Import video encoder classes
+from analyzers.nnanalyzer import NNAnalyzer # 导入基类用于类型提示
+from analyzers.nnanalyzer import MySpecificNNAnalyzer # 导入SLEAPAnalyzer类
+from encoders.videoencoder import BaseVideoEncoder # , X264Encoder # Import video encoder classes
+from encoders.x264_encoder_x264 import X264Encoder # Import video encoder classes
 
 import time
 
-import mvsdk
+import camera.mvsdk as mvsdk
 
-FRAME_TIME = 16.6666 # 5ms = 200fps, a temp control here
+FRAME_TIME = 10 # 5ms = 200fps, a temp control here
 # 此时encode出来的视频实际fps是120.061，但是实际（拍摄时钟）计算得到的fps是120.47，未知原因。
 
 class CameraSystem:
@@ -331,7 +331,7 @@ class CameraSystem:
 
 if __name__ == "__main__":
     # Import specific implementations for testing in __main__
-    from nnanalyzer import MySpecificNNAnalyzer
+    from analyzers.nnanalyzer import MySpecificNNAnalyzer
     # numpy is likely needed by dependencies or for frame creation if camera mock is used
     import numpy as np
 
@@ -375,7 +375,7 @@ if __name__ == "__main__":
         # Analyzer expects original frame size
         analyzer_config = {
             'needs_timecode': True,
-            'model_path': 'nntest/best_model.h5',
+            'model_path': 'nntests/best_model.h5',
             'frame_shape': output_frame_shape,
             'effective_image_shape': original_frame_shape,
             'timecode_timebase': camera.timecode_timebase, # Use camera's timebase
@@ -399,7 +399,7 @@ if __name__ == "__main__":
         print("Creating CameraSystem instance...")
         camera_system = CameraSystem(
             camera=camera,
-            AnalyzerClass=SleapAnalyzer,
+            AnalyzerClass=MySpecificNNAnalyzer,
             VideoEncoderClass=X264Encoder,
             analyzer_config=analyzer_config,
             video_encoder_config=video_encoder_config,

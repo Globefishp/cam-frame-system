@@ -5,7 +5,7 @@ import multiprocessing as mp
 import multiprocessing.synchronize as mp_sync
 from multiprocessing.sharedctypes import Synchronized
 
-from shared_ring_buffer_v3 import ProcessSafeSharedRingBuffer
+from ringbuffers.shared_ring_buffer_v3 import ProcessSafeSharedRingBuffer
 
 # Use a larger buffer for this test
 LARGE_BUFFER_CAPACITY = 20
@@ -95,13 +95,13 @@ def peeker(buffer: ProcessSafeSharedRingBuffer, put_ids: list, gotten_ids: list,
 # Assuming ProcessSafeSharedRingBuffer is in the parent directory or in a module that can be imported
 # Adjust the import path if necessary
 try:
-    from shared_ring_buffer_v3 import ProcessSafeSharedRingBuffer
+    from ringbuffers.shared_ring_buffer_v3 import ProcessSafeSharedRingBuffer
 except ImportError:
     # Fallback for different project structures
     import sys
     import os
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    from shared_ring_buffer_v3 import ProcessSafeSharedRingBuffer
+    from ringbuffers.shared_ring_buffer_v3 import ProcessSafeSharedRingBuffer
 
 BUFFER_CAPACITY = 5
 FRAME_SIZE = (10, 10, 3) # Example frame size (height, width, channels)

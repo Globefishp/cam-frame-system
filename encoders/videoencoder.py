@@ -4,7 +4,7 @@ import multiprocessing.shared_memory as mp_shm
 import multiprocessing.synchronize as mp_sync
 import numpy as np
 from typing import Tuple, Any, Optional, List
-from shared_ring_buffer import ProcessSafeSharedRingBuffer # Import the ring buffer class
+from ringbuffers.shared_ring_buffer import ProcessSafeSharedRingBuffer # Import the ring buffer class
 import time # Import time for speed calculation and warning throttling
 
 class BaseVideoEncoder(abc.ABC):
@@ -320,4 +320,4 @@ class BaseVideoEncoder(abc.ABC):
 
         print("VideoEncoder stopped.")
 
-from x264_encoder_x264 import X264Encoder # Import X264Encoder from the new file
+from encoders.x264_encoder_x264 import X264Encoder # Import X264Encoder from the new file

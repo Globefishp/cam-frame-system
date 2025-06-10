@@ -1,7 +1,7 @@
 import pytest
 from threading import Thread
 from time import sleep
-from ringbuffer import RingBuffer  # 替换your_module为你的模块名
+from ringbuffers.ringbuffer import RingBuffer  # 替换your_module为你的模块名
 
 class TestRingBuffer:
     def test_initialization(self):

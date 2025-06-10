@@ -10,7 +10,7 @@ from typing import Any, Tuple, Optional
 import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from nnanalyzer import NNAnalyzer
+from analyzers.nnanalyzer import NNAnalyzer
 
 # Mock NNAnalyzer subclass for testing
 class MockNNAnalyzer(NNAnalyzer):

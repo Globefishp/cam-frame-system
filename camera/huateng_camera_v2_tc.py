@@ -1,14 +1,23 @@
+# We intend to adapt IMX264 camera. Currently this file is not used in proj.
+# 1. ROI
+# 2. 12bit (linear storage?)
+# 3. Color transfer matrix + AWB? More accurate color.
+# 4. FPS control by soft trigger.
+
 import numpy as np
-import mvsdk
 import platform
 from typing import Optional, Tuple
 import ctypes # For memmove
 from typing import Tuple
 
-FRAME_TIME = 5
+from camera import mvsdk
+
+FRAME_TIME = 10
 TIMECODE_DTYPE = np.dtype("uint32") # Use numpy dtype for timecode
 TIMECODE_BYTES = TIMECODE_DTYPE.itemsize # Get size in bytes from dtype
 APPENDED_ROWS_FOR_TIMECODE = 1 # Number of extra rows to append for storing metadata
+
+# TODO: 更换了相机，尝试使用软件触发来控制帧率。
 
 def extract_tc_from_frames(
     combined_frames: np.ndarray,

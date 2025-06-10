@@ -8,8 +8,8 @@ import multiprocessing.synchronize as mp_sync
 import numpy as np
 from fractions import Fraction
 from typing import Tuple, Any, Optional, List
-from shared_ring_buffer import ProcessSafeSharedRingBuffer
-from videoencoder import BaseVideoEncoder # Import BaseVideoEncoder
+from ringbuffers.shared_ring_buffer import ProcessSafeSharedRingBuffer
+from encoders.videoencoder import BaseVideoEncoder # Import BaseVideoEncoder
 
 # Add imports for subprocess, sys, threading, and os here
 import av

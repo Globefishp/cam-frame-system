@@ -19,7 +19,7 @@ import cv2 # For image encoding/decoding
 from typing import Optional, Any, Tuple, Dict
 
 from nnanalyzer import NNAnalyzer
-from huateng_camera_tc import extract_tc_from_frames
+from camera.huateng_camera_tc import extract_tc_from_frames
 
 class SAM2RTRemoteAnalyzer(NNAnalyzer):
     def __init__(self,

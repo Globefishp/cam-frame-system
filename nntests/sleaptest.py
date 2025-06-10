@@ -10,7 +10,7 @@ import tensorflow as tf
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from sleap_peak_postprocessing import find_local_peaks
+from analyzers.sleap_peak_postprocessing import find_local_peaks
 
 # utils
 import matplotlib
