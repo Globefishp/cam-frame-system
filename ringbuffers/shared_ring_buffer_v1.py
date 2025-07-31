@@ -148,7 +148,7 @@ class ProcessSafeSharedRingBuffer:
                 # Initialize metadata in the metadata shared memory
                 self._init_metadata()
                 print(f"Shared Ring Buffer created. Metadata SHM: {self._metadata_shm.name}, "
-                      f"Data SHM: {self._data_shm.name}")
+                      f"Data SHM: {self._data_shm.name}, size: {self._data_buffer_size} bytes")
 
             except Exception as e:
                 print(f"Error creating Shared Ring Buffer: {e}")
@@ -213,7 +213,7 @@ class ProcessSafeSharedRingBuffer:
                 self._space_available = source_buffer.space_available_condition
 
                 print(f"Attached to Shared Ring Buffer. Metadata SHM: {self._metadata_shm.name}, "
-                      f"Data SHM: {self._data_shm.name}")
+                      f"Data SHM: {self._data_shm.name}, size: {self._data_buffer_size} bytes")
 
             except FileNotFoundError as e:
                 print(f"Error: Shared memory segment not found: {e}")
@@ -323,7 +323,7 @@ class ProcessSafeSharedRingBuffer:
                 # Re-read metadata after waiting
                 capacity, expected_frame_shape, expected_dtype, read_ptr, write_ptr, occupied_count, last_get_count = self._get_metadata()
         # RELEASE Lock when data is copying
-        # Access the data buffer directly
+        # Access the data buffer directly by numpy view, which is hard-coded to byte(uint8)
         data_buffer = np.ndarray(self._data_buffer_size, dtype=np.uint8, buffer=self._data_shm.buf)
         # print(data_buffer) # Debugging print
 
@@ -416,7 +416,7 @@ class ProcessSafeSharedRingBuffer:
                 # Re-read metadata after waiting
                 capacity, frame_shape, frame_dtype, read_ptr, write_ptr, occupied_count, last_get_count = self._get_metadata()
 
-        # Create a view of data buffer where further slicing occurs.
+        # Create a view of data buffer where further slicing occurs. The view is hard-coded to byte(uint8)
         data_buffer = np.ndarray(self._data_buffer_size, dtype=np.uint8, buffer=self._data_shm.buf)
         # print(data_buffer) # Debugging print
         frames_list = []
