@@ -774,7 +774,11 @@ class ProcessSafeSharedRingBuffer:
                 self._pointer_lock.release() # Release lock HERE
 
         return frame_copy
-
+    
+    @property
+    def dtype(self) -> np.dtype:
+        """Returns the dtype of the frame data in the buffer."""
+        return self._dtype
 
     @property
     def metadata_name(self) -> Optional[str]:

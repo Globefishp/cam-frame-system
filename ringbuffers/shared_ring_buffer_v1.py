@@ -484,6 +484,10 @@ class ProcessSafeSharedRingBuffer:
         self._set_metadata(read_ptr, write_ptr, new_occupied_count, 0) # Reset last_get_count to 0
         return last_get_count
 
+    @property
+    def dtype(self) -> np.dtype:
+        """Returns the dtype of the frame data in the buffer."""
+        return self._dtype
 
     @property
     def metadata_name(self) -> Optional[str]:
