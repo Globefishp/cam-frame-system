@@ -13,7 +13,8 @@ from multiprocessing.shared_memory import SharedMemory
 from collections import deque
 from typing import List, Optional, Any, Type # Import Type for class hints
 
-from camera.huateng_camera_tc import Camera
+from camera.abstractcamera import AbstractCamera
+from camera.huateng_camera_v3_1_tc_raw import HuatengCamera
 # from ringbuffer import RingBuffer # No longer needed
 from ringbuffers.shared_ring_buffer import ProcessSafeSharedRingBuffer
 # No longer need specific analyzer import here
@@ -41,7 +42,7 @@ class CameraSystem:
     for video encoding.
     """
     def __init__(self,
-                 camera: Camera,
+                 camera: AbstractCamera,
                  AnalyzerClass: Type[NNAnalyzer],
                  VideoEncoderClass: Type[BaseVideoEncoder],
                  analyzer_config: dict,
@@ -344,7 +345,7 @@ if __name__ == "__main__":
         print("No cameras found. Exiting test.")
         exit()
     # Use huateng_camera_tc.Camera which appends timecode
-    camera = Camera(DevList[0], exposure_time_ms=FRAME_TIME, tc=True) # Use exposure_time_ms as per huateng_camera_tc
+    camera = HuatengCamera(DevList[0], exposure_time_ms=FRAME_TIME, tc=True) # Use exposure_time_ms as per huateng_camera_tc
     if not camera.open():
         print("Failed to open camera. Exiting test.")
         exit()
