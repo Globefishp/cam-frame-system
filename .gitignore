@@ -3,6 +3,7 @@ tests/__pycache__/
 .pytest_cache/
 .vscode/
 .VSCodeCounter/
+*build*
 *.pyc
 *.mp4
 *.exe

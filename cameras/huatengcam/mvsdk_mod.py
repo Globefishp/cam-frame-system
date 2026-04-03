@@ -853,6 +853,19 @@ def CameraSetMediaType(hCamera, iMediaType):
 	SetLastError(err_code)
 	return err_code
 
+# --- Added by Haiyun Huang ---
+def CameraGetRawStartBit(hCamera):
+	piStartBit = c_int()
+	err_code = _sdk.CameraGetRawStartBit(hCamera, byref(piStartBit))
+	SetLastError(err_code)
+	return piStartBit.value
+
+def CameraSetRawStartBit(hCamera, iStartBit):
+	err_code = _sdk.CameraSetRawStartBit(hCamera, iStartBit)
+	SetLastError(err_code)
+	return err_code
+# --- End Addition ---
+
 def CameraSetAeState(hCamera, bAeState):
 	err_code = _sdk.CameraSetAeState(hCamera, bAeState)
 	SetLastError(err_code)

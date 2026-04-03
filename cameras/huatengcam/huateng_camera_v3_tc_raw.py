@@ -14,8 +14,8 @@ from typing import Tuple
 import time
 import collections
 
-from . import mvsdk
-from .extensions.huatengcam.unpack_12bit_raw import unpack_12bit_to_16bit_fast
+from . import mvsdk_mod as mvsdk
+from .extensions.unpack_12bit_raw import unpack_12bit_to_16bit_fast
 from . import PrecisionTimer
 
 FRAME_TIME = 10

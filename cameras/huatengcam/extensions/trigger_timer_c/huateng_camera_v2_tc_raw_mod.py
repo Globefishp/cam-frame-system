@@ -10,7 +10,7 @@ from typing import Optional, Tuple
 import ctypes # For memmove
 from typing import Tuple
 
-from . import mvsdk
+import cameras.huatengcam.mvsdk_mod as mvsdk
 
 FRAME_TIME = 10
 GAIN = 1.0
@@ -185,7 +185,7 @@ class Camera(object):
     """
     华腾相机，本文件中的 Camera 类根据 open 函数的 tc 参数决定是否返回帧末尾追加时间码的图像。
     如果启用时间码，时间码以 uint32 小端字节序存储，存储在图像的最后一行（Height）。
-    hibitdepth: 0: 8bit, 1: 12bit(Packed模式:实际占用1.5bpp, 需要想办法解码)
+    hibitdepth: 0: 8bit, 1: 12bit(Packed模式:实际占用1.5bpp)
     """
     def __init__(self, 
                  DevInfo, 
@@ -253,6 +253,9 @@ class Camera(object):
         """Returns the timebase (denominator) for timecode. 1/timebase = time per tick."""
         return 10000 # 0.1ms
 
+    # TODO: Framerate is not determined by exposure time. It's controlled by trigger.
+    # Some better `actual_fps` calc?
+    # No free run? lock by `target_fps`?
     @property
     def target_fps(self) -> float:
         """根据目标曝光时间返回目标 FPS。"""
@@ -432,7 +435,7 @@ class Camera(object):
         pFrameBuffer = self.pFrameBuffer
 
         try:
-            pRawData, FrameHead = mvsdk.CameraGetImageBuffer(hCamera, 60000)
+            pRawData, FrameHead = mvsdk.CameraGetImageBuffer(hCamera, 200)
             # mvsdk.CameraImageProcess(hCamera, pRawData, pFrameBuffer, FrameHead)
             # Copy RawData to a numpy array for inspection.
             # Image size before debayer is HxWx(Bpp), for 12bit packed, Bpp=1.5
@@ -452,7 +455,7 @@ class Camera(object):
             raw_data_np = raw_data_np.reshape(self.image_height, self.image_width)
             # print(raw_data_np.shape, raw_data_np.dtype)
 
-            return raw_data_np
+            return raw_data_np, FrameHead.uiTimeStamp # 0.1ms int32
 
         except mvsdk.CameraException as e:
             if e.error_code != mvsdk.CAMERA_STATUS_TIME_OUT:
@@ -484,7 +487,7 @@ class Camera(object):
         pFrameBuffer = self.pFrameBuffer
 
         try:
-            pRawData, FrameHead = mvsdk.CameraGetImageBuffer(hCamera, 60000)
+            pRawData, FrameHead = mvsdk.CameraGetImageBuffer(hCamera, 2000)
             mvsdk.CameraImageProcess(hCamera, pRawData, pFrameBuffer, FrameHead)
             mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
 

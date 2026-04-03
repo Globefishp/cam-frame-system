@@ -1,6 +1,8 @@
 # distutils: language = c
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 
+# v1.1 260402: Add extra_height parameter
+
 import numpy as np
 cimport numpy as np
 cimport cython
@@ -34,7 +36,7 @@ cdef np.ndarray _create_aligned_array(int num_pixels, size_t alignment):
     
     return aligned_array
 
-def unpack_12bit_to_16bit(packed_array, int height, int width):
+def unpack_12bit_to_16bit(packed_array, int height, int width, int extra_height=0):
     """
     Unpacks a 1D or 2D numpy array of 12-bit packed data into a 
     2D 16-bit numpy array.
@@ -44,6 +46,9 @@ def unpack_12bit_to_16bit(packed_array, int height, int width):
                       representing the 12-bit packed data.
         height (int): The height of the target image.
         width (int): The width of the target image.
+        extra_height (int): The number of extra rows to allocated after 
+            the image. Defaults to 0. The extra rows are **uninitialized**.
+            This is useful for store additional metadata after the image.
 
     Returns:
         A new 2D numpy array (height x width) of uint16 type containing 
@@ -62,6 +67,7 @@ def unpack_12bit_to_16bit(packed_array, int height, int width):
         raise ValueError("Image width must be an even number.")
 
     cdef int num_pixels = height * width
+    cdef int num_pixels_to_alloc = num_pixels + extra_height * width
     cdef int expected_packed_size = (num_pixels * 3) // 2
 
     if packed_array.size != expected_packed_size:
@@ -76,7 +82,7 @@ def unpack_12bit_to_16bit(packed_array, int height, int width):
 
     # Create the 1D output array with 16-byte alignment for SSE streaming stores
     cdef np.ndarray[np.uint16_t, ndim=1, mode='c'] unpacked_array_1d
-    unpacked_array_1d = _create_aligned_array(num_pixels, 16)
+    unpacked_array_1d = _create_aligned_array(num_pixels_to_alloc, 16)
 
     # Get pointers to the data buffers of the numpy arrays
     cdef unsigned char* src_ptr = &flat_packed_array[0]
@@ -86,12 +92,13 @@ def unpack_12bit_to_16bit(packed_array, int height, int width):
     unpack_12bit_raw(src_ptr, dst_ptr, num_pixels)
 
     # Reshape the 1D result into a 2D image and return it
-    return unpacked_array_1d.reshape((height, width))
+    return unpacked_array_1d.reshape((height+extra_height, width))
 
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-def unpack_12bit_to_16bit_fast(np.ndarray[np.uint8_t, ndim=1, mode='c'] packed_array, int height, int width):
+def unpack_12bit_to_16bit_fast(np.ndarray[np.uint8_t, ndim=1, mode='c'] packed_array, 
+                               int height, int width, int extra_height=0):
     """
     Unpacks a 1D numpy array of 12-bit packed data into a 2D 16-bit numpy array.
     
@@ -106,15 +113,20 @@ def unpack_12bit_to_16bit_fast(np.ndarray[np.uint8_t, ndim=1, mode='c'] packed_a
                       representing the 12-bit packed data.
         height (int): The height of the target image.
         width (int): The width of the target image.
+        extra_height (int): The number of extra rows to allocated after 
+            the image. Defaults to 0. The extra rows are **uninitialized**.
+            This is useful for store additional metadata after the image.
 
     Returns:
         A new 2D numpy array (height x width) of uint16 type containing 
         the unpacked pixel data.
     """
     cdef int num_pixels = height * width
+    cdef int num_pixels_to_alloc = num_pixels + extra_height * width
     
     # Create the output numpy array with 16-byte alignment for SSE streaming stores
-    cdef np.ndarray[np.uint16_t, ndim=1, mode='c'] unpacked_array_1d = _create_aligned_array(num_pixels, 16)
+    cdef np.ndarray[np.uint16_t, ndim=1, mode='c'] unpacked_array_1d = _create_aligned_array(
+        num_pixels_to_alloc, 16)
 
     # Get pointers to the data buffers of the numpy arrays
     cdef unsigned char* src_ptr = &packed_array[0]
@@ -124,4 +136,4 @@ def unpack_12bit_to_16bit_fast(np.ndarray[np.uint8_t, ndim=1, mode='c'] packed_a
     unpack_12bit_raw(src_ptr, dst_ptr, num_pixels)
 
     # Reshape the 1D result into a 2D image and return it
-    return unpacked_array_1d.reshape((height, width))
+    return unpacked_array_1d.reshape((height+extra_height, width))
