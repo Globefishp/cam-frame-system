@@ -12,6 +12,7 @@ class MpObjProxy:
     object born in the subprocess, via RPC through internal pipes.
 
     Limitations: 
+        - Multi-processing must in spawn mode: mp.set_start_method('spawn', force=True)
         - Only allow one to one RPC; 
         - returned property object is a copy, not sync'ed with the remote object.
           So any access to `self.obj.obj_value` should be forwarded by 
