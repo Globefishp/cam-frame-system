@@ -1,16 +1,15 @@
 # Sketched by Google Gemini 2.5 Flash exp, 
 # Manually corrected by Haiyun Huang 2025.
-# v2a: All by Claude Sonnet 4.6
+# v2a: by Claude Sonnet 4.6, cleanup by Haiyun Huang
 
 # Update log: 
 #   - v1: Basic function
 #   - v2: Add peek_last_frame (read while blocking put/get), 
 #         optimize pointer related func to increase throughput
-#   - v2a: Add proper pickle protocol (__getstate__/__setstate__) using a
-#           blacklist strategy, enabling direct DI injection of the buffer
-#           into subprocesses without manual create=False re-attachment.
-#           Attach mode (create=False) is kept for API compatibility but
-#           is now deprecated.
+#   - v2a: Add a pickle protocol (__getstate__/__setstate__) to hook the 
+#          serialization process, enabling direct DI injection of the buffer
+#          into `spawn` mode subprocesses instead of a manual re-attachment.
+#          Attach mode (create=False) is now deprecated.
 
 # Requirements: python > 3.9
 import multiprocessing as mp
@@ -18,7 +17,7 @@ import multiprocessing.shared_memory as mp_shm
 import multiprocessing.synchronize as mp_sync
 import numpy as np
 import ctypes
-from typing import Tuple, Any, Optional, List, overload # Import overload
+from typing import Tuple, Any, Optional, List, overload
 import time # Import time for timeouts
 
 
@@ -54,10 +53,8 @@ class ProcessSafeSharedRingBuffer:
     Uses a pointer lock to synchronize access to metadata.
     Allows one `put` and one `get` concurrently. Optimized for performance.
 
-    Supports pickle protocol (__getstate__/__setstate__) for transparent
-    cross-process passing via DI injection. When an instance is passed as
-    an argument to mp.Process, it is automatically re-attached in the child
-    process without any manual create=False call.
+    v2a supports full serialization across multi-processes in `spawn` mode.
+    Attach mode is deprecated. Please pass the initialized buffer to subprocess directly.
 
     Notes:
         - For detailed instructions and limitation, refer to docstring of `put` and `get`.
@@ -248,17 +245,13 @@ class ProcessSafeSharedRingBuffer:
                 raise
 
     # -------------------------------------------------------------------------
-    # Pickle Protocol (v2a addition)
+    # Pickle Protocol (added in v2a)
     # -------------------------------------------------------------------------
 
     def __getstate__(self) -> dict:
         """
-        Custom pickle serialization using a blacklist strategy.
-
-        Rule: exclude any attribute that is a process-local memory address binding.
-        All pure Python state (_buffer_capacity, _frame_shape, _dtype, _frame_bytes,
-        _data_buffer_size, _pointer_lock, _data_available, _space_available) passes
-        through automatically.
+        Custom pickle serialization that exclude process-local resources.
+        Shared memory are automatically re-attach after pickle.
 
         Blacklisted attributes (stable set — expand only when a new process-local
         memory binding is introduced):
@@ -273,21 +266,16 @@ class ProcessSafeSharedRingBuffer:
 
             _data_shm        : Same as _metadata_shm.
 
-        Pass-through attributes (not blacklisted):
-            _pointer_lock, _data_available, _space_available:
-                mp.Lock / mp.Condition — designed to be picklable and cross-process.
+        Other python attributes are picklable and will pass directly
         """
         state = self.__dict__.copy()
 
         # Remove the process-local ctypes binding entirely; __setstate__ will rebuild it.
         del state['_metadata_ctypes']
-
         # Replace SharedMemory objects with their name strings for cross-process re-attachment.
         state['_metadata_shm'] = self._metadata_shm.name if self._metadata_shm else None
         state['_data_shm']     = self._data_shm.name     if self._data_shm     else None
 
-        # _pointer_lock, _data_available, _space_available are mp primitives —
-        # they go through as-is. No action needed.
         return state
 
     def __setstate__(self, state: dict):
@@ -298,8 +286,8 @@ class ProcessSafeSharedRingBuffer:
         to the shared memory segments by name, and finally rebuilds the ctypes
         mapping (_metadata_ctypes) bound to this process's virtual address.
 
-        This method is called automatically when an instance is unpickled in a
-        child process, enabling transparent DI injection:
+        This method is called when an instance is unpickled in a child process,
+        enabling transparent DI injection:
 
             buffer = ProcessSafeSharedRingBuffer(create=True, ...)
             encoder = MyEncoder(shared_buffer=buffer, ...)
@@ -309,10 +297,9 @@ class ProcessSafeSharedRingBuffer:
         # 1. Restore all Python-level attributes (capacity, shape, dtype, locks, etc.)
         self.__dict__.update(state)
 
-        # 2. At this point _metadata_shm and _data_shm are name strings (from __getstate__).
-        #    Re-attach to the named shared memory segments.
+        # 2. Re-attach to the named shared memory segments.
         metadata_name: Optional[str] = self._metadata_shm  # type: ignore[assignment]
-        data_name:     Optional[str] = self._data_shm       # type: ignore[assignment]
+        data_name:     Optional[str] = self._data_shm      # type: ignore[assignment]
 
         if metadata_name is not None:
             self._metadata_shm = mp_shm.SharedMemory(name=metadata_name)
