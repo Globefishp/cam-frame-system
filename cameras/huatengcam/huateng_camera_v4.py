@@ -125,7 +125,7 @@ class HuatengCamera(AC):
         try:
             hCamera = mvsdk.CameraInit(self._DevInfo, -1, -1)
         except MvCamException as e:
-            raise HuatengSDKException(e, src_func="HuatengCamera.open")
+            raise HuatengSDKException(e, src_func="HuatengCamera.open") from e
         self._hCamera = hCamera
 
         self._cap = mvsdk.CameraGetCapability(hCamera)
@@ -244,7 +244,7 @@ class HuatengCamera(AC):
             mvsdk.CameraRstTimeStamp(self._hCamera) # 重置时间戳
             mvsdk.CameraPlay(self._hCamera)
         except MvCamException as e:
-            raise HuatengSDKException(e, src_func="HuatengCamera.start_capture")
+            raise HuatengSDKException(e, src_func="HuatengCamera.start_capture") from e
         self._is_capturing = True
         logger.info(f"Camera {self._DevInfo.GetProductName()} started capturing.")
     
@@ -253,7 +253,7 @@ class HuatengCamera(AC):
         try:
             mvsdk.CameraStop(self._hCamera)
         except MvCamException as e:
-            raise HuatengSDKException(e, src_func="HuatengCamera.stop_capture")
+            raise HuatengSDKException(e, src_func="HuatengCamera.stop_capture") from e
         self._is_capturing = False
         logger.info(f"Camera {self._DevInfo.GetProductName()} stopped capturing.")
     
@@ -418,7 +418,7 @@ class HuatengCamera(AC):
 
         except MvCamException as e:
             if e.error_code != mvsdk.CAMERA_STATUS_TIME_OUT:
-                raise HuatengSDKException(e, "Failed to grab frame", extra_info="HuatengCamera.grab_metadata")
+                raise HuatengSDKException(e, "Failed to grab frame", extra_info="HuatengCamera.grab_metadata") from e
             else:
                 logger.warning(f"Timeout to grab frame ({self._frames_captured + 1}).")
                 return None, None
