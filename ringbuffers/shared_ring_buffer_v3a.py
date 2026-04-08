@@ -1,38 +1,43 @@
 # Sketched by Google Gemini 2.5 Flash exp, 
 # Manually corrected by Haiyun Huang 2025.
-# v2a: by Claude Sonnet 4.6, cleanup & reviewed by Haiyun Huang 260406
+# v3a: copied from v2a by Haiyun Huang 260407
 
 # Update log: 
 #   - v1: Basic function
 #   - v2: Add peek_last_frame (read while blocking put/get), 
 #         optimize pointer related func to increase throughput
-#   - v2a: Add a pickle protocol (__getstate__/__setstate__) to hook the 
-#          serialization process, enabling direct DI injection of the buffer
-#          into `spawn` mode subprocesses instead of a manual re-attachment.
-#          Instantiating in attach mode (create=False) is now replaced by 
-#          re-attach method `attach()` which can be called after close() but 
-#          before global unlink().
-
+#   - v3: Refactor peek_last_frame, allowing parallel read/put/get, 
+#         useful in peek-intensive applications. (slightly slower put/get 
+#         performance than v2)
+#         Potential future improvement: split _get/set_pointer_metadata to 
+#         smaller functions, return less items (split according to the use case)
+#   - v3a: Add a functionally pickle support for (and only for) cross-process
+#          serialization. Hook the serialization process by __getstate__ and 
+#          __setstate__ (same as v2a), and handle re-attachment automatically. 
+#          See v2a for more detail. Not tested, only copy v2a lifecycle
+#          management code.
 
 # for infrastructure, using print and raise instead of logger.
 # `try` block is for cleanup, not logging or retry. Raise original Exception type. 
 
 # Requirements: python > 3.9
+
 import multiprocessing as mp
 import multiprocessing.shared_memory as mp_shm
 import multiprocessing.synchronize as mp_sync
 import numpy as np
 import ctypes
-from typing import Tuple, Any, Optional, List, overload
+import warnings
+from typing import Tuple, Any, Optional, List, overload # Import overload
 import time # Import time for timeouts
 
 
 # Define the metadata structure size
 # Using a simple structure for demonstration: capacity, frame_size (h, w, c), dtype_kind, dtype_bits, read_ptr, write_ptr, count
 # Using int64 for safety, adjust if needed. Let's ensure enough space.
-# 10 fields * 8 bytes/field (for int64) = 80 bytes. Let's use 128 bytes to be safe and allow for potential future additions.
+# 10 fields + 2 new fields * 8 bytes/field (for int64) = 96 bytes. Let's use 128 bytes to be safe.
 
-METADATA_SIZE = 128
+METADATA_SIZE = 128 # Keep 128 for alignment and future additions
 class Metadata(ctypes.Structure):
     '''
     Metadata structure for the shared ring buffer.
@@ -49,7 +54,9 @@ class Metadata(ctypes.Structure):
         ("read_ptr", ctypes.c_int64),
         ("write_ptr", ctypes.c_int64),
         ("occupied_count", ctypes.c_int64),
-        ("last_get_count", ctypes.c_int64)
+        ("next_release_count", ctypes.c_int64),
+        ("protected_count", ctypes.c_int64), # Added: Frames protected by peek
+        ("eager_release_count", ctypes.c_int64), # Added: Frames to release after peek
     ]
 
 class ProcessSafeSharedRingBuffer:
@@ -58,10 +65,6 @@ class ProcessSafeSharedRingBuffer:
     two SharedMemory blocks: one for metadata and one for frame data.
     Uses a pointer lock to synchronize access to metadata.
     Allows one `put` and one `get` concurrently. Optimized for performance.
-
-    v2a supports full serialization across multi-processes in `spawn` mode.
-    Attach mode is not preferred. Please pass the initialized buffer to 
-    subprocess directly.
 
     Notes:
         - For detailed instructions and limitation, refer to docstring of `put` and `get`.
@@ -198,7 +201,7 @@ class ProcessSafeSharedRingBuffer:
                 self._space_available = source_buffer.space_available_condition
 
                 print(f"Attached to Shared Ring Buffer. Metadata SHM: {self._metadata_shm.name}, "
-                        f"Data SHM: {self._data_shm.name}, size: {self._data_buffer_size} bytes")
+                      f"Data SHM: {self._data_shm.name}, size: {self._data_buffer_size} bytes")
 
             except FileNotFoundError as e:
                 print(f"Error: Shared memory segment not found: {e}")
@@ -227,7 +230,8 @@ class ProcessSafeSharedRingBuffer:
         # Should not reach here, but just in case.
 
         # Read all metadata using _get_metadata
-        capacity, frame_shape, frame_dtype, read_ptr, write_ptr, occupied_count, last_get_count = self._get_metadata()
+        capacity, frame_shape, frame_dtype, read_ptr, write_ptr, \
+        occupied_count, next_release_count, protected_count, eager_release_count = self._get_metadata()
 
         # Set instance attributes based on read metadata
         self._buffer_capacity = capacity
@@ -246,12 +250,7 @@ class ProcessSafeSharedRingBuffer:
                             f"calculated size based on metadata ({self._data_buffer_size}). \n"
                             f"This might be due to system-specific shared memory allocation "
                             f"behavior. Will use calculated size.")
-        
         # Multiprocessing synchronization objects are not touched here.
-
-    # -------------------------------------------------------------------------
-    # Pickle Protocol (added in v2a)
-    # -------------------------------------------------------------------------
 
     def __getstate__(self) -> dict:
         """
@@ -279,11 +278,6 @@ class ProcessSafeSharedRingBuffer:
         # Rebuild the ctypes mapping bound to THIS process's virtual address.
         self._metadata_ctypes = Metadata.from_buffer(self._metadata_shm.buf)
 
-
-    # -------------------------------------------------------------------------
-    # Internal helpers
-    # -------------------------------------------------------------------------
-
     def _init_metadata(self):
         """
         Initializes the metadata in the metadata shared memory.
@@ -307,7 +301,9 @@ class ProcessSafeSharedRingBuffer:
         self._metadata_ctypes.read_ptr = 0
         self._metadata_ctypes.write_ptr = 0
         self._metadata_ctypes.occupied_count = 0
-        self._metadata_ctypes.last_get_count = 0
+        self._metadata_ctypes.next_release_count = 0
+        self._metadata_ctypes.protected_count = 0 # Initialize new field
+        self._metadata_ctypes.eager_release_count = 0 # Initialize new field
 
     def _get_metadata(self):
         """
@@ -320,16 +316,18 @@ class ProcessSafeSharedRingBuffer:
 
         # # Access metadata ctypes directly
 
-        capacity =       self._metadata_ctypes.capacity
-        frame_h =        self._metadata_ctypes.frame_h
-        frame_w =        self._metadata_ctypes.frame_w
-        frame_c =        self._metadata_ctypes.frame_c
-        dtype_kind =     self._metadata_ctypes.dtype_kind  # 后续需要转换为字符（如 'u'）
-        dtype_bits =     self._metadata_ctypes.dtype_bits
-        read_ptr =       self._metadata_ctypes.read_ptr
-        write_ptr =      self._metadata_ctypes.write_ptr
-        count =          self._metadata_ctypes.occupied_count
-        last_get_count = self._metadata_ctypes.last_get_count
+        capacity =           self._metadata_ctypes.capacity
+        frame_h =            self._metadata_ctypes.frame_h
+        frame_w =            self._metadata_ctypes.frame_w
+        frame_c =            self._metadata_ctypes.frame_c
+        dtype_kind =         self._metadata_ctypes.dtype_kind  # 后续需要转换为字符（如 'u'）
+        dtype_bits =         self._metadata_ctypes.dtype_bits
+        read_ptr =           self._metadata_ctypes.read_ptr
+        write_ptr =          self._metadata_ctypes.write_ptr
+        count =              self._metadata_ctypes.occupied_count
+        next_release_count = self._metadata_ctypes.next_release_count
+        protected_count =    self._metadata_ctypes.protected_count # Read new field
+        eager_release_count= self._metadata_ctypes.eager_release_count # Read new field
 
         # Validate and reconstruct dtype
         if not (0 <= dtype_kind <= 127):
@@ -337,27 +335,29 @@ class ProcessSafeSharedRingBuffer:
         read_dtype_kind = chr(dtype_kind)
         frame_dtype = np.dtype(f'{read_dtype_kind}{dtype_bits // 8}')
 
-        return capacity, (frame_h, frame_w, frame_c), frame_dtype, read_ptr, write_ptr, count, last_get_count
+        return capacity, (frame_h, frame_w, frame_c), frame_dtype, read_ptr, write_ptr, count, next_release_count, protected_count, eager_release_count
 
     def _get_pointers_metadata(self):
         """
-        Reads pointer-related metadata (read_ptr, write_ptr, occupied_count, last_get_count)
+        Reads pointer-related metadata (read_ptr, write_ptr, occupied_count, next_release_count)
         from the metadata shared memory. Assumes pointer_lock is held.
         This method is intended for frequent access to mutable metadata.
         """
         if self._metadata_ctypes is None:
             raise RuntimeError("Metadata shared memory not properly initialized.")
 
-        read_ptr =       self._metadata_ctypes.read_ptr
-        write_ptr =      self._metadata_ctypes.write_ptr
-        occupied_count = self._metadata_ctypes.occupied_count
-        last_get_count = self._metadata_ctypes.last_get_count
+        read_ptr =           self._metadata_ctypes.read_ptr
+        write_ptr =          self._metadata_ctypes.write_ptr
+        occupied_count =     self._metadata_ctypes.occupied_count
+        next_release_count = self._metadata_ctypes.next_release_count
+        protected_count =    self._metadata_ctypes.protected_count # Read new field
+        eager_release_count= self._metadata_ctypes.eager_release_count # Read new field
 
-        return read_ptr, write_ptr, occupied_count, last_get_count
+        return read_ptr, write_ptr, occupied_count, next_release_count, protected_count, eager_release_count
 
-    def _set_pointers_metadata(self, read_ptr: int, write_ptr: int, count: int, last_get_count: int):
+    def _set_pointers_metadata(self, read_ptr: int, write_ptr: int, occupied_count: int, next_release_count: int, protected_count: int, eager_release_count: int):
         """
-        Writes pointer-related metadata (read_ptr, write_ptr, occupied_count, last_get_count)
+        Writes pointer-related metadata (read_ptr, write_ptr, occupied_count, next_release_count)
         to the metadata shared memory. Assumes pointer_lock is held.
         This method is intended for updating mutable metadata.
         """
@@ -368,12 +368,11 @@ class ProcessSafeSharedRingBuffer:
 
         self._metadata_ctypes.read_ptr = read_ptr
         self._metadata_ctypes.write_ptr = write_ptr
-        self._metadata_ctypes.occupied_count = count
-        self._metadata_ctypes.last_get_count = last_get_count
+        self._metadata_ctypes.occupied_count = occupied_count
+        self._metadata_ctypes.next_release_count = next_release_count
+        self._metadata_ctypes.protected_count = protected_count # Write new field
+        self._metadata_ctypes.eager_release_count = eager_release_count # Write new field
 
-    # -------------------------------------------------------------------------
-    # Public API: put / get / peek / release
-    # -------------------------------------------------------------------------
 
     def put(self, frames: np.ndarray, timeout: Optional[float] = None):
         """
@@ -388,24 +387,30 @@ class ProcessSafeSharedRingBuffer:
         if self._metadata_shm is None or self._data_shm is None or self._pointer_lock is None or self._space_available is None or self._data_available is None:
             print("Error: Shared buffer not fully initialized.")
             return False
+        
+        # Validate requests, too many checks may reduce performance
+        # Validate frame counts to put
+        if len(frames) > self._buffer_capacity:
+            print(f"Error: Frame count {len(frames)} exceeds buffer capacity {self._buffer_capacity}.")
+            return False
 
+        # Validate frame size and dtype using cached attributes
+        if frames.shape[-3:] != self._frame_shape:
+            print(f"Error: Frame size mismatch. Expected {self._frame_shape}, got {frames.shape[-3:]}")
+            return False
+            
+        if frames.dtype != self._dtype:
+            print(f"Error: Frame dtype mismatch. Expected {self._dtype}, got {frames.dtype}")
+            return False # Return False as frame is invalid
+        
         # Validate frame size and dtype
         # Reading metadata requires the lock for consistency
         with self._pointer_lock: # Acquire lock for metadata access and synchronization
             # Read mutable metadata under lock
-            read_ptr, write_ptr, occupied_count, last_get_count = self._get_pointers_metadata()
+            read_ptr, write_ptr, occupied_count, next_release_count, _, _ = self._get_pointers_metadata()
             # print(f'At put head: read_ptr: {read_ptr}, write_ptr: {write_ptr}, \
-            #       occupied_count: {occupied_count}, last_get_count: {last_get_count}') # Debugging print
+            #       occupied_count: {occupied_count}, next_release_count: {next_release_count}') # Debugging print
 
-            # Validate frame size and dtype using cached attributes
-            if frames.shape[-3:] != self._frame_shape:
-                print(f"Error: Frame size mismatch. Expected {self._frame_shape}, got {frames.shape[-3:]}")
-                return False
-                
-            if frames.dtype != self._dtype:
-                print(f"Error: Frame dtype mismatch. Expected {self._dtype}, got {frames.dtype}")
-                return False # Return False as frame is invalid
-            
             put_frame_num = frames.shape[0]
             # Wait for space to become available
             while occupied_count + put_frame_num > self._buffer_capacity: # The buffer is full
@@ -414,7 +419,7 @@ class ProcessSafeSharedRingBuffer:
                 if not self._space_available.wait(timeout=timeout):
                     return False # Timeout
                 # Re-read mutable metadata after waiting
-                read_ptr, write_ptr, occupied_count, last_get_count = self._get_pointers_metadata()
+                read_ptr, write_ptr, occupied_count, next_release_count, _, _ = self._get_pointers_metadata()
         # RELEASE Lock when data is copying
         # Access the data buffer directly by numpy view, which is hard-coded to byte(uint8)
         data_buffer = np.ndarray(self._data_buffer_size, dtype=np.uint8, buffer=self._data_shm.buf)
@@ -453,14 +458,18 @@ class ProcessSafeSharedRingBuffer:
 
         with self._pointer_lock: # Acquire lock after data copy
             # Read mutable metadata again, in case `read_ptr` has changed
-            read_ptr, write_ptr, occupied_count, last_get_count = self._get_pointers_metadata()
+            (read_ptr, write_ptr, occupied_count, next_release_count, 
+             protected_count, eager_release_count) = self._get_pointers_metadata()
             # Update metadata
             new_write_ptr = (write_ptr + put_frame_num) % self._buffer_capacity
             new_count = occupied_count + put_frame_num
-            self._set_pointers_metadata(read_ptr, new_write_ptr, new_count, last_get_count) # Use read_ptr obtained under the same lock
+            # If peeking, update protected_count correspondingly
+            new_protected_count = (protected_count + put_frame_num) if protected_count > 0 else 0 
+            self._set_pointers_metadata(read_ptr, new_write_ptr, new_count, next_release_count, 
+                                        new_protected_count, eager_release_count) # Use read_ptr obtained under the same lock
 
             # print(f'At put tail: read_ptr: {read_ptr}, write_ptr: {new_write_ptr}, \
-            #       occupied_count: {new_count}, last_get_count: {last_get_count}')
+            #       occupied_count: {new_count}, next_release_count: {next_release_count}')
 
             # Notify that data is available (under lock)
             self._data_available.notify()
@@ -501,15 +510,15 @@ class ProcessSafeSharedRingBuffer:
             if released_count > 0:
                 self._space_available.notify() # Some space is available, the lock will be released at `wait` (see after)
             # Read mutable metadata
-            read_ptr, write_ptr, occupied_count, last_get_count = self._get_pointers_metadata()
+            read_ptr, write_ptr, occupied_count, next_release_count, protected_count, eager_release_count = self._get_pointers_metadata()
             # Wait for data to become available
             # print(f'At get head: read_ptr: {read_ptr}, write_ptr: {write_ptr}, \
-            #       occupied_count: {occupied_count}, last_get_count: {last_get_count}') # Debugging print
-            while occupied_count - get_frame_num < 0: # Buffer has no enough data to get
+            #       occupied_count: {occupied_count}, next_release_count: {next_release_count}') # Debugging print
+            while (occupied_count - next_release_count) < get_frame_num: # Buffer has no enough data to get
                 if not self._data_available.wait(timeout=timeout):
                     return None # Timeout
                 # Re-read mutable metadata after waiting
-                read_ptr, write_ptr, occupied_count, last_get_count = self._get_pointers_metadata()
+                read_ptr, write_ptr, occupied_count, next_release_count, protected_count, eager_release_count = self._get_pointers_metadata()
 
         # Create a view of data buffer where further slicing occurs. The view is hard-coded to byte(uint8)
         data_buffer = np.ndarray(self._data_buffer_size, dtype=np.uint8, buffer=self._data_shm.buf)
@@ -545,19 +554,149 @@ class ProcessSafeSharedRingBuffer:
 
         with self._pointer_lock: # Acquire lock after data read
             # Read mutable metadata again, in case `write_ptr` has changed
-            read_ptr, write_ptr, occupied_count, last_get_count = self._get_pointers_metadata()
-            # Update metadata (read_ptr and last_get_count) (under lock)
+            read_ptr, write_ptr, occupied_count, next_release_count, protected_count, eager_release_count = self._get_pointers_metadata()
+            # Update metadata (read_ptr and next_release_count) (under lock)
             new_read_ptr = (read_ptr + get_frame_num) % self._buffer_capacity
-            self._set_pointers_metadata(new_read_ptr, write_ptr, occupied_count, get_frame_num) # Use write_ptr obtained under the same lock
+            self._set_pointers_metadata(new_read_ptr, write_ptr, occupied_count, get_frame_num, protected_count, eager_release_count) # Use write_ptr obtained under the same lock
             # the occupied_count is unchanged, the returned frames are not released here.
-            # the `last_get_count` is updated. For the design concept, see `_release_last_got_data`.
+            # the `next_release_count` is updated. For the design concept, see `_release_last_got_data`.
 
             # Since the frames are not released, do not notify that space is available here.
             # self._space_available.notify()
         # Lock released HERE
 
         return frames_list # Successfully got frame
-    
+
+    def peek_frames(self, offset: int, num_frames: int, timeout: Optional[float] = 0.1) -> Optional[np.ndarray]:
+        """
+        Gets a copy of `num_frames` frames without removing them, starting from 
+        last `offset` frame (i.e. offset relative to newest frame). Frames are
+        read from oldest to newest.
+
+        Args:
+            offset: (int), the offset from the write pointer (0 for the last frame, 1 for the second last, etc.).
+            num_frames: (int), the number of frames to read starting from the offset.
+                        Should >= 1, <= offset + 1
+            timeout: (Optional[float]), seconds to wait for acquiring the lock.
+                     If None, block indefinitely, default 0.1s.
+        Returns:
+            A numpy ndarrays containing copies of the requested frames, (f, h, w, c)
+            or None if the buffer is currently empty or the offset/num_frames is invalid
+            or acquiring lock timeout.
+        """
+        if self._metadata_shm is None or self._data_shm is None or self._pointer_lock is None or self._metadata_ctypes is None:
+            print("Error: Shared buffer not fully initialized for peek_frames.")
+            return None
+
+        acquired_lock = False
+
+        # Stage 1 (with lock): Acquire lock and update metadata for protection
+        acquired_lock = self._pointer_lock.acquire(timeout=timeout)
+        if not acquired_lock:
+                print("Timeout acquiring lock for peek_frames (Stage 1).")
+                return None
+
+        try:
+            # Read mutable metadata
+            read_ptr, write_ptr, occupied_count, next_release_count, protected_count, eager_release_count = self._get_pointers_metadata()
+
+            # Validate request: Check if the offset and num_frames are valid and if there are enough frames.
+            # Also check if protected_count is 0, assuming non-concurrent peek operations.
+            # use a looser validation: allow accessing unreleased frames
+            available_frames = occupied_count # - next_release_count
+            if offset < 0 or offset >= available_frames or num_frames <= 0 or num_frames > offset + 1:
+                 print(f"Error: Invalid offset ({offset}) or num_frames ({num_frames}). Available frame count is {available_frames}.")
+                 return None # Invalid request
+
+            if protected_count > 0:
+                 print(f"Error: Another peek operation is in progress. protected_count is {protected_count}.")
+                 return None # Non-concurrent peek assumption violated
+
+
+            # Calculate new protected_count and eager_release_count
+            new_protected_count = offset + 1
+            # eager_release_count is for frames that were supposed to be released by get
+            # but are now protected by peek.
+            new_eager_release_count = max(0, new_protected_count + next_release_count - occupied_count)
+
+            # Update metadata: set protected_count and eager_release_count
+            self._set_pointers_metadata(read_ptr, write_ptr, occupied_count, next_release_count, new_protected_count, new_eager_release_count)
+
+            # Calculate the index of the first frame to peek
+            start_index_to_peek = (write_ptr - offset - 1) % self._buffer_capacity
+            # Calculate the index of the last frame to peek,
+            end_index_to_peek = (start_index_to_peek + num_frames) % self._buffer_capacity
+
+            # Handling wrap-around for frames to copy
+            slices_to_copy = [] # Store slices to copy
+            if end_index_to_peek <= start_index_to_peek: # wraps around
+                # Two segments to copy
+                first_seg_slots = self._buffer_capacity - start_index_to_peek
+                second_seg_slots = num_frames - first_seg_slots
+
+                first_seg_start_bytes = start_index_to_peek * self._frame_bytes
+                first_seg_end_bytes = self._buffer_capacity * self._frame_bytes
+                second_seg_start_bytes = 0
+                second_seg_end_bytes = (end_index_to_peek + 1) * self._frame_bytes
+
+                # (start_bytes, end_bytes)
+                slices_to_copy.append((slice(first_seg_start_bytes, first_seg_end_bytes), first_seg_slots))
+                slices_to_copy.append((slice(second_seg_start_bytes, second_seg_end_bytes), second_seg_slots))
+
+            else: # No wrap around
+                # One segment to copy
+                slices_to_copy.append((slice(start_index_to_peek * self._frame_bytes, 
+                                             (end_index_to_peek + 1) * self._frame_bytes), num_frames))
+
+        except Exception as e:
+             print(f"Error during peek_frames Stage 1: {e}")
+             return None # Indicate failure
+        finally:
+            self._pointer_lock.release() # Release lock after Stage 1
+
+        # Stage 2 (no lock): Copy data
+        try:
+            data_buffer_views = []
+            for slice_to_copy, slots in slices_to_copy:
+                data_buffer_views.append(np.ndarray((slots, ) + self._frame_shape, 
+                                                    dtype=self._dtype, 
+                                                    buffer=self._data_shm.buf[slice_to_copy]))
+
+            # np.concat always return a copy.
+            frame_copies = np.concat(data_buffer_views, axis=0, dtype=self._dtype)
+
+        except Exception as e:
+            # Handle potential errors during view creation or copying
+            print(f"Error accessing or copying frame data in peek_frames Stage 2: {e}")
+            return None # Return None on error
+        
+        finally:
+            # Stage 3 (with lock): Acquire lock and update metadata for release
+            try:
+                with self._pointer_lock:
+                    # Must acquire lock again to ensure correct protected_count (important) and
+                    # eager_release_count update.
+
+                    # Read mutable metadata
+                    read_ptr, write_ptr, occupied_count, next_release_count, protected_count, eager_release_count = self._get_pointers_metadata()
+
+                    # Release eager frames and reset protected_count and eager_release_count
+                    eager_released_now = eager_release_count
+                    new_occupied_count = min(occupied_count - eager_released_now, occupied_count)
+                    self._set_pointers_metadata(read_ptr, write_ptr, new_occupied_count, next_release_count, 0, 0)
+
+                    if eager_released_now > 0:
+                        self._space_available.notify() # Notify that space is available
+
+            except Exception as e:
+                print(f"Error during peek_frames Stage 3: {e}")
+                # Data was copied, but metadata couldn't be updated.
+                # The protected_count will remain set, blocking future peeks until a get/release happens.
+                # Consider adding a more robust cleanup mechanism or logging.
+                return None
+
+        return frame_copies # Successfully peeked and copied frames
+
     def _release_last_got_data(self) -> int:
         """
         Release previously preserved data (returned by last `get` call) from the buffer.
@@ -571,15 +710,25 @@ class ProcessSafeSharedRingBuffer:
         # when read_ptr == write_ptr and occupied_count == capacity
         # Is the buffer empty? or full? Depends on whether a `get` is called 
         # after a `put`.
-        # So unfortunately we need to introduce one more metadata: `last_get_count`
-        # It's maintained here and in `get`.
-        read_ptr, write_ptr, occupied_count, last_get_count = self._get_pointers_metadata()
-        new_occupied_count = occupied_count - last_get_count 
-        # New occupied_count should 'release' the frame count of last `get` call.
-        if new_occupied_count < 0: # This should never happen, but just in case.
-            new_occupied_count = 0
-        self._set_pointers_metadata(read_ptr, write_ptr, new_occupied_count, 0) # Reset last_get_count to 0
-        return last_get_count
+        # So unfortunately we need to introduce one more metadata: `next_release_count`
+        # It's maintained here and in `get`. It now also considers `protected_count`.
+        read_ptr, write_ptr, occupied_count, next_release_count, protected_count, eager_release_count = self._get_pointers_metadata()
+
+        # Calculate frames that can actually be released, respecting protected frames.
+        # protected_count represents the N newest frames that cannot be released.
+        # We can only release frames from the oldest ones (next_release_count).
+        # Logically, protected_count should not exceed occupied_count.
+        actual_release = min(next_release_count, occupied_count - protected_count)
+
+        # Calculate frames that were intended for release but couldn't be due to protection.
+        pending_release = next_release_count - actual_release
+
+        new_occupied_count = occupied_count - actual_release
+        new_eager_release_count = eager_release_count + pending_release
+        # Update metadata: adjust occupied_count, set next_release_count to 0, add pending to eager.
+        # Note: protected_count is managed by peek_frames.
+        self._set_pointers_metadata(read_ptr, write_ptr, new_occupied_count, 0, protected_count, new_eager_release_count)
+        return actual_release # Return the number of frames actually released
     
     def release_last_got_data(self) -> int:
         """
@@ -598,10 +747,11 @@ class ProcessSafeSharedRingBuffer:
             self._space_available.notify() # Notify that space is available
 
         return released_count # Successfully released occupied frames
-
+    
     def peek_last_frame(self, timeout: Optional[float] = 0.1) -> Optional[np.ndarray]:
         """
         Gets a copy of the last frame written to the buffer without removing it.
+        Deceperated, use `peek_frames` instead.
 
         Args:
             timeout: (Optional[float]), seconds to wait for acquiring the lock. 
@@ -625,7 +775,7 @@ class ProcessSafeSharedRingBuffer:
                  return None
 
             # Read mutable metadata
-            read_ptr, write_ptr, occupied_count, last_get_count = self._get_pointers_metadata()
+            read_ptr, write_ptr, occupied_count, next_release_count, _ ,_ = self._get_pointers_metadata()
 
             # Check if there's at least one frame physically in the buffer slots.
             # occupied_count > 0 indicates something is conceptually in the buffer.
@@ -669,11 +819,7 @@ class ProcessSafeSharedRingBuffer:
                 self._pointer_lock.release() # Release lock HERE
 
         return frame_copy
-
-    # -------------------------------------------------------------------------
-    # Properties
-    # -------------------------------------------------------------------------
-
+    
     @property
     def dtype(self) -> np.dtype:
         """Returns the dtype of the frame data in the buffer."""
@@ -696,12 +842,12 @@ class ProcessSafeSharedRingBuffer:
             raise RuntimeError("Shared buffer not fully initialized.")
 
         with self._pointer_lock:
-            read_ptr, write_ptr, occupied_count, last_get_count = self._get_pointers_metadata()
+            read_ptr, write_ptr, occupied_count, next_release_count, _, _ = self._get_pointers_metadata()
             # The number of frames available for the *next* get call
-            count = occupied_count - last_get_count
+            count = occupied_count - next_release_count
             count = max(0, count) # Ensure non-negative
             return count
-    
+        
     @property
     def buffer_capacity(self) -> int:
         """Returns the total capacity of the buffer."""
@@ -740,10 +886,10 @@ class ProcessSafeSharedRingBuffer:
         return count
 
     @property
-    def last_get_count_debug(self) -> int:
-        """Debug property: Returns the raw last_get_count metadata."""
+    def next_release_count_debug(self) -> int:
+        """Debug property: Returns the raw next_release_count metadata."""
         if self._metadata_shm is None or self._pointer_lock is None or self._metadata_ctypes is None:
-             print("Warning: last_get_count_debug called on uninitialized buffer.")
+             print("Warning: next_release_count_debug called on uninitialized buffer.")
              return -1
 
         count = -1
@@ -752,13 +898,13 @@ class ProcessSafeSharedRingBuffer:
             acquire_timeout = 0.1
             acquired_lock = self._pointer_lock.acquire(timeout=acquire_timeout)
             if not acquired_lock:
-                 print("Timeout acquiring lock for last_get_count_debug.")
+                 print("Timeout acquiring lock for next_release_count_debug.")
                  return -1
 
-            count = self._metadata_ctypes.last_get_count
+            count = self._metadata_ctypes.next_release_count
 
         except Exception as e:
-             print(f"Error reading metadata for last_get_count_debug: {e}")
+             print(f"Error reading metadata for next_release_count_debug: {e}")
              count = -1
         finally:
             if acquired_lock:
@@ -766,7 +912,7 @@ class ProcessSafeSharedRingBuffer:
         return count
 
 
-    # Expose synchronization objects for passing to worker process (also used by attach mode)
+    # Expose synchronization objects for passing to worker process
     @property
     def pointer_lock(self) -> Optional[mp_sync.Lock]:
         return self._pointer_lock
@@ -779,9 +925,6 @@ class ProcessSafeSharedRingBuffer:
     def space_available_condition(self) -> Optional[mp_sync.Condition]:
         return self._space_available
 
-    # -------------------------------------------------------------------------
-    # SHM Lifecycle: reattach / close / unlink
-    # -------------------------------------------------------------------------
 
     def reattach(self):
         """
@@ -796,7 +939,7 @@ class ProcessSafeSharedRingBuffer:
             RuntimeError: if the buffer was not fully initialized or has unlinked.
             FileNotFoundError: if the shared memory segments are not found.
         """
-        # Added in v2a, designed to replace create=False:
+        # Added in v3a, designed to replace create=False:
         #   Synchronization objects are not touched here, since they are passed 
         #   from the creator process.
         if self._metadata_shm is None or self._data_shm is None or self._metadata_shm.name is None or self._data_shm.name is None:
@@ -807,7 +950,7 @@ class ProcessSafeSharedRingBuffer:
         except FileNotFoundError as e:
             print(f"Error in reattaching to Metadata SHM: {self._metadata_shm.name}, Data SHM: {self._data_shm.name}")
             raise
-    
+
     def close(self):
         """
         Detaches the current process from the shared memory segments.
@@ -867,7 +1010,7 @@ class ProcessSafeSharedRingBuffer:
             # they are managed by the creator process.
 
 
-# ------------- Example Usage (unchanged from v2) -------------
+# ------------- Example Usage -------------
 BUFFER_CAPACITY = 5
 FRAME_SIZE = (1, 1, 3) # Example frame size (height, width, channels)
 FRAME_DTYPE = np.dtype('uint8')
@@ -948,7 +1091,7 @@ def peeker_process(source_buffer: ProcessSafeSharedRingBuffer):
             peeked_frame = buffer.peek_last_frame()
             unread = buffer.unread_count
             occupied = buffer.occupied_count_debug
-            last_get = buffer.last_get_count_debug
+            last_get = buffer.next_release_count_debug
             if peeked_frame is not None:
                 print(f"Peeker: Last frame value: {peeked_frame[0, 0, 0]}. Unread: {unread}, Occupied: {occupied}, LastGet: {last_get}")
             else:
