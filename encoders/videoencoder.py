@@ -1,74 +1,118 @@
-import abc
+# encoders/videoencoder.py
+# History:
+#  v2   (260407): Using ring buffer v2a, supports functional cross-process 
+#                 pickle (not standard pickle, but works for mp) ->
+#                 Using loguru to do logging;
+#                 Cleanup codes, docs and comments.
+#                 Improve stream control logic when stopped. 
+
+# Fails early is good.
+
+from __future__ import annotations # for Synchronized[int]
+import inspect
+from abc import ABC, abstractmethod
 import multiprocessing as mp
-import multiprocessing.shared_memory as mp_shm
+from multiprocessing.sharedctypes import Synchronized
 import multiprocessing.synchronize as mp_sync
 import numpy as np
 from typing import Tuple, Any, Optional, List
-from ringbuffers.shared_ring_buffer import ProcessSafeSharedRingBuffer # Import the ring buffer class
+from .videoencoder_types import EncoderException
+from ringbuffers.shared_ring_buffer_v2a import ProcessSafeSharedRingBuffer # Import the ring buffer class
 import time # Import time for speed calculation and warning throttling
 
-class BaseVideoEncoder(abc.ABC):
+from loguru import logger as file_logger
+Logger = type(file_logger)
+
+class BaseVideoEncoder(ABC):
     """
     Abstract base class for a video encoder using multiprocessing.
-    Handles IPC resource creation, process management, and frame processing from a shared buffer.
+    Can only be started once per instance lifetime. Recreate if restart encoding is needed.
+
+    Handles IPC resource creation, process management, frame processing and logging
+    from a shared buffer.
     Requires subclasses to implement the encoder initialization and frame encoding logic.
+    Use `self._logger` in subclass implememted methods if you want.
+
+    Cannot do standard picklization due to internal IPC resources.
+    Probably process-safe, but not tested.
     """
+
     def __init__(self,
-                 shared_buffer: ProcessSafeSharedRingBuffer, # Accept shared buffer instance
-                 output_path: str,
+                 shared_buffer: ProcessSafeSharedRingBuffer,
+                 output_path: str, # although not used in IPC, required by most encoder.
                  batch_size: int = 5,
-                 **kwargs): # Allow passing extra args to specific encoders
+                 expected_fps: Optional[float] = None,
+                 inject_logger: Optional[Logger] = None, 
+                 # Extra kwargs should be handled and store per subclass implementation.
+        ):
         """
         Initialize the base encoder with a pre-created shared buffer instance.
-        The worker process will attach to this buffer in start().
+
         Args:
-            shared_buffer: (ProcessSafeSharedRingBuffer), the shared buffer instance created externally.
+            shared_buffer: (ProcessSafeSharedRingBuffer), the shared buffer 
+                instance created externally.
             output_path: (str), path to the output video file.
-            batch_size: (int), number of frames to get from the buffer at once. Defaults to 5.
-            **kwargs: Additional keyword arguments for specific encoder implementations.
+            batch_size: (int), number of frames to get from the buffer at once. 
+                Defaults to 5.
+            expected_fps: (Optional[float]), expected encoding speed in fps. Used in speed
+                warning, NOT related with the encoding procedure. Defaults to None.
+            inject_logger: (Optional[Logger]), the loguru logger instance for logging.
+                enqueue=True is required. if None, a default logger is acquired 
+                from *current process* (i.e. could differ from the logger instance 
+                from `main` if current processs is not `main`).
         """
-        self._output_path = output_path
-        self._batch_size = batch_size # Store batch size
-        self._ring_buffer = shared_buffer # Store the injected buffer instance for worker to use
+        if isinstance(shared_buffer, ProcessSafeSharedRingBuffer):
+            self._ring_buffer : ProcessSafeSharedRingBuffer = shared_buffer
+        else:
+            raise TypeError("shared_buffer must be a ProcessSafeSharedRingBuffer instance.")
+        self._output_path: str = output_path
+        self._batch_size: int = batch_size
+        self._expected_fps: Optional[float] = expected_fps
+        self._logger: Logger
+        if inject_logger is not None:
+            if isinstance(inject_logger, Logger):
+                self._logger = inject_logger
+            else:
+                raise TypeError("inject_logger must be a loguru.Logger instance.")
+        else:
+            self._logger = file_logger
 
         # Multiprocessing resources
-        self._running = mp.Event()
-        self._worker_process: Optional[mp.Process] = None
-        self._worker_ready = mp.Event() # Signals when the worker is ready for the next frame
-        # Store kwargs for potential use in subclasses _initialize_encoder
-        self._encoder_kwargs = kwargs
+        # v2: Graded signal for running and exiting in multiprocessing env.
+        self._frame_count: Synchronized[int] = mp.Value('I', 0) # Only write in _worker.
+        self._worker_enable : mp_sync.Event = mp.Event() # True during normal working loop, False to trigger normal stop.
+        self._not_eager_stop : mp_sync.Event = mp.Event() # False to trigger a eager stop.
+        self._not_eager_stop.set() # Default True
+        self._worker_ready : mp_sync.Event = mp.Event() # Signals when the worker is ready, write in run, read only outside.
+        self._worker_process: Optional[mp.Process] = None 
 
     @property
     def is_ready(self) -> bool:
         """Checks if the encoder worker process has signaled it's ready."""
-        return self._worker_ready.is_set() and self._running.is_set()
+        return self._worker_ready.is_set() and self._worker_enable.is_set()
 
-    # Read properties from the injected buffer if needed (optional)
-    # Note: Accessing internal attributes like _frame_shape is generally discouraged.
-    # It's better if ProcessSafeSharedRingBuffer provides public properties.
-    # @property
-    # def frame_size(self) -> Tuple[int, int, int]:
-    #     if self._ring_buffer and hasattr(self._ring_buffer, '_frame_shape'): # Check attribute existence
-    #          return self._ring_buffer._frame_shape
-    #     raise ValueError("Shared buffer not initialized or frame shape unavailable.")
+    @property
+    def frame_encoded(self) -> int:
+        """Return encoded frame count. Process-safe."""
+        return self._frame_count.value
 
-    # @property
-    # def buffer_capacity(self) -> int:
-    #     if self._ring_buffer and hasattr(self._ring_buffer, '_buffer_capacity'): # Check attribute existence
-    #          return self._ring_buffer._buffer_capacity
-    #     raise ValueError("Shared buffer not initialized or capacity unavailable.")
-
-
-    @abc.abstractmethod
+    @abstractmethod
     def _initialize_encoder(self):
         """
         Initialize the specific video encoder within the worker process.
         This method MUST be implemented by subclasses and is called once
         when the worker process starts. It should handle encoder setup.
+
+        Raises:
+            EncoderException: when critical error occurs and continue encoding is 
+                not possible.
+        
+        Logging: Should have `pid` and `name` fields.
+
         """
         raise NotImplementedError
 
-    @abc.abstractmethod
+    @abstractmethod
     def _encode_frames(self, frames: List[np.ndarray]):
         """
         Encode a batch of frames using the specific video encoder.
@@ -78,7 +122,15 @@ class BaseVideoEncoder(abc.ABC):
                     the list contains **1 OR 2** np.ndarray objects,
                     each with shape (frame, height, width, channel).
                     The total number of frames should ideally match batch_size,
-                    but **MAY BE LESS** if buffer underflow causes a get-timeout.
+                    but **MAY BE LESS** for the last batch.
+        Returns:
+            bool: True if encoding was successful, False otherwise.
+
+        Raises:
+            EncoderException: when critical error occurs and continue encoding is 
+                not possible.
+        
+        Logging: Should have `pid` and `name` fields.
         
         Notes:
             np.concat(List[np.ndarray], axis=0) will results in a full batch
@@ -88,16 +140,22 @@ class BaseVideoEncoder(abc.ABC):
         """
         raise NotImplementedError
 
-    @abc.abstractmethod
+    @abstractmethod
     def _uninitialize_encoder(self):
         """
         Uninitialize the specific video encoder within the worker process.
         This method MUST be implemented by subclasses and is called once
         when the worker process is stopping. It should handle encoder cleanup.
+
+        Raises:
+            EncoderException: when critical error occurs and continue encoding is 
+                not possible.
+        
+        Logging: Should have `pid` and `name` fields.
         """
         raise NotImplementedError
 
-    def _worker(self, source_ring_buffer: ProcessSafeSharedRingBuffer): # Accept ring buffer as argument
+    def _worker(self):
         """
         The main function executed by the background worker process.
             - Initializes the encoder,
@@ -106,42 +164,44 @@ class BaseVideoEncoder(abc.ABC):
                 - Encodes the frames,
             - When the process is stopped, it ensures the encoder is uninitialized.
         """
-        # Attach to the shared ring buffer in the worker process
-        ring_buffer = ProcessSafeSharedRingBuffer(create=False, source_buffer=source_ring_buffer)
+        # --- Init Cross-process Resources ---
+        # In v2a, the ring buffer supports functional picklization, no need for attachment anymore.
+        ring_buffer = self._ring_buffer
 
-        # --- Speed Calculation Initialization ---
-        camera_fps = self._encoder_kwargs.get('camera_fps', 0.0) # Get camera FPS from config
-        if camera_fps <= 0:
-            print(f"Warning: Invalid or missing 'camera_fps' ({camera_fps}) in encoder config. Speed warning disabled.")
-        frame_count_since_last_check = 0
-        time_last_check = time.monotonic()
-        last_warning_time = 0
-        warning_interval = 5.0 # Seconds between warnings
-        measurement_interval = 2.0 # Seconds over which to measure average speed
-        # --- End Speed Calculation Initialization ---
+        pid, friendly_name = mp.current_process().pid, "VideoEncoder"
+        logger = self._logger.bind(friendly_name=friendly_name)
 
         self._worker_ready.clear() # Ensure not set initially
         try:
-            # 1. Initialize the specific encoder (once per process)
-            print(f"Encoder worker process ({mp.current_process().pid}) initializing...")
+            # 1. Initialize the specific encoder
+            logger.info(f"Encoder worker initializing...")
             self._initialize_encoder()
-            print(f"Encoder worker process ({mp.current_process().pid}) initialized successfully.")
+            logger.success(f"Encoder worker initialized successfully.")
         except Exception as e:
-            # Catch any exception during initialization
-            print(f"FATAL: Encoder worker process ({mp.current_process().pid}) failed during initialization: {e}")
+            logger.error(f"FATAL: Encoder worker failed during initialization: {e}")
             ring_buffer.close() # Close ring buffer connection on init failure
-            return # Exit worker function on initialization failure
+            return # Exit worker process on initialization failure
 
-            # 2. Main processing loop
+        # --- Speed Calculation Initialization ---
+        if self._expected_fps:
+            logger.info(f"Expected encoding speed: {self._expected_fps} fps. Speed warning enabled.")
+        else:
+            logger.info(f"Have no `expected_fps`, Encoding speed warning disabled.")
+        frame_count_since_last_check = 0
+        time_last_check = time.monotonic()
+        check_interval = 5.0 # Seconds between warnings
+        # --- End Speed Calculation Initialization ---
+
+        # 2. Main processing loop
         try:
-            while self._running.is_set():
+            # Signal readiness for the next frame BEFORE waiting
+            self._worker_ready.set()
+            while self._not_eager_stop.is_set():
+                # v2: Graded stop signal, still process remaining frames until eager_stop.
                 try:
-                    # Signal readiness for the next frame BEFORE waiting
-                    self._worker_ready.set()
-
-                    # Get frames from the ring buffer (blocks if no enough data)
+                    # --- Get frames from the ring buffer (blocks if no enough data) ---
                     # Get a batch of frames from the ring buffer
-                    frames_list = ring_buffer.get(self._batch_size, timeout=1.0) # Use batch_size
+                    frames_list = ring_buffer.get(self._batch_size, timeout=0.1) # Use batch_size
 
                     # Handle buffer underflow (timeout) here.
                     # Core logic: prevent a buffer which has less than batch_size frames.
@@ -150,87 +210,89 @@ class BaseVideoEncoder(abc.ABC):
                     # can always get the latest frame.  
                     if frames_list is None:
                         # Timeout occurred, check if still running
-                        if self._running.is_set():
-                            continue # Continue waiting new frames
-                        else: # Stop is signaled, no more frames will come in.
+                        if self._worker_enable.is_set():
+                            continue # Continue waiting new frames to collect a batch_size
+                        else: # Shutdown signalled, no more frames will come in.
                             if ring_buffer.unread_count > 0:
-                                # Get all remaining data
-                                frames_list = ring_buffer.get(ring_buffer.unread_count, timeout=1.0)
+                                # v2: Get remaining data one by one, rather than all unread_count
+                                frames_list = ring_buffer.get(1, timeout=0.1)
                                 if frames_list is None: # Timeout again, raise error
                                     raise TimeoutError("Ring buffer underflows unexpectedly.")
-                                else: # Successfully get all remaining frames
-                                    # Encode
-                                    pass
+                                else: # Successfully get remaining frame.
+                                    pass # To Encode
                             else: # Buffer is empty
                                 break # Exit loop
 
-                    # Encode the batch of frames
-                    if frames_list: # Only call if frames were received (after handling underflow)
-                        # --- Calculate number of frames processed in this batch ---
+                    # --- Encode the batch of frames ---
+                    if frames_list:
+                        # Calculate number of frames processed in this batch
                         num_frames_processed = sum(arr.shape[0] for arr in frames_list)
-                        if num_frames_processed == 0:
-                            continue # Skip speed calc if no frames were actually processed
+                        if num_frames_processed == 0: # Should not happen
+                            continue # Skip if no frames were actually processed
 
-                        # --- Blocking method, Pass the list of frame views ---
-                        encode_start_time = time.monotonic()
+                        # Blocking method, Pass the list of frame views
                         self._encode_frames(frames_list)
-                        encode_end_time = time.monotonic()
+                        self._frame_count.value += num_frames_processed
 
-                        # --- Update Speed Calculation ---
+                        # Update Speed Calculation 
                         frame_count_since_last_check += num_frames_processed
                         current_time = time.monotonic()
                         time_elapsed = current_time - time_last_check
 
-                        # Check speed periodically
-                        if time_elapsed >= measurement_interval:
-                            if camera_fps > 0: # Only calculate and warn if camera_fps is valid
+                        # Check speed periodically if target_fps specified
+                        if self._expected_fps is not None:
+                            if time_elapsed >= check_interval:
                                 encoding_speed = frame_count_since_last_check / time_elapsed
                                 # print(f"Debug: Avg encoding speed over {time_elapsed:.2f}s: {encoding_speed:.2f} FPS") # Optional debug
 
                                 # Check if speed is noticeably low and issue warning (throttled)
-                                if encoding_speed < camera_fps * 0.9 and (current_time - last_warning_time) > warning_interval:
-                                    print(f"Warning: VideoEncoder ({mp.current_process().pid}) encoding speed ({encoding_speed:.2f} FPS) "
-                                          f"is noticeably lower than camera target FPS ({camera_fps:.2f}). Frames might be dropped after buffer filled.")
-                                    print(f"Warning: Current buffer load: {ring_buffer.unread_count} frames, "
+                                if encoding_speed < self._expected_fps * 0.9:
+                                    logger.warning(f"VideoEncoder encoding speed ({encoding_speed:.2f} FPS) "
+                                          f"is noticeably lower than target FPS ({self._expected_fps:.2f}). "
+                                          "Frames might be dropped after buffer filled.")
+                                    logger.warning(f"Current buffer load: {ring_buffer.unread_count} frames, "
                                           f"{ring_buffer.unread_count / ring_buffer.buffer_capacity * 100:.2f}%")
-                                    last_warning_time = current_time
 
                             # Reset for next measurement interval
                             frame_count_since_last_check = 0
                             time_last_check = current_time
-                        # --- End Speed Calculation ---
-
-
-                except Exception as e:
-                    # Catch errors during frame batch processing, print and continue loop
-                    print(f"Error during frame encoding in worker ({mp.current_process().pid}): {e}")
-                    # Depending on requirements, might need more sophisticated error handling
-
-            print(f"VideoEncoder worker ({mp.current_process().pid}) exiting loop.")
+                except EncoderException as e:
+                    logger.error(f"[{e.name} ({e.pid})] {e.message}")
+                    self._not_eager_stop.clear() # exit immediately
+                except Exception as e: # Framework error, should not happen.
+                    logger.error(f"Unexpected error in encoder working loop: {e}")
+                    self._not_eager_stop.clear()
+            self._worker_ready.clear()
+            logger.info(f"Encoder worker exited working loop.")
 
         finally:
             # Ensure uninitialization and ring buffer closure are attempted
-            print(f"Encoder worker process ({mp.current_process().pid}): Attempting to uninitialize encoder and close ring buffer.")
+            logger.info(f"Encoder worker uninitializing encoder and closing ring buffer.")
             try:
                 self._uninitialize_encoder()
             except Exception as e:
-                print(f"Error during encoder uninitialization in worker ({mp.current_process().pid}): {e}")
+                logger.error(f"During encoder uninitialization in worker: {e}")
 
             ring_buffer.close() # Close ring buffer connection on exit
-            print(f"Encoder worker process ({mp.current_process().pid}): Cleanup attempted.")
+            logger.success(f"Encoder worker cleanup completed.")
+            logger.complete() # Flush logging buffer
 
 
     def start(self):
         """
-        Starts the video encoder.
-        Creates the shared ring buffer and launches the background worker process.
+        Overwrite mp.Process.start(), Can only be called once per instance lifetime.
+        Launches the background worker process and starts the video encoder.
+
         Does nothing if the encoder is already running.
         """
-        if self._running.is_set():
-            print("Encoder already running.")
+        pid, friendly_name = mp.current_process().pid, "VideoEncoder"
+        logger = self._logger.bind(friendly_name=friendly_name)
+
+        if self._worker_enable.is_set():
+            logger.error("Encoder already running, cannot start twice.")
             return
 
-        print("Starting VideoEncoder...")
+        logger.info("Starting VideoEncoder...")
         try:
             # Ensure shared buffer instance was provided during initialization
             if self._ring_buffer is None:
@@ -238,86 +300,83 @@ class BaseVideoEncoder(abc.ABC):
             if not isinstance(self._ring_buffer, ProcessSafeSharedRingBuffer):
                  raise TypeError("Provided shared_buffer is not a ProcessSafeSharedRingBuffer instance.")
 
-            # The main process no longer creates or attaches to the buffer here.
-            # The worker process will attach using the provided instance.
-
             # Set running state and start worker process
-            self._running.set()
-            print("Starting worker process...")
-            # Pass the created ring buffer instance to the worker
-            self._worker_process = mp.Process(
-                target=self._worker,
-                name="VideoEncoderWorker",
-                args=(self._ring_buffer,) # Pass the ring buffer instance
-            )
-            self._worker_process.start()
-            print(f"Worker process started with PID: {self._worker_process.pid}")
+            self._worker_enable.set()
+            self._frame_count.value = 0 # Reset counter.
+            logger.info("Starting worker process...")
+
+            # v2: No arguments need to be passed.
+            wp = mp.Process(target=self._worker)
+            self._worker_process = wp
+            wp.start()
 
             # Wait for worker to signal readiness
-            print(f"Waiting for encoder worker ({self._worker_process.pid}) to be ready...")
+            logger.info(f"Worker process started (PID {wp.pid}), waiting to be ready...")
+
             # Add timeout to worker ready wait
             if not self._worker_ready.wait(timeout=10.0): # e.g., 10 seconds timeout
-                 print(f"FATAL: Timeout waiting for encoder worker ({self._worker_process.pid}) to become ready.")
+                 logger.error(f"Timeout waiting for encoder worker ({wp.pid}) to become ready.")
                  self.stop() # Attempt cleanup if worker doesn't start
                  raise TimeoutError("Encoder worker failed to initialize within timeout.")
-            print(f"VideoEncoder started successfully with worker PID: {self._worker_process.pid}")
+            logger.success(f"VideoEncoder started successfully with worker PID: {wp.pid}")
 
         except Exception as e:
-            print(f"Error starting VideoEncoder: {e}")
+            logger.error(f"Error starting VideoEncoder: {e}")
             # If startup fails, clean up potentially created resources
             self.stop() # Use stop to ensure cleanup
             raise # Re-raise the exception after cleanup attempt
 
-
-    # submit_frame is removed as CameraSystem now writes directly to the buffer.
-    # TODO: Previously, submit_frame will check _worker_ready, but now CameraSystem
-    #       should manage this. Need to provide a method(property) to check worker status.
-
-
-    def stop(self):
+    def stop(self, exit_timeout=5.0, terminate_timeout=20.0):
         """
-        Stops the video encoder.
-        Signals the worker process to terminate, waits for it to join,
-        and cleans up the created IPC resources (shared ring buffer).
+        Stops the video encoder. Can only be called once per instance lifetime.
+            Signals the worker process to stop, waits for it to join,
+            and cleans up the created IPC resources (shared ring buffer).
+        Overwrite it if you want to control timeout. Usually terminate_timeout is
+            set to a large value.
+
         Does nothing if the encoder is already stopped.
+
+        Args:
+            exit_timeout (float): Timeout for the worker process to exit.
+            terminate_timeout (float): Timeout for the worker process to be terminated.
+
+        Raises:
+            TimeoutError: If the worker process does not terminate within the timeout.
         """
-        if not self._running.is_set() and self._worker_process is None:
-            print("Encoder already stopped.")
+        pid, friendly_name = mp.current_process().pid, "VideoEncoder"
+        logger = self._logger.bind(friendly_name=friendly_name)
+        wp = self._worker_process
+        
+        if wp is None:
+            logger.info("Encoder already stopped, cannot stop twice.")
             return
 
-        print("Stopping VideoEncoder...")
+        logger.info(f"Stopping VideoEncoder (PID {wp.pid})...")
         # Signal worker to stop
-        self._running.clear()
+        self._worker_enable.clear()
 
         # Wait for worker process to finish
-        if self._worker_process:
-            print(f"Waiting for VideoEncoder worker ({self._worker_process.pid}) to join...")
-            self._worker_process.join(timeout=5.0) # Wait with a timeout
-            if self._worker_process.is_alive():
-                print(f"Warning: Worker process {self._worker_process.pid} did not exit gracefully within timeout. Terminating.")
-                self._worker_process.terminate() # Force terminate if join times out
-            print(f"Worker process ({self._worker_process.pid}) joined.")
-            self._worker_process = None # Clear process reference
+        if wp.is_alive():
+            logger.info(f"Waiting for VideoEncoder worker ({wp.pid}) to join...")
+            # Wait mainly for all buffered frame get encoded, but sometimes waiting _uninit_encoder,
+            # depends on the impl. of encoder (whether _encoder_frame is blocking or not)
+            wp.join(timeout=exit_timeout) 
+            if wp.is_alive():
+                logger.warning(f"Worker process {wp.pid} did not exit within "
+                               f"timeout ({exit_timeout}s). Signal eager stop, "
+                               f"unprocessed frames may be lost...")
+                self._not_eager_stop.clear() # Eager stop. Turn to _uninit_encoder as soon as possible.
+            # Wait mainly for _uninit_encoder to finish, a large timeout.
+            wp.join(timeout=terminate_timeout)
+            if wp.is_alive():
+                logger.warning(f"Worker process {wp.pid} did not exit within "
+                               f"timeout ({terminate_timeout}s). System-level force terminating, "
+                               f"data may corrupted...")
+                # TODO: Signal outside to choose behaviour?
+                wp.terminate() # Force terminate if join times out
+            time.sleep(1.0) # Wait for the process to actually terminate
+            if wp.is_alive():
+                raise TimeoutError("Worker process did not terminate within timeout.")
+            logger.info(f"Worker process ({wp.pid}) joined.")
 
-        # Main process does not hold a connection to the buffer that needs closing here.
-        # The worker process closes its own connection upon exit (handled in _worker's finally block).
-        # Unlinking is handled by CameraSystem.
-        # if self._ring_buffer:
-        #     print("Closing VideoEncoder's connection to Shared Ring Buffer...")
-        #     try:
-        #         # Main process doesn't need to close the buffer connection itself
-        #         # self._ring_buffer.close()
-        #         print("VideoEncoder main process does not need to close buffer connection.")
-        #     except Exception as e:
-        #         print(f"Error related to buffer in VideoEncoder stop: {e}")
-        #     finally:
-        #          # Keep the reference until the object is destroyed, worker might still need it briefly?
-        #          # Or set to None if certain worker is done. Let's clear it.
-        #          self._ring_buffer = None # Reset ring buffer reference in main process
-
-        # Reset worker_ready event
-        self._worker_ready.clear()
-
-        print("VideoEncoder stopped.")
-
-from encoders.x264_encoder_x264 import X264Encoder # Import X264Encoder from the new file
+        logger.success("VideoEncoder stopped.")
