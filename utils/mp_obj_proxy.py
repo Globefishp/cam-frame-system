@@ -1,3 +1,6 @@
+# utils/mp_obj_proxy.py
+# Author: Google Gemini 3.1 pro, modified & cleanup by Haiyun Huang (260406)
+
 import threading
 import multiprocessing as mp
 from multiprocessing.connection import Connection
