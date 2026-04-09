@@ -24,7 +24,7 @@ from pathlib import Path
 import time # Import time for the example
 
 from loguru import logger as file_logger
-Logger = type(file_logger)
+from loguru._logger import Logger # For Type Hinting Only
 
 _ENCODER_CURR_DIR = Path(__file__).resolve().parent
 

@@ -21,7 +21,7 @@ from ringbuffers.shared_ring_buffer_v2a import ProcessSafeSharedRingBuffer # Imp
 import time # Import time for speed calculation and warning throttling
 
 from loguru import logger as file_logger
-Logger = type(file_logger)
+from loguru._logger import Logger # For Type Hinting Only
 
 class BaseVideoEncoder(ABC):
     """
