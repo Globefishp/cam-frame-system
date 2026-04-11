@@ -68,14 +68,16 @@ class BaseVideoEncoder(ABC):
         self._output_path: str = output_path
         self._batch_size: int = batch_size
         self._expected_fps: Optional[float] = expected_fps
-        self._logger: Logger
+        self._logger: Logger # For subclass use
         if inject_logger is not None:
             if isinstance(inject_logger, Logger):
                 self._logger = inject_logger
             else:
                 raise TypeError("inject_logger must be a loguru.Logger instance.")
         else:
-            self._logger = file_logger
+            self._logger = file_logger 
+        # Base class bind its own friendly_name for logging.
+        self.__logger: Logger = self._logger.bind(friendly_name="VideoEncoder")
 
         # Multiprocessing resources
         # v2: Graded signal for running and exiting in multiprocessing env.
@@ -168,8 +170,8 @@ class BaseVideoEncoder(ABC):
         # In v2a, the ring buffer supports functional picklization, no need for attachment anymore.
         ring_buffer = self._ring_buffer
 
-        pid, friendly_name = mp.current_process().pid, "VideoEncoder"
-        logger = self._logger.bind(friendly_name=friendly_name)
+        pid = mp.current_process().pid
+        logger = self.__logger
 
         self._worker_ready.clear() # Ensure not set initially
         try:
@@ -285,8 +287,8 @@ class BaseVideoEncoder(ABC):
 
         Does nothing if the encoder is already running.
         """
-        pid, friendly_name = mp.current_process().pid, "VideoEncoder"
-        logger = self._logger.bind(friendly_name=friendly_name)
+        pid = mp.current_process().pid
+        logger = self.__logger
 
         if self._worker_enable.is_set():
             logger.error("Encoder already running, cannot start twice.")
@@ -343,8 +345,8 @@ class BaseVideoEncoder(ABC):
         Raises:
             TimeoutError: If the worker process does not terminate within the timeout.
         """
-        pid, friendly_name = mp.current_process().pid, "VideoEncoder"
-        logger = self._logger.bind(friendly_name=friendly_name)
+        pid = mp.current_process().pid
+        logger = self.__logger
         wp = self._worker_process
         
         if wp is None:

@@ -80,7 +80,7 @@ class X264Encoder(BaseVideoEncoder):
         pid, friendly_name = mp.current_process().pid, "X264Encoder"
         fps = kwargs.get('fps', None)
         super().__init__(shared_buffer, output_path, batch_size=batch_size, expected_fps=fps, inject_logger=inject_logger)
-        logger = self._logger.bind(friendly_name=friendly_name)
+        self._logger = self._logger.bind(friendly_name=friendly_name)
 
         # Parse kwargs
         self._frame_size = kwargs.pop('frame_size') # the size of pure image data part for x264
@@ -123,8 +123,7 @@ class X264Encoder(BaseVideoEncoder):
 
     def _read_stdout(self):
         """Reads stdout from the x264 process in a separate thread."""
-        pid, friendly_name = mp.current_process().pid, "X264Encoder"
-        logger = self._logger.bind(friendly_name=friendly_name)
+        logger = self._logger
 
         process: subprocess.Popen = self._x264_process
 
@@ -164,8 +163,7 @@ class X264Encoder(BaseVideoEncoder):
 
     def _read_stderr(self):
         """Reads stderr from the x264 process in a separate thread."""
-        pid, friendly_name = mp.current_process().pid, "X264Encoder"
-        logger = self._logger.bind(friendly_name=friendly_name)
+        logger = self._logger
 
         process: subprocess.Popen = self._x264_process
         
@@ -218,8 +216,7 @@ class X264Encoder(BaseVideoEncoder):
         Initializes the x264 encoder by starting an x264.exe process.
         This runs in the worker process.
         """
-        pid, friendly_name = mp.current_process().pid, "X264Encoder"
-        logger = self._logger.bind(friendly_name=friendly_name)
+        logger = self._logger
         logger.info(f"Initializing x264 encoder (x264.exe)...")
 
         # Initialize process-specific attributes (called in `_worker process`)
@@ -337,7 +334,7 @@ class X264Encoder(BaseVideoEncoder):
             EncoderException: when critical error occurs and continue encoding is not possible.
         """
         pid, friendly_name = mp.current_process().pid, "X264Encoder"
-        logger = self._logger.bind(friendly_name=friendly_name)
+        logger = self._logger
 
         if not frames_list: # Check if the list itself is empty
             logger.warning(f"Received empty frames list. Skip encoding.")
@@ -421,8 +418,7 @@ class X264Encoder(BaseVideoEncoder):
         Uninitializes the x264 encoder by stopping the x264.exe process and reader threads.
         This runs in the worker process.
         """
-        pid, friendly_name = mp.current_process().pid, "X264Encoder"
-        logger = self._logger.bind(friendly_name=friendly_name)
+        logger = self._logger
 
         logger.info(f"Uninitializing x264 encoder (x264.exe)...")
 
@@ -502,8 +498,7 @@ class X264Encoder(BaseVideoEncoder):
         """
         Muxes the timecode file with the encoded video file using mp4fpsmod.
         """
-        pid, friendly_name = mp.current_process().pid, "X264Encoder"
-        logger = self._logger.bind(friendly_name=friendly_name)
+        logger = self._logger
 
         logger.info(f"Starting timecode muxing with mp4fpsmod...")
         # Get the directory of the current module
