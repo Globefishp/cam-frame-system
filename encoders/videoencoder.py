@@ -180,7 +180,7 @@ class BaseVideoEncoder(ABC):
             self._initialize_encoder()
             logger.success(f"Encoder worker initialized successfully.")
         except Exception as e:
-            logger.error(f"FATAL: Encoder worker failed during initialization: {e}")
+            logger.opt(exception=e).error(f"Encoder worker failed during initialization.")
             ring_buffer.close() # Close ring buffer connection on init failure
             return # Exit worker process on initialization failure
 
@@ -262,7 +262,7 @@ class BaseVideoEncoder(ABC):
                     logger.error(f"[{e.name} ({e.pid})] {e.message}")
                     self._not_eager_stop.clear() # exit immediately
                 except Exception as e: # Framework error, should not happen.
-                    logger.error(f"Unexpected error in encoder working loop: {e}")
+                    logger.opt(exception=e).error(f"Unexpected error in encoder working loop.")
                     self._not_eager_stop.clear()
             self._worker_ready.clear()
             logger.info(f"Encoder worker exited working loop.")
@@ -273,7 +273,7 @@ class BaseVideoEncoder(ABC):
             try:
                 self._uninitialize_encoder()
             except Exception as e:
-                logger.error(f"During encoder uninitialization in worker: {e}")
+                logger.opt(exception=e).error(f"Encoder worker failed during uninitialization.")
 
             ring_buffer.close() # Close ring buffer connection on exit
             logger.success(f"Encoder worker cleanup completed.")
@@ -323,7 +323,7 @@ class BaseVideoEncoder(ABC):
             logger.success(f"VideoEncoder started successfully with worker PID: {wp.pid}")
 
         except Exception as e:
-            logger.error(f"Error starting VideoEncoder: {e}")
+            logger.opt(exception=e).error(f"Error in starting VideoEncoder.")
             # If startup fails, clean up potentially created resources
             self.stop() # Use stop to ensure cleanup
             raise # Re-raise the exception after cleanup attempt

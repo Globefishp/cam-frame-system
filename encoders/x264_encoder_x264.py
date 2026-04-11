@@ -154,7 +154,7 @@ class X264Encoder(BaseVideoEncoder):
                     logger.info(f"Finished reading remaining stdout.")
             
             except Exception as e:
-                logger.error(f"Error reading x264 stdout: {e}")
+                logger.opt(exception=e).error(f"Error in reading x264 stdout.")
             finally:
                 if process and process.stdout:
                     process.stdout.close()
@@ -204,7 +204,7 @@ class X264Encoder(BaseVideoEncoder):
                     logger.info(f"Finished reading remaining stderr.")
 
             except Exception as e:
-                logger.error(f"Error reading x264 stderr: {e}")
+                logger.opt(exception=e).error(f"Error in reading x264 stderr.")
             finally:
                 if process and process.stderr:
                     process.stderr.close()
@@ -309,7 +309,7 @@ class X264Encoder(BaseVideoEncoder):
 
         except Exception as e:
             # Handle other potential errors during process startup
-            logger.error(f"Error starting x264.exe process: {e}")
+            logger.opt(exception=e).error(f"Error in starting x264.exe process.")
             self._x264_process = None
             raise # Re-raise the exception to indicate initialization failure
 
@@ -362,8 +362,8 @@ class X264Encoder(BaseVideoEncoder):
                         timecodes_list.append(timecode)
 
                 except Exception as e:
-                    logger.error(f"Unexpected error during TC extraction for frame "
-                                 f"{self.frame_encoded}: {e}.")
+                    logger.opt(exception=e).error(f"Unexpected error during TC extraction for frame "
+                                 f"{self.frame_encoded}.")
                     pure_image_data_list = list(frame_chunk_arr[:, :height, :width, :]) # Fallback image data
                     timecodes_list = []
             else:
@@ -428,7 +428,7 @@ class X264Encoder(BaseVideoEncoder):
             try:
                 self._x264_process.stdin.close()
             except Exception as e:
-                logger.error(f"Error closing x264.exe stdin: {e}")
+                logger.opt(exception=e).error(f"Error in closing x264.exe stdin.")
 
         # Close the timecode log file if it was opened
         if self._timecode_file:
@@ -436,7 +436,7 @@ class X264Encoder(BaseVideoEncoder):
             try:
                 self._timecode_file.close()
             except Exception as e:
-                logger.error(f"Error closing timecode log file: {e}")
+                logger.opt(exception=e).error(f"Error in closing timecode log file.")
             finally:
                 self._timecode_file = None
 
@@ -464,7 +464,7 @@ class X264Encoder(BaseVideoEncoder):
                 logger.warning(f"x264.exe process {self._x264_process.pid} did not terminate gracefully. Killing.")
                 self._x264_process.kill()
             except Exception as e:
-                logger.error(f"Error terminating x264.exe process: {e}")
+                logger.opt(exception=e).error(f"Error in terminating x264.exe process.")
             finally:
                 self._x264_process = None # Clear process reference
         elif self._x264_process:
@@ -536,7 +536,7 @@ class X264Encoder(BaseVideoEncoder):
             return False
         except Exception as e:
             # Handle other potential errors during muxing
-            logger.error(f"Error running mp4fpsmod: {e}")
+            logger.opt(exception=e).error(f"Error in running mp4fpsmod.")
             # raise  # Re-raise the exception to indicate muxing failure
             return False
         return True
