@@ -18,7 +18,7 @@ import pickle
 from typing import Optional, Tuple, Union, Any, List
 
 from . import mvsdk_mod as mvsdk
-from cameras.huatengcam.mvsdk_mod import CameraException as MvCamException
+from .mvsdk_mod import CameraException as MvCamException
 from .extensions.unpack_12bit_raw import unpack_12bit_to_16bit_fast
 from .extensions import PrecisionTimer
 from .extensions.raw_processing_cy_V11 import RawV11Processor
@@ -427,7 +427,7 @@ class HuatengCamera(AC):
         return raw_data_np, timecode_val # timestamp is always supported in HuatengCam
     
     def grab(self) -> Optional[np.ndarray]:
-        # TODO: Impl. ISP here
+        # TODO: Impl. Fused ISP (ProcessorV12)
         frame = self.grab_raw()
         if frame is None: return None
         frame = self._processor.process(frame)
