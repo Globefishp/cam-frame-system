@@ -109,7 +109,7 @@ class FrameServer:
         """Picklization protocol that is compatible in multiprocess environment."""
         state = self.__dict__.copy()
         # Clear memory reference by ctypes and numpy.
-        for k in ['metadata', 'enable_mask', 'next_frame_ids', 'tickets_arr']:
+        for k in ['_metadata', '_enable_mask', '_next_frame_ids', '_tickets_arr']:
             state.pop(k, None)
         return state
 
@@ -132,14 +132,9 @@ class FrameServer:
         self._metadata = FSMetadata.from_buffer(self._shm.buf)
         buf = self._shm.buf
         
-        offset = ctypes.sizeof(ctypes.c_int64) * 3 # fs_protocol_ver, fs_oldest_frame_id, rb_offset
-        self._enable_mask: NDArray[np.bool_] = np.ndarray((MAX_CONSUMERS,), dtype=np.bool_, buffer=buf, offset=offset)
-        
-        offset += ctypes.sizeof(ctypes.c_int64) * MAX_CONSUMERS
-        self._next_frame_ids: NDArray[np.int64] = np.ndarray((MAX_CONSUMERS,), dtype=np.int64, buffer=buf, offset=offset)
-        
-        offset += ctypes.sizeof(ctypes.c_int64) * MAX_CONSUMERS
-        self._tickets_arr: NDArray[np.int64] = np.ndarray((MAX_CONSUMERS, MAX_TICKETS), dtype=np.int64, buffer=buf, offset=offset)
+        self._enable_mask: NDArray[np.bool_] = np.ndarray((MAX_CONSUMERS,), dtype=np.bool_, buffer=buf, offset=FSMetadata.enable_mask.offset)
+        self._next_frame_ids: NDArray[np.int64] = np.ndarray((MAX_CONSUMERS,), dtype=np.int64, buffer=buf, offset=FSMetadata.next_frame_ids.offset)
+        self._tickets_arr: NDArray[np.int64] = np.ndarray((MAX_CONSUMERS, MAX_TICKETS), dtype=np.int64, buffer=buf, offset=FSMetadata.tickets.offset)
 
     def register_consumer(self) -> int:
         """
@@ -187,10 +182,11 @@ class FrameServer:
                 self._next_frame_ids[cid] = _INT64_MAX
                 self._tickets_arr[cid, :] = _INT64_MAX
 
-                self._gc()
                 logger.info(f"Consumer {cid} unregistered.")
             else:
                 logger.debug(f"Consumer {cid} is already unregistered.")
+
+        self._gc()
 
     def get_sync(self, cid: int, size: int, timeout: Optional[float] = None) -> Optional[FrameTicket]:
         """
@@ -237,7 +233,7 @@ class FrameServer:
                     self._tickets_arr[cid, available_ticket_slot] = next_frame_id
                     self._next_frame_ids[cid] = next_frame_id + size
                 
-                    return FrameTicket(abs_count=next_frame_id, size=size)
+                    return FrameTicket(head_id=next_frame_id, size=size)
 
             # 1st trial failed, wait buffer with timeout.
             if timeout is not None:

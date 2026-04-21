@@ -409,13 +409,13 @@ class ProcessSafeSharedRingBuffer:
         if frames.dtype != self._dtype:
             raise ValueError(f"Frame dtype mismatch. Expected {self._dtype}, got {frames.dtype}")
         
+        # Check remaining space outside lock (cover most calls) and trigger GC if needed.
+        put_frame_num = frames.shape[0]
+        if self._metadata_ctypes.occupied_count + put_frame_num > self._buffer_capacity:
+            if self._gc_func is not None:
+                self._gc_func()
         # Reading metadata requires the lock for consistency
         with self._pointer_lock: # Acquire lock for metadata access and synchronization
-            put_frame_num = frames.shape[0]
-            # Check remaining space and trigger GC if needed. TODO: dead-lock
-            if self._metadata_ctypes.occupied_count + put_frame_num > self._buffer_capacity:
-                if self._gc_func is not None:
-                    self._gc_func()
             # Always use occupied_count to determine if the buffer state, not read_ptr and write_ptr
             if not self._space_available.wait_for(
                 lambda: self._metadata_ctypes.occupied_count + put_frame_num <= self._buffer_capacity, 
@@ -649,7 +649,7 @@ class ProcessSafeSharedRingBuffer:
         """
         ...
 
-    def read_from(self, arg1: Union[int, BufferTicket], arg2: int) -> List[np.ndarray]:
+    def read_from(self, arg1: Union[int, BufferTicket], arg2: Optional[int] = None) -> List[np.ndarray]:
         if isinstance(arg1, BufferTicket):
             index, length = arg1.read_ptr, arg1.read_num
         elif isinstance(arg1, int) and isinstance(arg2, int):
