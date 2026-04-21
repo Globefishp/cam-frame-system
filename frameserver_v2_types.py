@@ -47,4 +47,5 @@ class FSMetadata(ctypes.Structure):
         ("enable_mask", ctypes.c_bool * MAX_CONSUMERS), # If a consumer is enabled.
         ("next_frame_ids", ctypes.c_int64 * MAX_CONSUMERS), # The first frame id to be got in the next `get_sync()` call.
         ("tickets", (ctypes.c_int64 * MAX_TICKETS) * MAX_CONSUMERS), # The first frame id of each batch (define as a `ticket`) that IS BEING occupied by consumers.
+        # tickets use Tickets x Consumers, to avoid False-sharing. Usually, different consumer's tickets will operate in the same process.
     ]

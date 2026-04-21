@@ -56,12 +56,14 @@ class FrameServer:
 
         self.buffer = ring_buffer
         self._fs_lock = mp.Lock()
+        self._gc_lock = mp.Lock() # gc lock is for blocking GC during get_async_copy()
         self._ticket_available = mp.Condition(self._fs_lock)
 
         self._metadata: Optional[FSMetadata] = None
         self._enable_mask: Optional[NDArray] = None
         self._next_frame_ids: Optional[NDArray] = None
         self._tickets_arr: Optional[NDArray] = None
+        self._gc_view: Optional[NDArray] = None # _gc_view is a flattened view for _next_frame_ids + _tickets_arr
         
         meta_size = ctypes.sizeof(FSMetadata)
         if create:
@@ -129,12 +131,13 @@ class FrameServer:
 
     def _link_np_view(self):
         """Use numpy view to have easy access to array fields."""
-        self._metadata = FSMetadata.from_buffer(self._shm.buf)
+        self._metadata: FSMetadata = FSMetadata.from_buffer(self._shm.buf)
         buf = self._shm.buf
         
         self._enable_mask: NDArray[np.bool_] = np.ndarray((MAX_CONSUMERS,), dtype=np.bool_, buffer=buf, offset=FSMetadata.enable_mask.offset)
         self._next_frame_ids: NDArray[np.int64] = np.ndarray((MAX_CONSUMERS,), dtype=np.int64, buffer=buf, offset=FSMetadata.next_frame_ids.offset)
         self._tickets_arr: NDArray[np.int64] = np.ndarray((MAX_CONSUMERS, MAX_TICKETS), dtype=np.int64, buffer=buf, offset=FSMetadata.tickets.offset)
+        self._gc_view: NDArray[np.int64] = np.ndarray((MAX_CONSUMERS + MAX_CONSUMERS * MAX_TICKETS,), dtype=np.int64, buffer=buf, offset=FSMetadata.next_frame_ids.offset)
 
     def register_consumer(self) -> int:
         """
@@ -191,6 +194,9 @@ class FrameServer:
     def get_sync(self, cid: int, size: int, timeout: Optional[float] = None) -> Optional[FrameTicket]:
         """
         Get the next ticket for a consumer for `size` frames. 
+        
+        Can also guarenteed to get sequential data (no overlap, no skip) under 
+        concurrent `get_sync` call for the same cid.
 
         Args:
             cid (int): consumer id.
@@ -204,7 +210,6 @@ class FrameServer:
             ValueError: If the consumer id is invalid.
             RuntimeError: If the consumer is not activated.
         
-        For the same consumer, concurrent `get_sync` call may get same tickets rather than sequential data????
         """
         if not (0 <= cid < MAX_CONSUMERS):
             raise ValueError(f"Invalid consumer id: {cid}")
@@ -297,28 +302,30 @@ class FrameServer:
     def _gc(self) -> int:
         """
         GC function scans the FrameServer metadata and release the expired data from the RingBuffer.
-        `_gc()` will acquire `_fs_lock`, call it outside the lock.
+        `_gc()` will acquire `_fs_lock`, so call it outside the lock.
 
         Returns:
             release_num (int): number of the oldest frames released.
         """
+        # _gc() maintains the coupling of buffer release state and write fs_oldest_frame_id.
         logger = self._logger
         if self._metadata is None or self._enable_mask is None or self._next_frame_ids is None or self._tickets_arr is None:
             # May run in daemon thread, raise is not suitable here.
             logger.warning("GC is called when metadata not fully initialized. Release nothing.")
             return 0
-        with self._fs_lock:
 
-            # Find the oldest ticket for each consumer.
-            # Inactive consumers and tickets will use _INT64_MAX, which will not affect the GC below.
-            consumers_oldest_ticket_id: NDArray[np.int64] = np.min(self._tickets_arr, axis=1)
-            
-            # If a consumer is active but no tickets are flying, clamping to its next_frame_id.
-            consumers_occupied_from_id = np.minimum(self._next_frame_ids, consumers_oldest_ticket_id)
-            
-            global_occupied_from_id: NDArray[np.int64] = np.min(consumers_occupied_from_id)
+        # Find the lagging most frame id (occupied for tickets, need to be preserved for next_frame_ids).
+        global_occupied_from_id = np.min(self._gc_view) 
+        # GC can run concurrently with other get_sync/release_sync. 
+        # in 64 bit system, int64 is atomic, the data inconsistency will only make 
+        # global_occupied_from_id lag behind the actual value. (release less, safe)
 
-            # Has consumers, and has something to release.
+        # === Critical zone (protect fs_oldest_frame_id, no concurrent _gc()) ===
+        if not self._gc_lock.acquire(block=False):
+            return 0 # Let next gc to do works.
+        
+        # Has consumers, and has something to release.
+        try:
             if global_occupied_from_id != _INT64_MAX and global_occupied_from_id > self._metadata.fs_oldest_frame_id:
                 to_release = global_occupied_from_id - self._metadata.fs_oldest_frame_id
                 release_num = self.buffer.release(to_release)
@@ -326,6 +333,8 @@ class FrameServer:
                 self._metadata.fs_oldest_frame_id += release_num 
                 return release_num
             return 0
+        finally: # use `finally` to release lock before leaving current scope.
+            self._gc_lock.release()
 
     def get_async(self, size: int) -> Optional[FrameTicket]:
         """
@@ -336,12 +345,33 @@ class FrameServer:
                 or None if the buffer do not have enough frames to return.
         """
         # Due to memory barrier, not guaranteed to be the latest.
-        buffer_frontier_id = self._metadata.fs_oldest_frame_id + self.buffer.occupied_count_
         if self.buffer.occupied_count_ < size:
             return None # Buffer do not have enough data.
             
+        buffer_frontier_id = self._metadata.fs_oldest_frame_id + self.buffer.occupied_count_
         head_id = buffer_frontier_id - size
         return FrameTicket(head_id=head_id, size=size)
+
+    def get_async_copy(self, size: int) -> Optional[List[NDArray]]:
+        """
+        Get the deep copy of the latest `size` frames.
+
+        Returns:
+            Optional[List[NDArray]]: The deep copy of the latest `size` frames, 
+                or None if the buffer do not have enough frames to return.
+        """
+        with self._gc_lock:
+            # Block GC ensures data integrity.
+            if self.buffer.occupied_count_ < size:
+                return None # Buffer do not have enough data.
+
+            buffer_frontier_id = self._metadata.fs_oldest_frame_id + self.buffer.occupied_count_
+            head_id = buffer_frontier_id - size
+
+            relative_ptr = (head_id + self._metadata.rb_offset) % self.buffer.buffer_capacity
+            data_views = self.buffer.read_from(relative_ptr, size)
+            return [np.copy(data_view) for data_view in data_views]
+
 
     def close(self):
         """Close the metadata shared memory."""
