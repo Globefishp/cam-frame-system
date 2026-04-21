@@ -251,7 +251,7 @@ class FrameServer:
                     return None # timeout, return.
                     
 
-    def get_data_from_ticket(self, ticket: FrameTicket) -> List[np.ndarray]:
+    def get_from_ticket(self, ticket: FrameTicket) -> List[np.ndarray]:
         """
         Extract the data view from the Ticket. Zero-copy.
         
@@ -327,7 +327,7 @@ class FrameServer:
                 return release_num
             return 0
 
-    def get_async_ticket(self, size: int) -> Optional[FrameTicket]:
+    def get_async(self, size: int) -> Optional[FrameTicket]:
         """
         Non-blockingly get the latest `size` frames from the buffer.
 
