@@ -23,9 +23,11 @@ class FrameServer:
     FrameServer V2 enables zero-copy frame distribution to multiple consumers 
     from a shared ring buffer. Process-safe design, allowing concurrently get() 
     calls.
+    Limitation: can only be passed to subprocesses when creating them. 
+    (Common limitation for mp objects, standard picklization won't work)
     """
     def __init__(self, ring_buffer: ProcessSafeSharedRingBuffer, 
-                 create: bool = True, shm_name: str = None, 
+                 create: bool = True, frameserver: 'FrameServer' = None, 
                  inject_logger: Optional[Logger] = None):
         """
         Args:
@@ -33,7 +35,7 @@ class FrameServer:
                 Once injected, it should be exclusively read by this FrameServer instance.
                 Or internal status will be corrupted.
             create (bool): If True, create a new FrameServer. 
-            shm_name (str): The name of the shared memory.
+            frameserver (FrameServer): The FrameServer instance to link.
             inject_logger (Optional[Logger]): The loguru logger to use for logging, 
                            requires `enqueue=True`. If None, logging is disabled.
         
@@ -77,35 +79,52 @@ class FrameServer:
                     ", system resource has run out." if e.errno == errno.ENOMEM else ".") from e
             except Exception as e:
                 self.close()
-                raise RuntimeError(f"Unexpected error when creating FrameServer with ShM name: {shm_name}.") from e
+                raise RuntimeError(f"Unexpected error when creating FrameServer.") from e
 
             logger.success(f"FrameServer created with ShM name: {self._shm.name}, size: {meta_size} bytes")
         else: # link to exist mp FrameServer instance by name.
-            if shm_name is None:
-                raise ValueError("`shm_name` must be provided when create=False.")
+            if frameserver is None:
+                raise ValueError("`frameserver` must be provided when create=False.")
             try:
-                self._shm = mp_shm.SharedMemory(name=shm_name)
-                self._link_np_view()
+                # Link to syncronization objects
+                self._fs_lock = frameserver.fs_lock
+                self._gc_lock = frameserver.gc_lock
+                self._ticket_available = frameserver.ticket_available
 
+                self._shm = mp_shm.SharedMemory(name=frameserver.shm_name)
+                self._link_np_view()
+            except AttributeError as e:
+                self.close()
+                raise AttributeError(f"FrameServer with ShM name: {frameserver.shm_name} is not a valid FrameServer instance.") from e
             except FileNotFoundError as e:
                 self.close()
-                raise FileNotFoundError(f"FrameServer with ShM name: {shm_name} not found.") from e
+                raise FileNotFoundError(f"FrameServer ShM name {frameserver.shm_name} is invalid or expired.") from e
             except OSError as e:
                 self.close()
-                raise OSError(f"Failed to attach to FrameServer with ShM name: {shm_name}.") from e
+                raise OSError(f"Failed to attach to FrameServer with ShM name: {frameserver.shm_name}.") from e
             except Exception as e:
                 self.close()
-                raise RuntimeError(f"Unexpected error when attaching to FrameServer with ShM name: {shm_name}.") from e
+                raise RuntimeError(f"Unexpected error when attaching to FrameServer with ShM name: {frameserver.shm_name}.") from e
             
             if self._metadata.fs_protocol_ver != _METADATA_VER_HASH:
                 self.close()
-                raise RuntimeError(f"ShM name: {shm_name} is not a valid metadata memory block for this FrameServer."
+                raise RuntimeError(f"ShM name: {frameserver.shm_name} is not a valid metadata memory block for this FrameServer."
                     f"Expected: {_METADATA_VER_HASH}, received: {self._metadata.fs_protocol_ver}")
             logger.success(f"Attached to FrameServer with ShM name: {self._shm.name}")
 
     @property
     def shm_name(self) -> str:
         return self._shm.name
+    @property
+    def fs_lock(self) -> mp.Lock:
+        return self._fs_lock
+    @property
+    def gc_lock(self) -> mp.Lock:
+        return self._gc_lock
+    @property
+    def ticket_available(self) -> mp.Condition:
+        return self._ticket_available
+    
 
     def __getstate__(self) -> dict:
         """Picklization protocol that is compatible in multiprocess environment."""
@@ -219,9 +238,9 @@ class FrameServer:
 
         end_time = time.monotonic() + timeout if timeout is not None else 0.0
         while True:
-            with self._fs_lock:
+            with self._fs_lock: # TODO: Can use Lock for each consumer, allow fine grain parallelization.
                 # check available slot.
-                if not self._ticket_available.wait_for(
+                if not self._ticket_available.wait_for( # TODO: Intend to remove ticket_available condition, this is rare.
                     lambda: len(np.where(self._tickets_arr[cid] == _INT64_MAX)[0]) > 0, timeout=timeout
                 ):
                     return None # Timeout
