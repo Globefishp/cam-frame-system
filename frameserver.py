@@ -1,6 +1,21 @@
 # frameserver.py
 # Author: Haiyun Huang & Google Gemini 3.1 Pro
 
+# V2 TODO: Process safe, do flow control for multiple consumer.
+#          It receives `get` request from multiple consumers, get data ticket from the ring buffer,
+#          cache the tickets for flow control, and issue its own FrameTicket (for release)
+#          (or direct return data view) to consumers. It is FrameServer's responsibility to make sure every call to
+#          the ring buffer is valid.
+#          Background GC: detect the oldest occupied frame, release released frames 
+#          by calling release() in ring buffer.
+#          For the basic function, we need to maintain a structure that record the occupied frames by
+#          each registered `named` consumer.
+#          API: Sync named consumers will get continuous (per consumer) data:
+#               register_consumer(name); get_sync(name, size)->Tuple[List[NDArray], FrameTicket]; release_sync(name, FrameTicket);
+#               Async anonymous consumer do dirty read:
+#               get_async_view(offset, size) -> Optional[List[NDArray]] # None if including trash data. similar to peek_frames() in RB v3a.
+#               get_async_copy(offset, size) -> Optional[List[NDArray]]
+
 import threading as t
 import numpy as np
 from numpy.typing import NDArray
@@ -21,6 +36,8 @@ class FrameServer:
             `release_sync()`.
         - Anonymous consumer: Tolerant to data drop, may also do dirty read 
             for performance. In this case, use `get_async_` API series.
+
+    All consumers will retrieve the same batch of data for the same time.
     
     This frame server is thread-safe for all public API. 
     In current structure, inject this frameserver to downstream consumer to get 
