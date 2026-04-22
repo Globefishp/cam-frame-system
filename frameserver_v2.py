@@ -2,6 +2,8 @@
 # Scratch by Google Gemini 3.1 Pro, reviewed & cleaned up by Haiyun Huang (260421)
 
 # Require 64bit system to safely read int64 atomically.
+# gc_lock is a small grain lock, if lock nesting is needed, gc_lock must be acquired 
+#   AFTER holding cid_lock/reg_lock to prevent ABBA dead lock.
 
 import time
 import ctypes
@@ -57,9 +59,9 @@ class FrameServer:
         logger = self._logger
 
         self.buffer = ring_buffer
-        self._fs_lock = mp.Lock()
+        self._reg_lock = mp.Lock()
+        self._cid_locks: List[mp.Lock] = [mp.Lock() for _ in range(MAX_CONSUMERS)]
         self._gc_lock = mp.Lock() # gc lock is for blocking GC during get_async_copy()
-        self._ticket_available = mp.Condition(self._fs_lock)
 
         self._metadata: Optional[FSMetadata] = None
         self._enable_mask: Optional[NDArray] = None
@@ -87,9 +89,9 @@ class FrameServer:
                 raise ValueError("`frameserver` must be provided when create=False.")
             try:
                 # Link to syncronization objects
-                self._fs_lock = frameserver.fs_lock
+                self._reg_lock = frameserver.reg_lock
+                self._cid_locks = frameserver.cid_locks
                 self._gc_lock = frameserver.gc_lock
-                self._ticket_available = frameserver.ticket_available
 
                 self._shm = mp_shm.SharedMemory(name=frameserver.shm_name)
                 self._link_np_view()
@@ -116,14 +118,14 @@ class FrameServer:
     def shm_name(self) -> str:
         return self._shm.name
     @property
-    def fs_lock(self) -> mp.Lock:
-        return self._fs_lock
+    def reg_lock(self) -> mp.Lock:
+        return self._reg_lock
+    @property
+    def cid_locks(self) -> List[mp.Lock]:
+        return self._cid_locks
     @property
     def gc_lock(self) -> mp.Lock:
         return self._gc_lock
-    @property
-    def ticket_available(self) -> mp.Condition:
-        return self._ticket_available
     
 
     def __getstate__(self) -> dict:
@@ -169,17 +171,18 @@ class FrameServer:
             RuntimeError: If the number of consumers exceeds the maximum supported number.
         """
         logger = self._logger
-        with self._fs_lock:
+        with self._reg_lock:
             zeros = np.where(self._enable_mask == False)[0]
             if len(zeros) == 0:
                 raise RuntimeError(f"Exceed the max consumer number supported ({MAX_CONSUMERS}).")
+            # Use the first available slot.
             cid = zeros[0]
             
-            # Activate the first available slot.
-            self._enable_mask[cid] = True
             # Initialize metadata for the consumer.
-            self._next_frame_ids[cid] = self._metadata.fs_oldest_frame_id + self.buffer.occupied_count_
+            with self._gc_lock:
+                self._next_frame_ids[cid] = self._metadata.fs_oldest_frame_id + self.buffer.occupied_count_
             self._tickets_arr[cid, :] = _INT64_MAX # Use _INT64_MAX to mark unused tickets.
+            self._enable_mask[cid] = True # set flag at the end does NOT provide any order guarantee as it is shared memory.
         
         logger.info(f"Consumer {cid} registered.")
         return cid
@@ -198,15 +201,16 @@ class FrameServer:
         logger = self._logger
         if not (0 <= cid < MAX_CONSUMERS):
             raise ValueError(f"Invalid consumer id: {cid}")
-        with self._fs_lock:
-            if self._enable_mask[cid] == True:
-                self._enable_mask[cid] = False
-                self._next_frame_ids[cid] = _INT64_MAX
-                self._tickets_arr[cid, :] = _INT64_MAX
+        with self._reg_lock:
+            with self._cid_locks[cid]:
+                if self._enable_mask[cid] == True:
+                    self._enable_mask[cid] = False
+                    self._next_frame_ids[cid] = _INT64_MAX
+                    self._tickets_arr[cid, :] = _INT64_MAX
 
-                logger.info(f"Consumer {cid} unregistered.")
-            else:
-                logger.debug(f"Consumer {cid} is already unregistered.")
+                    logger.info(f"Consumer {cid} unregistered.")
+                else:
+                    logger.debug(f"Consumer {cid} is already unregistered.")
 
         self._gc()
 
@@ -233,33 +237,37 @@ class FrameServer:
         if not (0 <= cid < MAX_CONSUMERS):
             raise ValueError(f"Invalid consumer id: {cid}")
 
-        if self._enable_mask[cid] == 0: # Check don't need lock.
+        if self._enable_mask[cid] == False: # Check don't need lock.
             raise RuntimeError(f"Consumer ID ({cid}) is not activated.")
 
         end_time = time.monotonic() + timeout if timeout is not None else 0.0
         while True:
-            with self._fs_lock: # TODO: Can use Lock for each consumer, allow fine grain parallelization.
-                # check available slot.
-                if not self._ticket_available.wait_for( # TODO: Intend to remove ticket_available condition, this is rare.
-                    lambda: len(np.where(self._tickets_arr[cid] == _INT64_MAX)[0]) > 0, timeout=timeout
-                ):
-                    return None # Timeout
+            insufficient_tickets: bool = False
+            with self._cid_locks[cid]:
+                # Check available slot.
                 available_ticket_slots = np.where(self._tickets_arr[cid] == _INT64_MAX)[0]
+                if len(available_ticket_slots) > 0:
 
-                # Check whether buffer has enough data.
-                next_frame_id: int = self._next_frame_ids[cid]
-                buffer_frontier_id = self._metadata.fs_oldest_frame_id + self.buffer.occupied_count_
+                    with self._gc_lock: # Use _gc_lock to prevent fs_oldest_frame_id mismatch with occupied_count_.
+                        buffer_frontier_id = self._metadata.fs_oldest_frame_id + self.buffer.occupied_count_
 
-                # Check unlocked occupied_count_ first, which is safe in 64bit system.
-                if buffer_frontier_id >= next_frame_id + size: # Avoid unnecessary lock acquisition.
-                    # Have enough data, issue ticket.
-                    available_ticket_slot = available_ticket_slots[0]
-                    self._tickets_arr[cid, available_ticket_slot] = next_frame_id
-                    self._next_frame_ids[cid] = next_frame_id + size
-                
-                    return FrameTicket(head_id=next_frame_id, size=size)
+                    # Check whether buffer has enough data.
+                    next_frame_id: int = self._next_frame_ids[cid]
+                    if buffer_frontier_id >= next_frame_id + size: # Possibility for false-negative.
+                        # Have enough data, issue ticket.
+                        available_ticket_slot = available_ticket_slots[0]
+                        self._tickets_arr[cid, available_ticket_slot] = next_frame_id
+                        self._next_frame_ids[cid] = next_frame_id + size
+                    
+                        return FrameTicket(head_id=next_frame_id, size=size)
+                else:
+                    insufficient_tickets = True
 
-            # 1st trial failed, wait buffer with timeout.
+            if insufficient_tickets:
+                time.sleep(0.001) # time slice rotation, 16ms punishment on Windows.
+                continue # retry by polling rather than waiting condition.
+
+            # insufficient buffer, wait buffer with timeout.
             if timeout is not None:
                 timeout = end_time - time.monotonic()
                 if timeout <= 0: return None # timeout, return.
@@ -268,10 +276,8 @@ class FrameServer:
             with self.buffer.pointer_lock: 
                 # Check within lock, memory barrier.
                 # wait_for exec predicate in lock, avoid using locked .occupied_count() (dead lock)
-                if not self.buffer.data_available_condition.wait_for(
-                    lambda: self._metadata.fs_oldest_frame_id + self.buffer.occupied_count_ >= next_frame_id + size,
-                    timeout=timeout
-                ):
+                if not self.buffer.data_available_condition.wait(timeout=timeout):
+                    # Wait without predicate, let next cycle to check false positive.
                     return None # timeout, return.
                     
 
@@ -310,18 +316,18 @@ class FrameServer:
         if not (0 <= cid < MAX_CONSUMERS):
             raise ValueError(f"Invalid consumer id: {cid}")
 
-        with self._fs_lock:
+        with self._cid_locks[cid]:
             match_idx = np.where(self._tickets_arr[cid] == ticket.head_id)[0]
             if len(match_idx) > 0:
                 self._tickets_arr[cid, match_idx[0]] = _INT64_MAX
-                self._ticket_available.notify_all() # multiple consumers, must notify all.
+                # Ticket available condition now is checked by polling
             
-        self._gc()
+        self._gc() # avoid unnecessary lock nesting
 
     def _gc(self) -> int:
         """
         GC function scans the FrameServer metadata and release the expired data from the RingBuffer.
-        `_gc()` will acquire `_fs_lock`, so call it outside the lock.
+        `_gc()` will acquire `_gc_lock`, please avoid unnecessary lock nesting to prevent dead lock.
 
         Returns:
             release_num (int): number of the oldest frames released.
@@ -357,7 +363,7 @@ class FrameServer:
 
     def get_async(self, size: int) -> Optional[FrameTicket]:
         """
-        Non-blockingly get the latest `size` frames from the buffer.
+        Get the latest `size` frames from the buffer.
 
         Returns:
             Optional[FrameTicket]: The ticket for the latest `size` frames, 
@@ -366,8 +372,9 @@ class FrameServer:
         # Due to memory barrier, not guaranteed to be the latest.
         if self.buffer.occupied_count_ < size:
             return None # Buffer do not have enough data.
-            
-        buffer_frontier_id = self._metadata.fs_oldest_frame_id + self.buffer.occupied_count_
+        with self._gc_lock:
+            buffer_frontier_id = self._metadata.fs_oldest_frame_id + self.buffer.occupied_count_
+        
         head_id = buffer_frontier_id - size
         return FrameTicket(head_id=head_id, size=size)
 
@@ -379,11 +386,11 @@ class FrameServer:
             Optional[List[NDArray]]: The deep copy of the latest `size` frames, 
                 or None if the buffer do not have enough frames to return.
         """
-        with self._gc_lock:
-            # Block GC ensures data integrity.
-            if self.buffer.occupied_count_ < size:
-                return None # Buffer do not have enough data.
+        if self.buffer.occupied_count_ < size:
+            return None # Buffer do not have enough data.
 
+        with self._gc_lock: # TODO: Anyway to make copy outside?? probably not except mod ring buffer.
+            # Block GC ensures consistent `fs_oldest_frame_id` and `occupied_count_` and data integrity.
             buffer_frontier_id = self._metadata.fs_oldest_frame_id + self.buffer.occupied_count_
             head_id = buffer_frontier_id - size
 
