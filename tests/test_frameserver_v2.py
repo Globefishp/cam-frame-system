@@ -18,6 +18,7 @@ import pytest
 import numpy as np
 import time
 import multiprocessing as mp
+import random
 
 from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
 from frameserver_v2 import FrameServer
@@ -41,7 +42,7 @@ def small_buffer():
     try: rb.unlink()
     except Exception: pass
 
-def __basic_use_consumer(server_master, use_linked_fs, queue):
+def __basic_use_consumer(server_master, use_linked_fs, result_queue):
     try:
         if use_linked_fs:
             server = FrameServer(create=False, frameserver=server_master)
@@ -49,66 +50,73 @@ def __basic_use_consumer(server_master, use_linked_fs, queue):
             server = server_master
             
         cid = server.register_consumer()
-        queue.put(("REGISTERED", cid))
+        if cid != 0:
+            raise ValueError(f"Expected cid 0, got {cid}")
+            
+        result_queue.put("READY")
         
-        # Wait for data (polling for simplicity in test)
-        ticket = server.get_sync(cid, 1, timeout=0.5)
+        # We expect 100 frames
+        collected = []
+        for i in range(100):
+            ticket = server.get_sync(cid, 1, timeout=2.0)
+            if ticket is None:
+                raise ValueError(f"Timeout expecting frame {i}")
+            if ticket.head_id != i:
+                raise ValueError(f"Expected frame {i}, got {ticket.head_id}")
+                
+            data_list = server.get_from_ticket(ticket)
+            if data_list[0].shape != (1, 2, 2, 3):
+                raise ValueError(f"Wrong shape")
             
-        if ticket is None:
-            raise TimeoutError("Consumer timed out waiting for data from producer")
+            val = int(data_list[0][0, 0, 0, 0])
+            collected.append(val)
             
-        # Get Data
-        data_list = server.get_from_ticket(ticket)
-        if data_list[0].shape != (1, 2, 2, 3):
-            raise ValueError(f"Shape mismatch: {data_list[0].shape}")
-        if not np.all(data_list[0] == 11):
-            raise ValueError("Data content mismatch")
+            server.release_sync(cid, ticket)
             
-        # Release Sync
-        server.release_sync(cid, ticket)
-        
         server.unregister_consumer(cid)
-
-        server.close()
             
-        queue.put(("SUCCESS", None))
+        result_queue.put(collected)
     except Exception as e:
-        import traceback
-        queue.put(("ERROR", (str(e), traceback.format_exc())))
+        result_queue.put(e)
+    finally:
+        server.close()
 
 @pytest.mark.parametrize("use_linked_fs", [False, True])
 def test_fs_basic_use(small_buffer, use_linked_fs):
-    """Test frameserver basic registration and sequential flow via Subprocess."""
+    """Test frameserver basic registration and sequential flow across processes."""
     server_master = FrameServer(create=True, ring_buffer=small_buffer)
-    # Set the GC trigger implicitly handled by user architecture
     small_buffer.trigger_release = server_master._gc
     
-    queue = ctx.Queue()
-    p = ctx.Process(target=__basic_use_consumer, args=(server_master, use_linked_fs, queue))
-    p.start()
+    result_queue = ctx.Queue()
+    consumer_proc = ctx.Process(target=__basic_use_consumer, args=(server_master, use_linked_fs, result_queue))
+    consumer_proc.start()
     
-    # 协调同步: 等待子进程就绪并完成注册
-    res = queue.get(timeout=5.0)
-    assert res[0] == "REGISTERED", f"Expected REGISTERED, got {res}"
-    cid = res[1]
+    res = result_queue.get(timeout=3.0)
+    if isinstance(res, Exception):
+        raise res
+    assert res == "READY"
     
-    # 主进程放入数据
-    small_buffer.put(np.full((1, 2, 2, 3), 11, dtype=np.uint32))
+    # Put 100 frames to cause wrap around (cap is 5)
+    for i in range(100):
+        small_buffer.put(np.full((1, 2, 2, 3), i, dtype=np.uint32))
+        
+    res = result_queue.get(timeout=3.0)
+    consumer_proc.join(timeout=1.0)
     
-    # 等待子进程处理验证结果
-    res = queue.get(timeout=5.0)
-    if res[0] == "ERROR":
-        msg, tb = res[1]
-        print(tb)
-        pytest.fail(f"Child process failed: {msg}")
-    assert res[0] == "SUCCESS"
+    if isinstance(res, Exception):
+        raise res
+    assert res == list(range(100))
     
-    p.join(timeout=2.0)
-
     server_master.close()
     server_master.unlink()
 
-def __unified_consumer_worker(fs_obj, cid, stop_event, fetch_size, result_queue):
+def __spin_delay(delay_sec):
+    if delay_sec <= 0: return
+    end = time.perf_counter() + delay_sec
+    while time.perf_counter() < end:
+        pass
+
+def __unified_consumer_worker(fs_obj, cid, stop_event, fetch_size, result_queue, delay_mean=0.0, delay_std=0.0):
     try:
         server = FrameServer(create=False, frameserver=fs_obj)
         print(f"Successfully create subprocess consumer ({cid}): {os.getpid()}")
@@ -130,6 +138,9 @@ def __unified_consumer_worker(fs_obj, cid, stop_event, fetch_size, result_queue)
                 except TicketExpireException:
                     pass
                 
+                load_time = max(0.0, random.gauss(delay_mean, delay_std))
+                __spin_delay(load_time)
+                
                 tickets.append((ticket.head_id, ts))
                 server.release_sync(cid, ticket)
         result_queue.put(tickets)
@@ -137,8 +148,9 @@ def __unified_consumer_worker(fs_obj, cid, stop_event, fetch_size, result_queue)
         result_queue.put(e)
     finally:
         server.close()
+        print(f"Consumer ({cid}) closed.")
 
-def __unified_producer_worker(rb_obj, stop_event, batch_size, result_queue):
+def __unified_producer_worker(rb_obj, stop_event, batch_size, result_queue, delay_mean=0.0, delay_std=0.0):
     buffer = ProcessSafeSharedRingBuffer(create=False, source_buffer=rb_obj)
     print(f"Successfully create subprocess producer: {os.getpid()}")
     i = 0
@@ -146,6 +158,10 @@ def __unified_producer_worker(rb_obj, stop_event, batch_size, result_queue):
         frames = np.zeros((batch_size, 10, 10, 3), dtype=np.uint32)
         for sub in range(batch_size):
             frames[sub] = i * batch_size + sub
+            
+        load_time = max(0.0, random.gauss(delay_mean, delay_std))
+        __spin_delay(load_time)
+        
         ret = buffer.put(frames, timeout=0.1)
         if ret: i += 1
     result_queue.put(i * batch_size) # 乘以 batch_size 送出实际的帧总数
@@ -173,9 +189,8 @@ def test_fs_concurrent_single_consumer(empty_buffer):
     time.sleep(0.5)
     rx_stop_event.set()
     
-    producer.join(timeout=1.0)
     produced_frames = tx_queue.get()
-    for w in workers: w.join(timeout=1.0)
+    producer.join(timeout=1.0)
     
     collected_tickets = []
     for q in rx_queues:
@@ -185,6 +200,7 @@ def test_fs_concurrent_single_consumer(empty_buffer):
     print(f"Produced: {produced_frames}, Collected: {len(collected_tickets)}")
     assert len(collected_tickets) == produced_frames
     
+    for w in workers: w.join(timeout=1.0)
     # Timestamp verification
     # Using time.monotonic to strict prove data generation order identical to acquire order!
     collected_tickets.sort(key=lambda x: x[1]) # Sort by timestamp
@@ -230,9 +246,8 @@ def test_fs_multi_cid_parallel(empty_buffer):
     time.sleep(1.0)
     rx_stop_event.set()
     
-    producer.join(timeout=2.0)
     produced_frames = tx_queue.get()
-    for w in workers: w.join(timeout=2.0)
+    producer.join(timeout=2.0)
     
     for cid, q in zip(cids, rx_queues):
         res = q.get()
@@ -243,9 +258,10 @@ def test_fs_multi_cid_parallel(empty_buffer):
         expected_ids = list(range(0, produced_frames))
         
         if head_ids != expected_ids:
-            print(f"Sequence gap on distinct CID {cid}. Expected up to {produced_frames}, got max {head_ids[-1] if head_ids else 'None'}.")
+            print(f"Sequence gap on distinct CID {cid}. Expected up to id {produced_frames -1}, got max {head_ids[-1] if head_ids else 'None'}.")
         assert head_ids == expected_ids
     
+    for w in workers: w.join(timeout=2.0)
     for cid in cids: server.unregister_consumer(cid)
     server.close()
     server.unlink()
@@ -350,8 +366,8 @@ def test_fs_async_sync_barrier(empty_buffer):
     time.sleep(2.0) # Intense multiprocess execution window
     stop_event.set()
     
-    p_prod.join(); p_cons.join(); p_stalker.join()
     tearing_cnt = queue.get()
+    p_prod.join(); p_cons.join(); p_stalker.join()
     
     # Assert absolutely NO torn data and correct expirations 
     print(f"Tearing count: {tearing_cnt}")
@@ -403,11 +419,11 @@ def test_fs_get_async_expire(empty_buffer, cons_num, decode_delay, should_expire
     time.sleep(2.0)
     stop_event.set()
     
+    success, expired = queue.get()
     prod.join()
     for c in cons_procs: c.join()
     async_reader.join()
     
-    success, expired = queue.get()
     print(f"Async Success: {success}, Expired: {expired} with delay: {decode_delay}")
     
     if should_expire:
@@ -466,5 +482,69 @@ def test_fs_unregister_usage_denial(small_buffer):
     with pytest.raises(RuntimeError, match="not activated"):
         server.get_sync(cid, 1)
         
+    server.close()
+    server.unlink()
+
+@pytest.mark.parametrize("cons_num, prod_params, cons_params", [
+    # 消费者数, 生产(均值,方差)秒, 消费(均值,方差)秒
+    # 场景 1：极速并发（测试锁和调度的最高吞吐争抢）
+    ( 1, (0.0001, 0.0), (0.0001, 0.0) ),
+    (31, (0.0001, 0.00001), (0.0001, 0.00001) ),
+
+    # 场景 2：极端背压（生产狂飙，几十个消费全部慢动作或随机长卡顿）
+    ( 5, (0.00001, 0.0), (0.005, 0.015) ),
+
+    # 场景 3：饥饿缺水（消费瞬间秒空，生产动辄几十毫秒便秘抖动）
+    ( 8, (0.01, 0.03), (0.00001, 0.0) ),
+    
+    # 场景 4：天地大冲撞（两者均产生极大抖动，GC指针如过山车）
+    (20, (0.002, 0.01), (0.002, 0.01) ),
+])
+def test_fs_stochastic_stress(empty_buffer, cons_num, prod_params, cons_params):
+    """Stress test with stochastic processing times utilizing __spin_delay."""
+    server = FrameServer(create=True, ring_buffer=empty_buffer)
+    cids = [server.register_consumer() for _ in range(cons_num)]
+    tx_stop_event = mp.Event()
+    rx_stop_event = mp.Event()
+    
+    tx_queue = ctx.Queue()
+    producer = ctx.Process(
+        target=__unified_producer_worker, 
+        args=(empty_buffer, tx_stop_event, 5, tx_queue, prod_params[0], prod_params[1])
+    )
+    producer.start()
+    
+    rx_queues = [ctx.Queue() for _ in range(cons_num)]
+    workers = [
+        ctx.Process(
+            target=__unified_consumer_worker, 
+            args=(server, cid, rx_stop_event, 1, q, cons_params[0], cons_params[1])
+        ) for cid, q in zip(cids, rx_queues)
+    ]
+    
+    for w in workers: w.start()
+    
+    time.sleep(5.0) # Run the simulation for 3.5 seconds
+    tx_stop_event.set()
+    time.sleep(1.0)
+    rx_stop_event.set()
+    
+    produced_frames = tx_queue.get()
+    print(f"Produced {produced_frames} frames.")
+    producer.join(timeout=2.0)
+    
+    for cid, q in zip(cids, rx_queues):
+        res = q.get()
+        if isinstance(res, Exception): raise res
+        res.sort(key=lambda x: x[0])
+        head_ids = [x[0] for x in res]
+        print(f"CID {cid} received {len(head_ids)} frames.")
+        expected_ids = list(range(produced_frames))
+        if head_ids != expected_ids:
+            print(f"Sequence gap on distinct CID {cid}. Expected up to id {produced_frames -1}, got max {head_ids[-1] if head_ids else 'None'}.")
+        assert head_ids == expected_ids
+    for w in workers: w.join(timeout=4.0)
+    
+    for cid in cids: server.unregister_consumer(cid)
     server.close()
     server.unlink()
