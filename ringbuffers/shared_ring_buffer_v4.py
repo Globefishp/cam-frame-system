@@ -252,7 +252,7 @@ class ProcessSafeSharedRingBuffer:
         self._metadata_ctypes = Metadata.from_buffer(self._metadata_shm.buf)
 
         # Read all metadata using _get_metadata
-        capacity, frame_shape, frame_dtype, read_ptr, write_ptr, occupied_count = self._get_metadata()
+        capacity, frame_shape, frame_dtype, all_is_unread, read_ptr, write_ptr, occupied_count = self._get_metadata()
 
         # Set instance attributes based on read metadata
         self._buffer_capacity = capacity
@@ -267,12 +267,9 @@ class ProcessSafeSharedRingBuffer:
 
 
         # 4. Verify Data Buffer Size
-        if self._data_shm.size != self._data_buffer_size:
-            import warnings
-            warnings.warn(f"Attached data buffer size ({self._data_shm.size}) mismatches "
-                            f"calculated size based on metadata ({self._data_buffer_size}). \n"
-                            f"This might be due to system-specific shared memory allocation "
-                            f"behavior. Will use calculated size.")
+        if self._data_shm.size < self._data_buffer_size:
+            raise RuntimeError(f"Attached data buffer size ({self._data_shm.size}) "
+                f"is smaller than calculated size based on metadata ({self._data_buffer_size}).")
         # Multiprocessing synchronization objects are not touched here.
 
     def __getstate__(self) -> dict:
@@ -323,6 +320,7 @@ class ProcessSafeSharedRingBuffer:
         self._metadata_ctypes.frame_c = self._frame_shape[2]
         self._metadata_ctypes.dtype_kind = ord(self._dtype.kind) # Store character code (should be V)
         self._metadata_ctypes.dtype_bits = self._dtype.itemsize * 8 # Store bits
+        self._metadata_ctypes.all_is_unread = 0
         self._metadata_ctypes.read_ptr = 0
         self._metadata_ctypes.write_ptr = 0
         self._metadata_ctypes.occupied_count = 0
@@ -344,6 +342,7 @@ class ProcessSafeSharedRingBuffer:
         frame_c =            self._metadata_ctypes.frame_c
         dtype_kind =         self._metadata_ctypes.dtype_kind  # 后续需要转换为字符（如 'u'）
         dtype_bits =         self._metadata_ctypes.dtype_bits
+        all_is_unread =      self._metadata_ctypes.all_is_unread
         read_ptr =           self._metadata_ctypes.read_ptr
         write_ptr =          self._metadata_ctypes.write_ptr
         count =              self._metadata_ctypes.occupied_count
@@ -354,22 +353,23 @@ class ProcessSafeSharedRingBuffer:
         read_dtype_kind = chr(dtype_kind)
         frame_dtype = np.dtype(f'{read_dtype_kind}{dtype_bits // 8}')
 
-        return capacity, (frame_h, frame_w, frame_c), frame_dtype, read_ptr, write_ptr, count
+        return capacity, (frame_h, frame_w, frame_c), frame_dtype, all_is_unread, read_ptr, write_ptr, count
 
-    def _get_pointers_metadata(self) -> Tuple[int, int, int]:
+    def _get_pointers_metadata(self) -> Tuple[int, int, int, int]:
         """
         Reads pointer-related metadata (read_ptr, write_ptr, occupied_count)
         from the metadata shared memory. Assumes pointer_lock is held and 
         metadata_ctypes is not None.
         """
 
+        all_is_unread =      self._metadata_ctypes.all_is_unread
         read_ptr =           self._metadata_ctypes.read_ptr
         write_ptr =          self._metadata_ctypes.write_ptr
         occupied_count =     self._metadata_ctypes.occupied_count
 
-        return read_ptr, write_ptr, occupied_count
+        return all_is_unread, read_ptr, write_ptr, occupied_count
 
-    def _set_pointers_metadata(self, read_ptr: int, write_ptr: int, occupied_count: int):
+    def _set_pointers_metadata(self, all_is_unread: int, read_ptr: int, write_ptr: int, occupied_count: int):
         """
         Writes pointer-related metadata (read_ptr, write_ptr, occupied_count)
         to the metadata shared memory. Assumes pointer_lock is held and 
@@ -377,8 +377,9 @@ class ProcessSafeSharedRingBuffer:
         """
 
         # Access metadata ctypes directly
-        self._metadata_ctypes.read_ptr = read_ptr
-        self._metadata_ctypes.write_ptr = write_ptr
+        self._metadata_ctypes.all_is_unread  = all_is_unread
+        self._metadata_ctypes.read_ptr       = read_ptr
+        self._metadata_ctypes.write_ptr      = write_ptr
         self._metadata_ctypes.occupied_count = occupied_count
 
 
@@ -423,7 +424,7 @@ class ProcessSafeSharedRingBuffer:
             ):
                 return False # Timeout
             # Re-read mutable metadata after waiting
-            read_ptr, write_ptr, occupied_count = self._get_pointers_metadata()
+            all_is_unread, read_ptr, write_ptr, occupied_count = self._get_pointers_metadata()
 
         # RELEASE Lock when data is copying
         data_buffer = self._data_ndarr
@@ -462,11 +463,12 @@ class ProcessSafeSharedRingBuffer:
 
         with self._pointer_lock: # Acquire lock after data copy
             # Read mutable metadata again, in case `read_ptr` has changed
-            read_ptr, write_ptr, occupied_count = self._get_pointers_metadata()
+            all_is_unread, read_ptr, write_ptr, occupied_count = self._get_pointers_metadata()
             # Update metadata
             new_write_ptr = (write_ptr + put_frame_num) % self._buffer_capacity
             new_count = occupied_count + put_frame_num
-            self._set_pointers_metadata(read_ptr, new_write_ptr, new_count) # Use read_ptr obtained under the same lock
+            new_all_is_unread = 1 if new_write_ptr == read_ptr else 0 # chase the read_ptr.
+            self._set_pointers_metadata(new_all_is_unread, read_ptr, new_write_ptr, new_count) # Use read_ptr obtained under the same lock
 
             # print(f'At put tail: read_ptr: {read_ptr}, write_ptr: {new_write_ptr}, \
             #       occupied_count: {new_count}, next_release_count: {next_release_count}')
@@ -504,7 +506,7 @@ class ProcessSafeSharedRingBuffer:
             ):
                 return None # wait_for() returns False if timeout
             # Read mutable metadata after waiting
-            read_ptr, write_ptr, occupied_count = self._get_pointers_metadata()
+            all_is_unread, read_ptr, write_ptr, occupied_count = self._get_pointers_metadata()
 
         # A view of data buffer hard-coded to byte(uint8)
         data_buffer = self._data_ndarr
@@ -538,9 +540,10 @@ class ProcessSafeSharedRingBuffer:
 
         with self._pointer_lock: # Acquire lock after data read
             # Move read_ptr
-            read_ptr, write_ptr, occupied_count = self._get_pointers_metadata()
+            all_is_unread, read_ptr, write_ptr, occupied_count = self._get_pointers_metadata()
             new_read_ptr = (read_ptr + get_frame_num) % self._buffer_capacity
-            self._set_pointers_metadata(new_read_ptr, write_ptr, occupied_count)
+            new_all_is_unread = 0 if get_frame_num > 0 else all_is_unread
+            self._set_pointers_metadata(new_all_is_unread, new_read_ptr, write_ptr, occupied_count)
         ticket = BufferTicket(read_ptr, get_frame_num)
 
         return frames_list, ticket # Successfully got frame
@@ -549,7 +552,9 @@ class ProcessSafeSharedRingBuffer:
     def release(self, release_num: int, /) -> int:
         """
         Manually release the oldest `release_num` frames by marking them ready 
-        to be overwritten.
+        to be overwritten. Unread frames can also be released, in which case the
+        next `get()` call will read from the first valid frame. So release with
+        care.
         
         Args:
             release_num (int): The number of frames intended to release.
@@ -585,21 +590,22 @@ class ProcessSafeSharedRingBuffer:
     def release(self, obj: Union[int, BufferTicket], /) -> int:
         if isinstance(obj, BufferTicket):
             release_num = obj.read_num
-        elif isinstance(obj, int):
+        else: # Assume int or np.integer
             release_num = obj
-        else:
-            raise TypeError(f"Arg1 {type(obj)} must be `BufferTicket` or `int`.")
 
         if release_num <= 0:
             return 0
             
         with self._pointer_lock: # Acquire lock for metadata access and synchronization
-            read_ptr, write_ptr, occupied_count = self._get_pointers_metadata()
+            all_is_unread, read_ptr, write_ptr, occupied_count = self._get_pointers_metadata()
             actual_release = min(release_num, occupied_count)
             
             # Reduce occupied count
             new_occupied_count = occupied_count - actual_release 
-            self._set_pointers_metadata(read_ptr, write_ptr, new_occupied_count)
+            # Move read_ptr forward if some unread data released.
+            new_read_ptr = (read_ptr + max(0, self._unread_count() - new_occupied_count)) % self._buffer_capacity
+            # acutal_release == 0 -> occupied_count == 0, buffer is null, otherwise, any release will make some space.
+            self._set_pointers_metadata(0, new_read_ptr, write_ptr, new_occupied_count)
             
             if actual_release > 0:
                 # Notify all for exported condition (by public property)
@@ -652,10 +658,10 @@ class ProcessSafeSharedRingBuffer:
     def read_from(self, arg1: Union[int, BufferTicket], arg2: Optional[int] = None) -> List[np.ndarray]:
         if isinstance(arg1, BufferTicket):
             index, length = arg1.read_ptr, arg1.read_num
-        elif isinstance(arg1, int) and isinstance(arg2, int):
+        elif arg2 is not None: # Assume arg1 is int or np.integer, check arg2.
             index, length = arg1, arg2
         else:
-            raise TypeError("Invalid argument type.")
+            raise TypeError("Invalid argument composition.")
 
         if index < 0 or index >= self._buffer_capacity:
             raise ValueError(f"Invalid physical pointer: {index}")
@@ -708,12 +714,22 @@ class ProcessSafeSharedRingBuffer:
         return self._frame_shape
 
     @property
+    def all_is_unread(self) -> bool:
+        """Get whether all the data in buffer is unread."""
+        with self._pointer_lock:
+            return bool(self._metadata_ctypes.all_is_unread)
+    @property
+    def all_is_unread_(self) -> ctypes.c_int16:
+        """Get whether all the data in buffer is unread, dirty read without lock."""
+        return self._metadata_ctypes.all_is_unread
+
+    @property
     def read_ptr(self) -> int:
         """The read pointer of the buffer"""
         with self._pointer_lock:
             return self._metadata_ctypes.read_ptr
     @property
-    def read_ptr_(self) -> int:
+    def read_ptr_(self) -> ctypes.c_int64:
         """The read pointer of the buffer, dirty read without lock. Safe in 64bit system"""
         # Due to TOCTOU, for single int64, acquire lock here is meaningless.
         return self._metadata_ctypes.read_ptr
@@ -724,7 +740,7 @@ class ProcessSafeSharedRingBuffer:
         with self._pointer_lock:
             return self._metadata_ctypes.write_ptr
     @property
-    def write_ptr_(self) -> int:
+    def write_ptr_(self) -> ctypes.c_int64:
         """Returns the write pointer of the buffer, dirty read without lock. Safe in 64bit system"""
         return self._metadata_ctypes.write_ptr
 
@@ -761,6 +777,16 @@ class ProcessSafeSharedRingBuffer:
         due to memory barrier. Only safe in 64 bit system.
         """
         return self._metadata_ctypes.occupied_count
+    
+    @property
+    def is_full(self) -> bool:
+        """Get whether the buffer is full"""
+        with self._pointer_lock:
+            return self._metadata_ctypes.occupied_count == self._buffer_capacity
+    @property
+    def is_full_(self) -> bool:
+        """Get whether the buffer is full, dirty read without lock."""
+        return self._metadata_ctypes.occupied_count == self._buffer_capacity
 
     def unread_count(self, timeout = None) -> int:
         """
@@ -789,12 +815,12 @@ class ProcessSafeSharedRingBuffer:
         Returns the number of unread items in the buffer without lock, 
         must acquire lock before calling. Internal use only.
         """
-        read_ptr, write_ptr, occupied_count = self._get_pointers_metadata()
+        all_is_unread, read_ptr, write_ptr, occupied_count = self._get_pointers_metadata()
         # The number of frames available for the *next* get call
         count = (write_ptr - read_ptr) % self._buffer_capacity 
-        if count == 0 and occupied_count > 0:
+        if (not count) & all_is_unread: # Equals to `(count==0) and (occupied_count>0)`
             # Corner case: write_ptr chase read_ptr, all frames in buffer is unread.
-            count = occupied_count
+            count = self._buffer_capacity
         return count
 
     # Expose synchronization objects for passing to worker process

@@ -1,14 +1,15 @@
 # ringbuffers/shared_ring_buffer_v4_types.py
 
 from dataclasses import dataclass
+import numpy as np
 import ctypes
 
 @dataclass(frozen=True, slots=True) 
 # Immutable is important for the data integrity. Ring buffer can skip data validation.
 # Produced by ring buffer, used by ring buffer.
 class BufferTicket:
-    read_ptr: int  # The absolute position for the ring buffer API to get data from.
-    read_num: int  # The data slots to read start from read_ptr.
+    read_ptr: np.int64  # The absolute position for the ring buffer API to get data from.
+    read_num: int       # The data slots to read start from read_ptr.
 
 
 # Define the metadata structure size
@@ -26,6 +27,7 @@ class Metadata(ctypes.Structure):
     frame_c: int
     dtype_kind: int
     dtype_bits: int
+    all_is_unread: int
     read_ptr: int
     write_ptr: int
     occupied_count: int
@@ -34,9 +36,10 @@ class Metadata(ctypes.Structure):
         ("capacity", ctypes.c_int64),
         ("frame_h", ctypes.c_int32),
         ("frame_w", ctypes.c_int32),
-        ("frame_c", ctypes.c_int32),
+        ("frame_c", ctypes.c_int16),
         ("dtype_kind", ctypes.c_int16),
-        ("dtype_bits", ctypes.c_int16), # 8 bytes aligned
+        ("dtype_bits", ctypes.c_int16),
+        ("all_is_unread", ctypes.c_int16), # 8 bytes aligned
         ("read_ptr", ctypes.c_int64),
         ("write_ptr", ctypes.c_int64),
         ("occupied_count", ctypes.c_int64),
