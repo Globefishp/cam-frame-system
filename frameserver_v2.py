@@ -1,10 +1,14 @@
 # frameserver_v2.py
 # Scratch by Google Gemini 3.1 Pro, reviewed & cleaned up by Haiyun Huang (260421)
 
+# Concurrent code must be modified with extreme care, make sure you have considered 
+#   most concurrent cases and race conditions (HW out-of-order load/store etc.)
+
 # Require 64bit system to safely read int64 atomically.
-# gc_lock is a small grain lock, if lock nesting is needed, gc_lock must be acquired 
+# gc_lock is a fine-grained lock, if lock nesting is needed, gc_lock must be acquired 
 #   AFTER holding cid_lock/reg_lock to prevent ABBA dead lock.
 
+from typing import overload
 import time
 import ctypes
 import errno
@@ -28,22 +32,27 @@ class FrameServer:
     Limitation: can only be passed to subprocesses when creating them. 
     (Common limitation for mp objects, standard picklization won't work)
     """
-    def __init__(self, ring_buffer: ProcessSafeSharedRingBuffer, 
-                 create: bool = True, frameserver: 'FrameServer' = None, 
+
+    def __init__(self, create: bool = True, *,
+                 ring_buffer: Optional[ProcessSafeSharedRingBuffer] = None, 
+                 frameserver: Optional['FrameServer'] = None, 
                  inject_logger: Optional[Logger] = None):
         """
         Args:
-            ring_buffer (ProcessSafeSharedRingBuffer): The ring buffer instance to use. 
-                Once injected, it should be exclusively read by this FrameServer instance.
-                Or internal status will be corrupted.
             create (bool): If True, create a new FrameServer. 
-            frameserver (FrameServer): The FrameServer instance to link.
+            ring_buffer (Optional[ProcessSafeSharedRingBuffer]): The ring buffer 
+                instance to use. Once injected, it should be exclusively read by 
+                this FrameServer instance, or internal status will be corrupted. 
+                Must be provided when `create=True`. If provided when `create=False`,
+                You are linking the the flow control for different buffers. # TODO: 新想法, 有什么用?
+            frameserver (Optional[FrameServer]): The FrameServer instance to link.
+                Must be provided when `create=False`.
             inject_logger (Optional[Logger]): The loguru logger to use for logging, 
                            requires `enqueue=True`. If None, logging is disabled.
         
         Raises:
             TypeError: If inject_logger is not a loguru.Logger instance.
-            ValueError: If create=False and shm_name is None.
+            ValueError: If create=True, but ring_buffer is not provided correctly, or
             FileNotFoundError: If create=False and shm_name is not found.
             OSError: If the shared memory segment for metadata cannot be created or attached to.
             RuntimeError: If the shared memory segment for metadata is not a valid metadata 
@@ -58,10 +67,10 @@ class FrameServer:
             self._logger = None
         logger = self._logger
 
-        self.buffer = ring_buffer
-        self._reg_lock = mp.Lock()
+        self.buffer: Optional[ProcessSafeSharedRingBuffer] = ring_buffer
+        self._reg_lock: mp.Lock        =  mp.Lock()
         self._cid_locks: List[mp.Lock] = [mp.Lock() for _ in range(MAX_CONSUMERS)]
-        self._gc_lock = mp.Lock() # gc lock is for blocking GC during get_async_copy()
+        self._gc_lock: mp.Lock         =  mp.Lock() # gc lock is for blocking GC during get_async_copy()
 
         self._metadata: Optional[FSMetadata] = None
         self._enable_mask: Optional[NDArray] = None
@@ -71,6 +80,9 @@ class FrameServer:
         
         meta_size = ctypes.sizeof(FSMetadata)
         if create:
+            if not isinstance(self.buffer, ProcessSafeSharedRingBuffer):
+                raise ValueError("`ring_buffer` must be provided as a instance of "
+                                 "`ProcessSafeSharedRingBuffer` when create=True.")
             try:
                 self._shm = mp_shm.SharedMemory(create=True, size=meta_size)
                 self._init_metadata()
@@ -83,12 +95,16 @@ class FrameServer:
                 self.close()
                 raise RuntimeError(f"Unexpected error when creating FrameServer.") from e
 
-            logger.success(f"FrameServer created with ShM name: {self._shm.name}, size: {meta_size} bytes")
+            if logger: logger.success(f"FrameServer created with ShM name: {self._shm.name}, size: {meta_size} bytes")
         else: # link to exist mp FrameServer instance by name.
-            if frameserver is None:
-                raise ValueError("`frameserver` must be provided when create=False.")
+            if not isinstance(frameserver, FrameServer):
+                raise ValueError("`frameserver` must be provided as a instance of "
+                                 "`FrameServer` when create=False.")
             try:
                 # Link to syncronization objects
+                if not isinstance(self.buffer, ProcessSafeSharedRingBuffer):
+                    # Link to buffer inside provided FrameServer
+                    self.buffer = frameserver.buffer
                 self._reg_lock = frameserver.reg_lock
                 self._cid_locks = frameserver.cid_locks
                 self._gc_lock = frameserver.gc_lock
@@ -112,7 +128,7 @@ class FrameServer:
                 self.close()
                 raise RuntimeError(f"ShM name: {frameserver.shm_name} is not a valid metadata memory block for this FrameServer."
                     f"Expected: {_METADATA_VER_HASH}, received: {self._metadata.fs_protocol_ver}")
-            logger.success(f"Attached to FrameServer with ShM name: {self._shm.name}")
+            if logger: logger.success(f"Attached to FrameServer with ShM name: {self._shm.name}")
 
     @property
     def shm_name(self) -> str:
@@ -147,7 +163,7 @@ class FrameServer:
         self._metadata.fs_oldest_frame_id = 0
         self._metadata.rb_offset = self.buffer.read_ptr
         self._enable_mask.fill(0)
-        self._next_frame_ids.fill(0)
+        self._next_frame_ids.fill(_INT64_MAX)
         self._tickets_arr.fill(_INT64_MAX)
 
     def _link_np_view(self):
@@ -184,8 +200,8 @@ class FrameServer:
             self._tickets_arr[cid, :] = _INT64_MAX # Use _INT64_MAX to mark unused tickets.
             self._enable_mask[cid] = True # set flag at the end does NOT provide any order guarantee as it is shared memory.
         
-        logger.info(f"Consumer {cid} registered.")
-        return cid
+        if logger: logger.info(f"Consumer {cid} registered.")
+        return int(cid)
 
     def unregister_consumer(self, cid: int):
         """
@@ -208,9 +224,9 @@ class FrameServer:
                     self._next_frame_ids[cid] = _INT64_MAX
                     self._tickets_arr[cid, :] = _INT64_MAX
 
-                    logger.info(f"Consumer {cid} unregistered.")
+                    if logger: logger.info(f"Consumer {cid} unregistered.")
                 else:
-                    logger.debug(f"Consumer {cid} is already unregistered.")
+                    if logger: logger.debug(f"Consumer {cid} is already unregistered.")
 
         self._gc()
 
@@ -259,7 +275,7 @@ class FrameServer:
                         self._tickets_arr[cid, available_ticket_slot] = next_frame_id
                         self._next_frame_ids[cid] = next_frame_id + size
                     
-                        return FrameTicket(head_id=next_frame_id, size=size)
+                        return FrameTicket(head_id=int(next_frame_id), size=size)
                 else:
                     insufficient_tickets = True
 
@@ -297,14 +313,14 @@ class FrameServer:
         """
         if ticket.head_id < self._metadata.fs_oldest_frame_id:
             raise TicketExpireException(ticket, self._metadata.fs_oldest_frame_id)
-            
+        
         relative_ptr = (ticket.head_id + self._metadata.rb_offset) % self.buffer.buffer_capacity
         return self.buffer.read_from(relative_ptr, ticket.size)
 
     def release_sync(self, cid: int, ticket: FrameTicket):
         """
         Release a ticket for a named consumer. Currently will also trigger GC.
-        It's safe if a ticket is already released.
+        Do nothing if a ticket is already released or consumer is unregistered.
 
         Args:
             cid (int): consumer id.
@@ -336,7 +352,7 @@ class FrameServer:
         logger = self._logger
         if self._metadata is None or self._enable_mask is None or self._next_frame_ids is None or self._tickets_arr is None:
             # May run in daemon thread, raise is not suitable here.
-            logger.warning("GC is called when metadata not fully initialized. Release nothing.")
+            if logger: logger.warning("GC is called when metadata not fully initialized. Release nothing.")
             return 0
 
         # Find the lagging most frame id (occupied for tickets, need to be preserved for next_frame_ids).
@@ -348,7 +364,7 @@ class FrameServer:
         # === Critical zone (protect fs_oldest_frame_id, no concurrent _gc()) ===
         if not self._gc_lock.acquire(block=False):
             return 0 # Let next gc to do works.
-        
+
         # Has consumers, and has something to release.
         try:
             if global_occupied_from_id != _INT64_MAX and global_occupied_from_id > self._metadata.fs_oldest_frame_id:

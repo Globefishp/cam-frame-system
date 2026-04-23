@@ -11,8 +11,8 @@ class FrameTicket:
     """
     FrameTicket is issued by FrameServer and use absolute index to identify frame batches.
     """
-    head_id: int    # The global index maintained by FrameServer
-    size: int       # The continuous frames to get started from head_id.
+    head_id: np.int64  # The global index maintained by FrameServer
+    size: int          # The continuous frames to get started from head_id.
 
 class TicketExpireException(Exception):
     """Ticket is expired."""
