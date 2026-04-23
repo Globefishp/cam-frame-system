@@ -44,7 +44,8 @@ class FrameServer:
                 instance to use. Once injected, it should be exclusively read by 
                 this FrameServer instance, or internal status will be corrupted. 
                 Must be provided when `create=True`. If provided when `create=False`,
-                You are linking the the flow control for different buffers. # TODO: 新想法, 有什么用?
+                You are linking the the flow control for different buffers. 
+                # TODO: 新想法, 有什么用? 当前的GC逻辑不适用! 只能释放一个buffer的.
             frameserver (Optional[FrameServer]): The FrameServer instance to link.
                 Must be provided when `create=False`.
             inject_logger (Optional[Logger]): The loguru logger to use for logging, 
@@ -105,6 +106,10 @@ class FrameServer:
                 if not isinstance(self.buffer, ProcessSafeSharedRingBuffer):
                     # Link to buffer inside provided FrameServer
                     self.buffer = frameserver.buffer
+                else:
+                    # Link to another buffer but use the same flow control with master server,
+                    # should disable `_gc()`
+                    pass 
                 self._reg_lock = frameserver.reg_lock
                 self._cid_locks = frameserver.cid_locks
                 self._gc_lock = frameserver.gc_lock
@@ -441,3 +446,15 @@ class FrameServer:
                 raise RuntimeError(f"Unexpected error in unlinking metadata shared memory segment '{self._shm.name}'") from e
             finally:
                 self._shm = None # Ensure reference is cleared
+
+    def __del__(self):
+        if hasattr(self, '_metadata'):
+            del self._metadata
+        if hasattr(self, '_enable_mask'):
+            del self._enable_mask
+        if hasattr(self, '_next_frame_ids'):
+            del self._next_frame_ids
+        if hasattr(self, '_tickets_arr'):
+            del self._tickets_arr
+        if hasattr(self, '_gc_view'):
+            del self._gc_view

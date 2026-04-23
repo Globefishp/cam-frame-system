@@ -935,6 +935,12 @@ class ProcessSafeSharedRingBuffer:
             # Note: Synchronization objects are not unlinked here,
             # they are managed by the creator process.
 
+    def __del__(self):
+        if hasattr(self, "_metadata_ctypes"):
+            del self._metadata_ctypes
+        if hasattr(self, "_data_ndarr"):
+            del self._data_ndarr
+
 
 # ------------- Example Usage -------------
 BUFFER_CAPACITY = 5
