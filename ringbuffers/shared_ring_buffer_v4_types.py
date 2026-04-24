@@ -27,7 +27,7 @@ class Metadata(ctypes.Structure):
     frame_c: int
     dtype_kind: int
     dtype_bits: int
-    all_is_unread: int
+    unread_full: int
     read_ptr: int
     write_ptr: int
     occupied_count: int
@@ -39,7 +39,7 @@ class Metadata(ctypes.Structure):
         ("frame_c", ctypes.c_int16),
         ("dtype_kind", ctypes.c_int16),
         ("dtype_bits", ctypes.c_int16),
-        ("all_is_unread", ctypes.c_int16), # 8 bytes aligned
+        ("unread_full", ctypes.c_int16), # 8 bytes aligned
         ("read_ptr", ctypes.c_int64),
         ("write_ptr", ctypes.c_int64),
         ("occupied_count", ctypes.c_int64),
