@@ -42,7 +42,7 @@ def small_buffer():
     try: rb.unlink()
     except Exception: pass
 
-def __basic_use_consumer(server_master, use_linked_fs, result_queue):
+def __basic_use_consumer(server_master: FrameServer, use_linked_fs, result_queue):
     try:
         if use_linked_fs:
             server = FrameServer(create=False, frameserver=server_master)

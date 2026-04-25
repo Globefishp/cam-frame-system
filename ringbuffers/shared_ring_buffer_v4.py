@@ -47,7 +47,7 @@ import warnings
 import errno
 import numpy as np
 from numpy.typing import NDArray
-from typing import Tuple, Any, Optional, Union, List, Callable, overload # Import overload
+from typing import Tuple, Any, Optional, Union, List, Callable, overload, Literal # Import overload
 
 import multiprocessing as mp
 import multiprocessing.shared_memory as mp_shm
@@ -72,14 +72,14 @@ class ProcessSafeSharedRingBuffer:
 
     @overload
     def __init__(self,
-                 create: bool,
+                 create: Literal[True] = ..., *,
                  buffer_capacity: int,
                  frame_shape: Tuple[int, int, int],
                  dtype: np.dtype = np.uint8,
                  source_buffer: None = None,
                  inject_logger: Optional[Logger] = None):
         """
-        Initialize or attach to the shared ring buffer.
+        Initialize a new shared ring buffer.
 
         Args:
             create: (bool), True, create the shared memory blocks and initialize metadata.
@@ -88,19 +88,23 @@ class ProcessSafeSharedRingBuffer:
             dtype: (np.dtype), data type of the frames. Defaults to np.uint8.
             inject_logger: (Optional[Logger]), loguru logger to use for logging, 
                            requires `enqueue=True`. If None, logging is disabled.
+
+        Raises:
+            ValueError: If `buffer_capacity` or `frame_shape` is not provided.
+            RuntimeError: If error occurs during shared memory creation.
         """
         ... 
 
     @overload
     def __init__(self,
-                 create: bool,
+                 create: Literal[False], *,
                  buffer_capacity: None = None,
                  frame_shape: None = None,
                  dtype: None = None,
                  source_buffer: 'ProcessSafeSharedRingBuffer' = None,
                  inject_logger: Optional[Logger] = None):
         """
-        Initialize or attach to the shared ring buffer.
+        Attach to a shared ring buffer.
 
         Args:
             create: (bool), False, attach to existing shared memory segments using source_buffer.
@@ -108,41 +112,23 @@ class ProcessSafeSharedRingBuffer:
                            in the main process, used for attaching in worker processes.
             inject_logger: (Optional[Logger]), loguru logger to use for logging, 
                            requires `enqueue=True`. If None, logging is disabled.
+
+        Raises:
+            ValueError: If `source_buffer` is not provided.
+            ValueError: If `source_buffer` shared memory names are not available.
+            RuntimeError: If `source_buffer` have smaller data buffer than the metadata 
+                specified, or any other error occurs during shared memory attachment.
+            FileNotFoundError: If shared memory segment not found during attachment.
         """
         ... 
 
     def __init__(self,
-                 create: bool,
+                 create: bool = True, *,
                  buffer_capacity: Optional[int] = None,
                  frame_shape: Optional[Tuple[int, int, int]] = None,
                  dtype: np.dtype = np.uint8, # Keep default for convenience, but logic handles None
                  source_buffer: Optional['ProcessSafeSharedRingBuffer'] = None,
                  inject_logger: Optional[Logger] = None):
-        """
-        Initialize or attach to the shared ring buffer.
-
-        Args:
-            create: (bool), if True, create the shared memory blocks and initialize metadata.
-                    If False, attach to existing shared memory segments using source_buffer.
-            buffer_capacity: (Optional[int]), the maximum number of frames the buffer can hold.
-                             Required when create is True.
-            frame_shape: (Optional[Tuple[int, int, int]]), expected frame size (height, width, channel).
-                         Required when create is True.
-            dtype: (np.dtype), data type of the frames. Defaults to np.uint8.
-                   Used when create is True.
-            source_buffer: (Optional[ProcessSafeSharedRingBuffer]), the buffer instance created
-                           in the main process, used for attaching in worker processes.
-                           Required when create is False.
-            inject_logger: (Optional[Logger]), loguru logger to use for logging, 
-                           requires `enqueue=True`. If None, logging is disabled.
-
-        Raises:
-            ValueError: If `buffer_capacity` or `frame_shape` is not provided when `create` is True.
-            ValueError: If `source_buffer` is not provided when `create` is False.
-            ValueError: If `source_buffer` shared memory names are not available.
-            RuntimeError: If error occurs during shared memory creation or attachment.
-            FileNotFoundError: If shared memory segment not found during attachment.
-        """
         if inject_logger is not None:
             if isinstance(inject_logger, Logger):
                 self._logger = inject_logger.bind(friendly_name="RingBuffer")

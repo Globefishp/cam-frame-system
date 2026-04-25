@@ -8,7 +8,7 @@
 # gc_lock is a fine-grained lock, if lock nesting is needed, gc_lock must be acquired 
 #   AFTER holding cid_lock/reg_lock to prevent ABBA dead lock.
 
-from typing import overload
+from typing import overload, Literal
 import time
 import ctypes
 import errno
@@ -32,33 +32,63 @@ class FrameServer:
     Limitation: can only be passed to subprocesses when creating them. 
     (Common limitation for mp objects, standard picklization won't work)
     """
+    @overload
+    def __init__(self, 
+                 create: Literal[True] = ..., *,
+                 ring_buffer: ProcessSafeSharedRingBuffer, 
+                 frameserver: None = None, 
+                 inject_logger: Optional[Logger] = None):
+        """
+        Create a new FrameServer to manage flow control for the given ring buffer.
+
+        Args:
+            create (Literal[True]): Must be True for creation mode.
+            ring_buffer (ProcessSafeSharedRingBuffer): The target ring buffer to manage.
+                It should be exclusively read by this FrameServer instance, or 
+                internal status will be corrupted. 
+            frameserver (None): Unused when `create=True`.
+            inject_logger (Optional[Logger]): Loguru logger instance.
+
+        Raises:
+            TypeError: If `inject_logger` is not a loguru.Logger instance.
+            ValueError: If `ring_buffer` is not provided correctly.
+            OSError: If the shared memory segment for metadata cannot be created.
+            RuntimeError: If any unexpected error occurs.
+        """
+        ...
+
+    @overload
+    def __init__(self, 
+                 create: Literal[False], *,
+                 ring_buffer: None = None, 
+                 frameserver: 'FrameServer', 
+                 inject_logger: Optional[Logger] = None):
+        """
+        Attach to an existing FrameServer forking its internal resources.
+
+        Usually this attachment is not needed. Directly using the frameserver copy 
+        inherited from parent process is recommended.
+
+        Args:
+            create (Literal[False]): Must be False for attach mode.
+            ring_buffer (None): Leave None to inherit the buffer from the source `frameserver`.
+            frameserver (FrameServer): The source FrameServer instance to attach to.
+            inject_logger (Optional[Logger]): Loguru logger instance.
+
+        Raises:
+            TypeError: If `inject_logger` is not a loguru.Logger instance.
+            ValueError: If `frameserver` is not provided correctly.
+            FileNotFoundError: If the shared memory segment of the parent `frameserver` cannot be found.
+            OSError: If the shared memory segment for metadata cannot be attached to.
+            RuntimeError: If the shared memory segment for metadata is not a valid metadata 
+                memory block for this FrameServer, or unexpected error occurs.
+        """
+        ...
 
     def __init__(self, create: bool = True, *,
                  ring_buffer: Optional[ProcessSafeSharedRingBuffer] = None, 
                  frameserver: Optional['FrameServer'] = None, 
                  inject_logger: Optional[Logger] = None):
-        """
-        Args:
-            create (bool): If True, create a new FrameServer. 
-            ring_buffer (Optional[ProcessSafeSharedRingBuffer]): The ring buffer 
-                instance to use. Once injected, it should be exclusively read by 
-                this FrameServer instance, or internal status will be corrupted. 
-                Must be provided when `create=True`. If provided when `create=False`,
-                You are linking the the flow control for different buffers. 
-                # TODO: 新想法, 有什么用? 当前的GC逻辑不适用! 只能释放一个buffer的.
-            frameserver (Optional[FrameServer]): The FrameServer instance to link.
-                Must be provided when `create=False`.
-            inject_logger (Optional[Logger]): The loguru logger to use for logging, 
-                           requires `enqueue=True`. If None, logging is disabled.
-        
-        Raises:
-            TypeError: If inject_logger is not a loguru.Logger instance.
-            ValueError: If create=True, but ring_buffer is not provided correctly, or
-            FileNotFoundError: If create=False and shm_name is not found.
-            OSError: If the shared memory segment for metadata cannot be created or attached to.
-            RuntimeError: If the shared memory segment for metadata is not a valid metadata 
-                memory block for this FrameServer, or unexpected error occurs.
-        """
         if inject_logger is not None:
             if isinstance(inject_logger, Logger):
                 self._logger = inject_logger.bind(friendly_name="FrameServer")
