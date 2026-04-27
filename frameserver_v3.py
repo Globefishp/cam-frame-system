@@ -1,5 +1,5 @@
-# frameserver_v2.py
-# Scratch by Google Gemini 3.1 Pro, reviewed & cleaned up by Haiyun Huang (260421)
+# frameserver_v3.py
+# Scratch by Google Gemini 3.1 Pro, reviewed & cleaned up by Haiyun Huang (260425)
 
 # Concurrent code must be modified with extreme care, make sure you have considered 
 #   most concurrent cases and race conditions (HW out-of-order load/store etc.)
@@ -37,9 +37,9 @@ class FrameServer:
 
     Get ticket from any fs 
     -> get data views from streams in needed
-    -> release from all (or any, see below) streams.
+    -> release from all (or any, in lazy GC mode, see below) streams.
 
-    Note: Once released on any stream, the data views of **ALL** streams are not 
+    Note: Once released on ANY stream, the data views of **ALL** streams are not 
     guaranteed to be integral. Release only after all data views are not used 
     anymore. 
 
@@ -112,7 +112,9 @@ class FrameServer:
                  frameserver: 'FrameServer', 
                  inject_logger: Optional[Logger] = None):
         """
-        Attach a new buffer to an existing FrameServer's unified ticket space.
+        Attach a new buffer to an existing FrameServer's unified ticket space to
+        create a new stream. This stream will start reading data from the `read_ptr`
+        when attaching. 
 
         Args:
             create (Literal[False]): Must be False for attach mode.
@@ -144,8 +146,7 @@ class FrameServer:
             self._logger = None
         logger = self._logger
 
-        self.buffer: Optional[ProcessSafeSharedRingBuffer] = ring_buffer
-        self.buf_id: int = 0
+        # === Syncronization objects ===
         # Lock for register/unregister consumer (`c_enable_mask`)
         self._reg_lock: mp.Lock        =  mp.Lock()
         # Consumer lock for get/release (`tickets`)
@@ -154,10 +155,15 @@ class FrameServer:
         self._gc_locks: List[mp.Lock]  = [mp.Lock() for _ in range(MAX_LINKED_BUFFERS)]
         # lock for linking buffers and ref counting (`rb_*`)
         self._link_lock: mp.Lock       =  mp.Lock() 
-        
+
+        # === Buffer ===
+        self.buffer: Optional[ProcessSafeSharedRingBuffer] = None # committed later.
+        self.buf_id: Optional[int] = None # Only set to actual id when all validation passed.
+
+        # === Metadata ===
         self._shm: Optional[mp_shm.SharedMemory] = None
         self._metadata:     Optional[FSMetadata] = None
-        self._rb_shm_name_hashes:  Optional[NDArray] = None
+        self._rb_metadata_name_hashes:  Optional[NDArray] = None
         self._rb_linked_fs_count:  Optional[NDArray] = None
         self._rb_oldest_frame_ids: Optional[NDArray] = None # pad to 64 bytes, use [buf_id, 0].
         self._rb_offsets:          Optional[NDArray] = None
@@ -167,14 +173,21 @@ class FrameServer:
         self._gc_view:        Optional[NDArray] = None
         
         meta_size = ctypes.sizeof(FSMetadata)
+
+        # ====== Initialization ======
+        # Sync obj -> metadata(views) -> buffer & metadata init
         if create:
-            if not isinstance(self.buffer, ProcessSafeSharedRingBuffer):
+            if not isinstance(ring_buffer, ProcessSafeSharedRingBuffer):
                 raise ValueError("`ring_buffer` must be provided as a instance of "
                                  "`ProcessSafeSharedRingBuffer` when create=True.")
             try:
-                self._init_buffer_gc()
 
                 self._shm = mp_shm.SharedMemory(create=True, size=meta_size)
+                self._link_np_view()
+
+                # Set buffer and initialize related properties
+                self.buffer = ring_buffer; self.buf_id = 0
+                self._init_buffer_gc()
                 self._init_metadata()
 
             except OSError as e:
@@ -219,32 +232,31 @@ class FrameServer:
                     f"Expected: {_METADATA_VER_HASH}, received: {self._metadata.fs_protocol_ver}")
 
             with ExitStack() as stack:
-                if not isinstance(self.buffer, ProcessSafeSharedRingBuffer):
+                if not self._link_lock.acquire(timeout=0.1):
+                    raise TimeoutError("Acquire link_lock timeout.")
+                stack.callback(self._link_lock.release)
+
+                if not isinstance(ring_buffer, ProcessSafeSharedRingBuffer):
                     # Link to buffer inside the provided FrameServer
-                    self.buffer = frameserver.buffer
-                    if not self._link_lock.acquire(timeout=0.1):
-                        raise TimeoutError("Acquire link_lock timeout.")
-                    stack.callback(self._link_lock.release)
+                    self.buffer = frameserver.buffer; self.buf_id = frameserver.buf_id
                     self._rb_linked_fs_count[self.buf_id] += 1
                 else:
                     # Link to a external buffer but use the same flow control with master server.
-                    buffer_hash = int.from_bytes(hashlib.blake2b(self.buffer.shm_name.encode(), digest_size=8).digest(), 'little', signed=False)
-                    self._init_buffer_gc()
-
-                    if not self._link_lock.acquire(timeout=0.1):
-                        raise TimeoutError("Acquire link_lock timeout.")
-                    stack.callback(self._link_lock.release)
+                    buffer_hash = int.from_bytes(hashlib.blake2b(ring_buffer.metadata_name.encode(), digest_size=8).digest(), 'little', signed=False)
 
                     # Prevent duplicate buffer linking
-                    if buffer_hash in self._rb_shm_name_hashes[self._rb_linked_fs_count > 0]:
-                        raise RuntimeError(f"Buffer {self.buffer.shm_name} is already linked to this FrameServer.")
+                    if buffer_hash in self._rb_metadata_name_hashes[self._rb_linked_fs_count > 0]:
+                        raise RuntimeError(f"Buffer {ring_buffer.metadata_name} is already linked to this FrameServer.")
 
                     available_buf_ids = np.where(self._rb_linked_fs_count == 0)[0]
                     if len(available_buf_ids) == 0:
                         raise RuntimeError(f"Exceed the max number of linked buffers supported ({MAX_LINKED_BUFFERS}).")
+                    self.buffer = ring_buffer # validation pass, commit property.
                     self.buf_id = int(available_buf_ids[0]) # Assign the first available slots.
+                    self._init_buffer_gc()
+
                     self._rb_linked_fs_count[self.buf_id] = 1
-                    self._rb_shm_name_hashes[self.buf_id] = buffer_hash
+                    self._rb_metadata_name_hashes[self.buf_id] = buffer_hash
                     
                     # Super heavy lock sequence will block all actions:
                     if not self._reg_lock.acquire(timeout=0.1): # _c_enable_mask
@@ -257,22 +269,23 @@ class FrameServer:
                         if not self._cid_locks[i].acquire(timeout=0.02): # _next_frame_ids
                             raise TimeoutError(f"Acquire cid_locks[{i}] timeout.")
                         stack.callback(self._cid_locks[i].release)
-
+                    
+                    read_frontier_id: np.uint64
                     if len(enabled_consumer_cids) > 0:
                         # Link to current consumers' read frontier.
                         read_frontier_id = np.max(self._next_frame_ids[enabled_consumer_cids])
                     else:
                         # Inherit current frameserver's frontier.
                         # The same logic as the first consumer registration.
-                        read_frontier_id = self._write_frontier_gc_locked()
+                        read_frontier_id = frameserver._buf_write_frontier_gc_locked()
 
                     if not self._gc_locks[self.buf_id].acquire(timeout=0.1): # _rb_oldest_frame_ids
                         raise TimeoutError("Acquire gc_locks timeout.")
                     try:
-                        self._rb_oldest_frame_ids[self.buf_id, 0] = read_frontier_id
+                        self._rb_oldest_frame_ids[self.buf_id] = read_frontier_id
                         # Align `read_frontier_id` to the new buffer `read_ptr` by the offset.
                         # The first `get` will get (read_frontier_id + rb_offset) % capacity === read_ptr.
-                        self._rb_offsets[self.buf_id] = (self.buffer.read_ptr_ - read_frontier_id) % self.buffer.buffer_capacity
+                        self._rb_offsets[self.buf_id] = (self.buffer.read_ptr_ - int(read_frontier_id)) % self.buffer.buffer_capacity
                     finally:
                         self._gc_locks[self.buf_id].release()
 
@@ -300,8 +313,8 @@ class FrameServer:
         state = self.__dict__.copy()
         # Clear memory reference by ctypes and numpy.
         for k in ['_metadata', 
-                  '_rb_linked_fs_count', '_rb_shm_name_hashes', 
-                  '_rb_oldest_frame_ids_pad', '_rb_offsets', 
+                  '_rb_linked_fs_count', '_rb_metadata_name_hashes', 
+                  '_rb_oldest_frame_ids', '_rb_offsets', 
                   '_c_enable_mask', '_next_frame_ids', '_tickets_arr', '_tickets_arr_full']:
             state.pop(k, None)
         return state
@@ -321,20 +334,19 @@ class FrameServer:
         self.buffer.release(initial_release_num)
 
     def _init_metadata(self):
-        self._link_np_view()
         self._metadata.fs_protocol_ver = _METADATA_VER_HASH
 
-        self._rb_shm_name_hashes.fill(0)
+        self._rb_metadata_name_hashes.fill(0)
         self._rb_linked_fs_count.fill(0)
-        self._rb_oldest_frame_ids.fill(_UINT64_MAX)
+        self._rb_oldest_frame_ids.fill(_UINT64_MAX) # _UINT64_MAX = uninit.
         self._rb_offsets.fill(_UINT64_MAX)
 
         self._rb_linked_fs_count[0] = 1 # reference count
-        self._rb_shm_name_hashes[0] = int.from_bytes(
+        self._rb_metadata_name_hashes[0] = int.from_bytes(
             hashlib.blake2b(self.buffer.metadata_name.encode(), digest_size=8).digest(), 'little', signed=False)
         # A transformation from relative counting(rb) to absolute counting(fs).
-        # Anchor: for the first buffer, let initial `read_ptr` be mapped to frame 0.
-        self._rb_oldest_frame_ids[0, 0] = 0 
+        # Anchor: for the first buffer, let initial frame to be 0, mapped to `rb_offset`.
+        self._rb_oldest_frame_ids[0] = 0 
         self._rb_offsets[0] = self.buffer.read_ptr_
 
         self._c_enable_mask.fill(0)
@@ -345,9 +357,9 @@ class FrameServer:
         self._metadata: FSMetadata = FSMetadata.from_buffer(self._shm.buf)
         buf = self._shm.buf
         
-        self._rb_shm_name_hashes: NDArray[np.uint64] = np.ndarray((MAX_LINKED_BUFFERS,), dtype=np.uint64, buffer=buf, offset=FSMetadata.rb_shm_name_hashes.offset)
+        self._rb_metadata_name_hashes: NDArray[np.uint64] = np.ndarray((MAX_LINKED_BUFFERS,), dtype=np.uint64, buffer=buf, offset=FSMetadata.rb_metadata_name_hashes.offset)
         self._rb_linked_fs_count: NDArray[np.uint8] = np.ndarray((MAX_LINKED_BUFFERS,), dtype=np.uint8, buffer=buf, offset=FSMetadata.rb_linked_fs_count.offset)
-        self._rb_oldest_frame_ids: NDArray[np.uint64] = np.ndarray((MAX_LINKED_BUFFERS, 8), dtype=np.uint64, buffer=buf, offset=FSMetadata.rb_oldest_frame_ids.offset)
+        self._rb_oldest_frame_ids: NDArray[np.uint64] = np.ndarray((MAX_LINKED_BUFFERS, 8), dtype=np.uint64, buffer=buf, offset=FSMetadata.rb_oldest_frame_ids.offset)[:, 0] # the first element is valid.
         self._rb_offsets: NDArray[np.uint64] = np.ndarray((MAX_LINKED_BUFFERS,), dtype=np.uint64, buffer=buf, offset=FSMetadata.rb_offsets.offset)
         
         self._c_enable_mask: NDArray[np.bool_] = np.ndarray((MAX_CONSUMERS,), dtype=np.bool_, buffer=buf, offset=FSMetadata.c_enable_mask.offset)
@@ -355,14 +367,21 @@ class FrameServer:
         self._tickets_arr:    NDArray[np.uint64] = self._gc_view[:, :MAX_TICKETS]
         self._next_frame_ids: NDArray[np.uint64] = self._gc_view[:, MAX_TICKETS]
 
-    def _write_frontier_gc_locked(self) -> int:
-        """Get the absolute index of the current write frontier with the buffer's gc_lock."""
-        with self._gc_locks[self.buf_id]:
-            return self._rb_oldest_frame_ids[self.buf_id, 0] + self.buffer.occupied_count_
+    def _buf_write_frontier_gc_locked(self) -> np.uint64:
+        """Get the absolute index of the current buffer's write frontier with the buffer's gc_lock."""
+        with self._gc_locks[self.buf_id]: # Use gc_lock to prevent rb_oldest_frame_id mismatch with occupied_count_.
+            return self._rb_oldest_frame_ids[self.buf_id] + self.buffer.occupied_count_
 
-    def register_consumer(self) -> int:
+    def register_consumer(self, historical_data: bool = False) -> int:
         """
         Register a new consumer and return the assigned ID for further access.
+
+        Args:
+            historical_data (bool): If True, the consumer will start from the 
+                oldest frame that hasn't been released by any consumer.
+                If False, the consumer will start from the current write frontier,
+                thus only data produced after registration can be read.
+                Default is False.
 
         Returns:
             cid (int): consumer id, for future FrameServer API call.
@@ -379,9 +398,10 @@ class FrameServer:
             cid = available_cids[0]
             
             # Initialize metadata for the consumer.
-            # New consumer get tickets from current write_ptr since read_ptr is not updated in our frameserver.
-            # No data can be retrieved if no `put` after registration
-            self._next_frame_ids[cid] = self._write_frontier_gc_locked()
+            if historical_data:
+                self._next_frame_ids[cid] = self._rb_oldest_frame_ids[self.buf_id]
+            else:
+                self._next_frame_ids[cid] = self._buf_write_frontier_gc_locked()
             self._tickets_arr[cid, :] = _UINT64_MAX # Use _INT64_MAX to mark unused tickets.
             self._c_enable_mask[cid] = True # set flag at the end does NOT provide any order guarantee as it is shared memory.
         
@@ -449,8 +469,7 @@ class FrameServer:
                 available_ticket_slots = np.where(self._tickets_arr[cid] == _UINT64_MAX)[0]
                 if len(available_ticket_slots) > 0:
 
-                    with self._gc_locks[self.buf_id]: # Use gc_lock to prevent rb_oldest_frame_id mismatch with occupied_count_.
-                        buffer_frontier_id = self._rb_oldest_frame_ids[self.buf_id, 0] + self.buffer.occupied_count_
+                    buffer_frontier_id = self._buf_write_frontier_gc_locked()
 
                     # Check whether buffer has enough data.
                     next_frame_id: int = self._next_frame_ids[cid]
@@ -460,7 +479,7 @@ class FrameServer:
                         self._tickets_arr[cid, available_ticket_slot] = next_frame_id
                         self._next_frame_ids[cid] = next_frame_id + size
                     
-                        return FrameTicket(head_id=int(next_frame_id), size=size)
+                        return FrameTicket(head_id=int(next_frame_id), size=size, buf_id=self.buf_id)
                 else:
                     insufficient_tickets = True
 
@@ -472,7 +491,6 @@ class FrameServer:
             if timeout is not None:
                 timeout = end_time - time.monotonic()
                 if timeout <= 0: return None # timeout, return.
-            else: timeout = None
 
             with self.buffer.pointer_lock: 
                 # Check within lock, memory barrier.
@@ -482,23 +500,45 @@ class FrameServer:
                     return None # timeout, return.
                     
 
-    def get_from_ticket(self, ticket: FrameTicket) -> List[np.ndarray]:
+    def get_from_ticket(self, ticket: FrameTicket, 
+                        timeout: Optional[float] = None) -> Optional[List[np.ndarray]]:
         """
         Extract the data view from the Ticket. Zero-copy.
+        Lock-free if the ticket is issued from the same buffer.
+        Can also handle cross-buffer ticket safely.
         
         Args:
             ticket (FrameTicket): The ticket to extract data from.
+            timeout (Optional[float]): time to wait if ticket is issued from
+                another buffer and is requesting future data. None = blocking.
+                Will not block if the ticket is issued from the same buffer.
         
         Returns:
-            data (List[np.ndarray]): The data view from the Ticket. 
-                                     len(data) can be 1 or 2.
+            data (Optional[List[np.ndarray]]): The data view from the Ticket. 
+                len(data) can be 1 or 2. None only if the ticket is from 
+                another buffer and timeout requesting future data.
         
         Raises:
-            TicketExpireException: If the ticket is invalid or expired.
+            TicketExpireException: If the ticket has been expired.
         """
-        if ticket.head_id < self._rb_oldest_frame_ids[self.buf_id, 0]:
-            raise TicketExpireException(ticket, self._rb_oldest_frame_ids[self.buf_id, 0])
-        
+        if ticket.head_id < self._rb_oldest_frame_ids[self.buf_id]:
+            raise TicketExpireException(ticket, self._rb_oldest_frame_ids[self.buf_id])
+
+        if ticket.buf_id != self.buf_id:
+            end_time = time.monotonic() + timeout if timeout is not None else 0.0
+            while True: # timeout loop
+                buf_write_frontier = self._buf_write_frontier_gc_locked()
+                if buf_write_frontier >= ticket.head_id + ticket.size:
+                    break
+                
+                if timeout is not None:
+                    timeout = end_time - time.monotonic()
+                    if timeout <= 0: return None # timeout, return.
+                
+                with self.buffer.pointer_lock:
+                    if not self.buffer.data_available_condition.wait(timeout=timeout):
+                        return None # timeout, return.
+
         relative_ptr = (ticket.head_id + self._rb_offsets[self.buf_id]) % self.buffer.buffer_capacity
         return self.buffer.read_from(relative_ptr, ticket.size)
 
@@ -554,11 +594,11 @@ class FrameServer:
 
         # Has consumers, and has something to release.
         try:
-            if global_occupied_from_id != _UINT64_MAX and global_occupied_from_id > self._rb_oldest_frame_ids[self.buf_id, 0]:
-                to_release = global_occupied_from_id - self._rb_oldest_frame_ids[self.buf_id, 0]
+            if global_occupied_from_id != _UINT64_MAX and global_occupied_from_id > self._rb_oldest_frame_ids[self.buf_id]:
+                to_release = global_occupied_from_id - self._rb_oldest_frame_ids[self.buf_id]
                 release_num = self.buffer.release(to_release)
                 # Maintain the couple of FS metadata and buffer status.
-                self._rb_oldest_frame_ids[self.buf_id, 0] += release_num 
+                self._rb_oldest_frame_ids[self.buf_id] += release_num 
                 return release_num
             return 0
         finally: # use `finally` to release lock before leaving current scope.
@@ -576,10 +616,10 @@ class FrameServer:
         if self.buffer.occupied_count_ < size:
             return None # Buffer do not have enough data.
         with self._gc_locks[self.buf_id]:
-            buffer_frontier_id = self._rb_oldest_frame_ids[self.buf_id, 0] + self.buffer.occupied_count_
+            buffer_frontier_id = self._rb_oldest_frame_ids[self.buf_id] + self.buffer.occupied_count_
         
         head_id = buffer_frontier_id - size
-        return FrameTicket(head_id=head_id, size=size)
+        return FrameTicket(head_id=head_id, size=size, buf_id=self.buf_id)
 
     def get_async_copy(self, size: int) -> Optional[List[NDArray]]:
         """
@@ -594,7 +634,7 @@ class FrameServer:
 
         with self._gc_locks[self.buf_id]: # TODO: Anyway to make copy outside?? probably not except mod ring buffer.
             # Block GC ensures consistent `fs_oldest_frame_id` and `occupied_count_` and data integrity.
-            buffer_frontier_id = self._rb_oldest_frame_ids[self.buf_id, 0] + self.buffer.occupied_count_
+            buffer_frontier_id = self._rb_oldest_frame_ids[self.buf_id] + self.buffer.occupied_count_
             head_id = buffer_frontier_id - size
 
             relative_ptr = (head_id + self._rb_offsets[self.buf_id]) % self.buffer.buffer_capacity
@@ -610,7 +650,7 @@ class FrameServer:
                 if self._rb_linked_fs_count[buf_id] > 0:
                     self._rb_linked_fs_count[buf_id] -= 1
                     if self._rb_linked_fs_count[buf_id] == 0:
-                        self._rb_shm_name_hashes[buf_id] = 0
+                        self._rb_metadata_name_hashes[buf_id] = 0
             self.buf_id = None # Let it crash philosophy for subsequent uses
             
         if hasattr(self, '_metadata'):
@@ -623,11 +663,11 @@ class FrameServer:
             del self._tickets_arr
         if hasattr(self, '_gc_view'):
             del self._gc_view
-        if hasattr(self, '_rb_shm_name_hashes'):
-            del self._rb_shm_name_hashes
+        if hasattr(self, '_rb_metadata_name_hashes'):
+            del self._rb_metadata_name_hashes
         if hasattr(self, '_rb_linked_fs_count'):
             del self._rb_linked_fs_count
-        if hasattr(self, '_rb_oldest_frame_ids_pad'):
+        if hasattr(self, '_rb_oldest_frame_ids'):
             del self._rb_oldest_frame_ids
         if hasattr(self, '_rb_offsets'):
             del self._rb_offsets
@@ -656,7 +696,7 @@ class FrameServer:
                     if self._rb_linked_fs_count[buf_id] > 0:
                         self._rb_linked_fs_count[buf_id] -= 1
                         if self._rb_linked_fs_count[buf_id] == 0:
-                            self._rb_shm_name_hashes[buf_id] = 0
+                            self._rb_metadata_name_hashes[buf_id] = 0
                 finally:
                     self._link_lock.release()
                 
@@ -664,9 +704,9 @@ class FrameServer:
             del self._metadata
         if hasattr(self, '_rb_linked_fs_count'):
             del self._rb_linked_fs_count
-        if hasattr(self, '_rb_shm_name_hashes'):
-            del self._rb_shm_name_hashes
-        if hasattr(self, '_rb_oldest_frame_ids_pad'):
+        if hasattr(self, '_rb_metadata_name_hashes'):
+            del self._rb_metadata_name_hashes
+        if hasattr(self, '_rb_oldest_frame_ids'):
             del self._rb_oldest_frame_ids
         if hasattr(self, '_rb_offsets'):
             del self._rb_offsets

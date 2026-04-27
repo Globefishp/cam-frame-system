@@ -19,10 +19,9 @@ import numpy as np
 import time
 import multiprocessing as mp
 import random
+import importlib
 
 from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
-from frameserver_v2 import FrameServer
-from frameserver_v2_types import TicketExpireException
 
 ctx = mp.get_context("spawn")
 
@@ -42,10 +41,11 @@ def small_buffer():
     try: rb.unlink()
     except Exception: pass
 
-def __basic_use_consumer(server_master: FrameServer, use_linked_fs, result_queue):
+def __basic_use_consumer(fs_module_name, server_master, use_linked_fs, result_queue):
+    fs_mod = importlib.import_module(fs_module_name)
     try:
         if use_linked_fs:
-            server = FrameServer(create=False, frameserver=server_master)
+            server = fs_mod.FrameServer(create=False, frameserver=server_master)
         else:
             server = server_master
             
@@ -81,14 +81,16 @@ def __basic_use_consumer(server_master: FrameServer, use_linked_fs, result_queue
     finally:
         server.close()
 
+@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
 @pytest.mark.parametrize("use_linked_fs", [False, True])
-def test_fs_basic_use(small_buffer, use_linked_fs):
+def test_fs_basic_use(small_buffer, fs_module_name, use_linked_fs):
     """Test frameserver basic registration and sequential flow across processes."""
-    server_master = FrameServer(create=True, ring_buffer=small_buffer)
+    fs_mod = importlib.import_module(fs_module_name)
+    server_master = fs_mod.FrameServer(create=True, ring_buffer=small_buffer)
     small_buffer.trigger_release = server_master._gc
     
     result_queue = ctx.Queue()
-    consumer_proc = ctx.Process(target=__basic_use_consumer, args=(server_master, use_linked_fs, result_queue))
+    consumer_proc = ctx.Process(target=__basic_use_consumer, args=(fs_module_name, server_master, use_linked_fs, result_queue))
     consumer_proc.start()
     
     res = result_queue.get(timeout=3.0)
@@ -116,9 +118,10 @@ def __spin_delay(delay_sec):
     while time.perf_counter() < end:
         pass
 
-def __unified_consumer_worker(fs_obj, cid, stop_event, fetch_size, result_queue, delay_mean=0.0, delay_std=0.0):
+def __unified_consumer_worker(fs_module_name, fs_obj, cid, stop_event, fetch_size, result_queue, delay_mean=0.0, delay_std=0.0):
+    fs_mod = importlib.import_module(fs_module_name)
     try:
-        server = FrameServer(create=False, frameserver=fs_obj)
+        server = fs_mod.FrameServer(create=False, frameserver=fs_obj)
         print(f"Successfully create subprocess consumer ({cid}): {os.getpid()}")
         tickets = []
         while not stop_event.is_set():
@@ -135,7 +138,7 @@ def __unified_consumer_worker(fs_obj, cid, stop_event, fetch_size, result_queue,
                             if block[i, 0, 0, 0] != expected_val:
                                 raise ValueError(f"Tearing! Expected {expected_val}, got {block[i, 0, 0, 0]}")
                             rel_idx += 1
-                except TicketExpireException:
+                except fs_mod.TicketExpireException:
                     pass
                 
                 load_time = max(0.0, random.gauss(delay_mean, delay_std))
@@ -167,9 +170,11 @@ def __unified_producer_worker(rb_obj, stop_event, batch_size, result_queue, dela
     result_queue.put(i * batch_size) # 乘以 batch_size 送出实际的帧总数
     buffer.close()
 
-def test_fs_concurrent_single_consumer(empty_buffer):
+@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
+def test_fs_concurrent_single_consumer(empty_buffer, fs_module_name):
     """Test concurrent polling inside single CID yielding strictly ordered tickets via MP."""
-    server = FrameServer(create=True, ring_buffer=empty_buffer)
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=True, ring_buffer=empty_buffer)
     cid = server.register_consumer()
     tx_stop_event = mp.Event()
     rx_stop_event = mp.Event()
@@ -180,7 +185,7 @@ def test_fs_concurrent_single_consumer(empty_buffer):
     producer.start()
         
     rx_queues = [ctx.Queue() for _ in range(5)]
-    workers = [ctx.Process(target=__unified_consumer_worker, args=(server, cid, rx_stop_event, 1, q)) for q in rx_queues]
+    workers = [ctx.Process(target=__unified_consumer_worker, args=(fs_module_name, server, cid, rx_stop_event, 1, q)) for q in rx_queues]
     
     for w in workers: w.start()
     
@@ -223,10 +228,11 @@ def test_fs_concurrent_single_consumer(empty_buffer):
     server.close()
     server.unlink()
 
-
-def test_fs_multi_cid_parallel(empty_buffer):
+@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
+def test_fs_multi_cid_parallel(empty_buffer, fs_module_name):
     """Test full system saturation with 32 distinct consumers reading concurrently via True MP."""
-    server = FrameServer(create=True, ring_buffer=empty_buffer)
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=True, ring_buffer=empty_buffer)
     cids = [server.register_consumer() for _ in range(32)]
     tx_stop_event = mp.Event()
     rx_stop_event = mp.Event()
@@ -237,7 +243,7 @@ def test_fs_multi_cid_parallel(empty_buffer):
     producer.start()
     
     rx_queues = [ctx.Queue() for _ in range(32)]
-    workers = [ctx.Process(target=__unified_consumer_worker, args=(server, cid, rx_stop_event, 1, q)) for cid, q in zip(cids, rx_queues)]
+    workers = [ctx.Process(target=__unified_consumer_worker, args=(fs_module_name, server, cid, rx_stop_event, 1, q)) for cid, q in zip(cids, rx_queues)]
     
     for w in workers: w.start()
     
@@ -266,9 +272,11 @@ def test_fs_multi_cid_parallel(empty_buffer):
     server.close()
     server.unlink()
 
-def test_fs_pipeline_backpressure(small_buffer):
+@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
+def test_fs_pipeline_backpressure(small_buffer, fs_module_name):
     """Test fast consumer starvation and producer locking by a slow consumer."""
-    server = FrameServer(create=True, ring_buffer=small_buffer)
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=True, ring_buffer=small_buffer)
     small_buffer.trigger_release = server._gc
     
     cid_fast = server.register_consumer()
@@ -309,8 +317,9 @@ def test_fs_pipeline_backpressure(small_buffer):
     server.close()
     server.unlink()
 
-def __barrier_producer(fs_obj, rb_obj, stop_event):
-    server = FrameServer(create=False, frameserver=fs_obj)
+def __barrier_producer(fs_module_name, fs_obj, rb_obj, stop_event):
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=False, frameserver=fs_obj)
     buffer = ProcessSafeSharedRingBuffer(create=False, source_buffer=rb_obj)
     buffer.trigger_release = server._gc
     
@@ -326,16 +335,18 @@ def __barrier_producer(fs_obj, rb_obj, stop_event):
         counter += 1
     buffer.close(); server.close()
 
-def __barrier_consumer(fs_obj, cid, stop_event):
-    server = FrameServer(create=False, frameserver=fs_obj)
+def __barrier_consumer(fs_module_name, fs_obj, cid, stop_event):
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=False, frameserver=fs_obj)
     while not stop_event.is_set():
         # High frequency read/release to provoke gc sliding frame pointers
         t = server.get_sync(cid, 5, timeout=0)
         if t: server.release_sync(cid, t)
     server.close()
 
-def __barrier_stalker(fs_obj, stop_event, result_queue):
-    server = FrameServer(create=False, frameserver=fs_obj)
+def __barrier_stalker(fs_module_name, fs_obj, stop_event, result_queue):
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=False, frameserver=fs_obj)
     tearing_cnt = 0
     
     while not stop_event.is_set():
@@ -349,18 +360,20 @@ def __barrier_stalker(fs_obj, stop_event, result_queue):
     result_queue.put(tearing_cnt)
     server.close()
 
-def test_fs_async_sync_barrier(empty_buffer):
+@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
+def test_fs_async_sync_barrier(empty_buffer, fs_module_name):
     """Stress test tearing memory guard via get_async_copy alongside a real sync consumer."""
-    server = FrameServer(create=True, ring_buffer=empty_buffer)
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=True, ring_buffer=empty_buffer)
     empty_buffer.trigger_release = server._gc
     cid = server.register_consumer()
     
     stop_event = ctx.Event()
     queue = ctx.Queue()
     
-    p_prod = ctx.Process(target=__barrier_producer, args=(server, empty_buffer, stop_event))
-    p_cons = ctx.Process(target=__barrier_consumer, args=(server, cid, stop_event))
-    p_stalker = ctx.Process(target=__barrier_stalker, args=(server, stop_event, queue))
+    p_prod = ctx.Process(target=__barrier_producer, args=(fs_module_name, server, empty_buffer, stop_event))
+    p_cons = ctx.Process(target=__barrier_consumer, args=(fs_module_name, server, cid, stop_event))
+    p_stalker = ctx.Process(target=__barrier_stalker, args=(fs_module_name, server, stop_event, queue))
     
     p_prod.start(); p_cons.start(); p_stalker.start()
     time.sleep(2.0) # Intense multiprocess execution window
@@ -375,8 +388,9 @@ def test_fs_async_sync_barrier(empty_buffer):
     server.close(); server.unlink()
 
 
-def __async_reader_worker(fs_obj, stop_event, decode_delay, result_queue):
-    server = FrameServer(create=False, frameserver=fs_obj)
+def __async_reader_worker(fs_module_name, fs_obj, stop_event, decode_delay, result_queue):
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=False, frameserver=fs_obj)
     expired = 0
     success = 0
     while not stop_event.is_set():
@@ -386,11 +400,12 @@ def __async_reader_worker(fs_obj, stop_event, decode_delay, result_queue):
             try:
                 server.get_from_ticket(ticket)
                 success += 1
-            except TicketExpireException:
+            except fs_mod.TicketExpireException:
                 expired += 1
     result_queue.put((success, expired))
     server.close()
 
+@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
 @pytest.mark.parametrize("cons_num, decode_delay, should_expire", [
     # Low latency decode: GC shouldn't overtake it easily. Over 2.0s it handles the delay perfectly.
     (1, 0.0, False),
@@ -398,19 +413,20 @@ def __async_reader_worker(fs_obj, stop_event, decode_delay, result_queue):
     # The Buffer capacity is 60. So during 0.05s stall, 5 sync consumers could process 50+ frames effortlessly. Ticket will EXPIRE!
     (5, 0.05, True) 
 ])
-def test_fs_get_async_expire(empty_buffer, cons_num, decode_delay, should_expire):
+def test_fs_get_async_expire(empty_buffer, fs_module_name, cons_num, decode_delay, should_expire):
     """Test that `get_async` properly delegates decoding exceptions and is influenced by consumer GC."""
-    server = FrameServer(create=True, ring_buffer=empty_buffer)
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=True, ring_buffer=empty_buffer)
     empty_buffer.trigger_release = server._gc
     cids = [server.register_consumer() for _ in range(cons_num)]
     
     stop_event = ctx.Event()
     
-    prod = ctx.Process(target=__barrier_producer, args=(server, empty_buffer, stop_event))
-    cons_procs = [ctx.Process(target=__barrier_consumer, args=(server, c, stop_event)) for c in cids]
+    prod = ctx.Process(target=__barrier_producer, args=(fs_module_name, server, empty_buffer, stop_event))
+    cons_procs = [ctx.Process(target=__barrier_consumer, args=(fs_module_name, server, c, stop_event)) for c in cids]
     
     queue = ctx.Queue()
-    async_reader = ctx.Process(target=__async_reader_worker, args=(server, stop_event, decode_delay, queue))
+    async_reader = ctx.Process(target=__async_reader_worker, args=(fs_module_name, server, stop_event, decode_delay, queue))
     
     prod.start()
     for c in cons_procs: c.start()
@@ -435,9 +451,11 @@ def test_fs_get_async_expire(empty_buffer, cons_num, decode_delay, should_expire
     for c in cids: server.unregister_consumer(c)
     server.close(); server.unlink()
 
-def test_fs_consumer_drop(small_buffer):
+@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
+def test_fs_consumer_drop(small_buffer, fs_module_name):
     """Test drop-consumer triggering explicit buffer eviction."""
-    server = FrameServer(create=True, ring_buffer=small_buffer)
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=True, ring_buffer=small_buffer)
     small_buffer.trigger_release = server._gc
     
     cid_slow = server.register_consumer()
@@ -463,9 +481,11 @@ def test_fs_consumer_drop(small_buffer):
     server.close()
     server.unlink()
 
-def test_fs_unregister_usage_denial(small_buffer):
+@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
+def test_fs_unregister_usage_denial(small_buffer, fs_module_name):
     """Test post-unregistered CID operations correctly get blocked or silenced."""
-    server = FrameServer(create=True, ring_buffer=small_buffer)
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=True, ring_buffer=small_buffer)
     cid = server.register_consumer()
     
     small_buffer.put(np.full((1, 2, 2, 3), 99, dtype=np.uint32))
@@ -485,6 +505,7 @@ def test_fs_unregister_usage_denial(small_buffer):
     server.close()
     server.unlink()
 
+@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
 @pytest.mark.parametrize("cons_num, prod_params, cons_params", [
     # 消费者数, 生产(均值,方差)秒, 消费(均值,方差)秒
     # 场景 1：极速并发（测试锁和调度的最高吞吐争抢）
@@ -500,9 +521,10 @@ def test_fs_unregister_usage_denial(small_buffer):
     # 场景 4：天地大冲撞（两者均产生极大抖动，GC指针如过山车）
     (20, (0.002, 0.01), (0.002, 0.01) ),
 ])
-def test_fs_stochastic_stress(empty_buffer, cons_num, prod_params, cons_params):
+def test_fs_stochastic_stress(empty_buffer, fs_module_name, cons_num, prod_params, cons_params):
     """Stress test with stochastic processing times utilizing __spin_delay."""
-    server = FrameServer(create=True, ring_buffer=empty_buffer)
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=True, ring_buffer=empty_buffer)
     cids = [server.register_consumer() for _ in range(cons_num)]
     tx_stop_event = mp.Event()
     rx_stop_event = mp.Event()
@@ -518,7 +540,7 @@ def test_fs_stochastic_stress(empty_buffer, cons_num, prod_params, cons_params):
     workers = [
         ctx.Process(
             target=__unified_consumer_worker, 
-            args=(server, cid, rx_stop_event, 1, q, cons_params[0], cons_params[1])
+            args=(fs_module_name, server, cid, rx_stop_event, 1, q, cons_params[0], cons_params[1])
         ) for cid, q in zip(cids, rx_queues)
     ]
     

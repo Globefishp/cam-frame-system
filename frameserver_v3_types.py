@@ -1,4 +1,4 @@
-# frameserver_v2_types.py
+# frameserver_v3_types.py
 
 import hashlib
 import ctypes
@@ -13,6 +13,7 @@ class FrameTicket:
     """
     head_id: np.int64  # The global index maintained by FrameServer
     size: int          # The continuous frames to get started from head_id.
+    buf_id: np.uint8   # The id of which ring buffer this ticket belongs to.
 
 class TicketExpireException(Exception):
     """Ticket is expired."""
@@ -35,10 +36,10 @@ class FSMetadata(ctypes.Structure):
     """
     fs_protocol_ver: int
     
-    rb_shm_name_hashes:  NDArray[np.uint64]
-    rb_linked_fs_count:  NDArray[np.uint8]
-    rb_oldest_frame_ids: NDArray[np.uint64]
-    rb_offsets:          NDArray[np.uint64]
+    rb_metadata_name_hashes: NDArray[np.uint64]
+    rb_linked_fs_count:      NDArray[np.uint8]
+    rb_oldest_frame_ids:     NDArray[np.uint64]
+    rb_offsets:              NDArray[np.uint64]
 
     c_enable_mask:  NDArray[np.bool_]
     next_frame_ids: NDArray[np.uint64]
@@ -47,7 +48,7 @@ class FSMetadata(ctypes.Structure):
     _fields_ = [
         ("fs_protocol_ver", ctypes.c_uint64),    # mark the Metadata version. See _METADATA_VER_HASH
         # for each linked ring buffer:
-        ("rb_shm_name_hashes", ctypes.c_uint64 * MAX_LINKED_BUFFERS), # Hash of the linked ring buffer's shm_name to prevent duplicate binding.
+        ("rb_metadata_name_hashes", ctypes.c_uint64 * MAX_LINKED_BUFFERS), # Hash of the linked ring buffer's metadata shm name to prevent duplicate binding.
         ("rb_linked_fs_count", ctypes.c_uint8 * MAX_LINKED_BUFFERS), # The reference count of each ring buffer linked by frameserver instances. 0 = free slot.
         ("rb_oldest_frame_ids", (ctypes.c_uint64 * 8) * MAX_LINKED_BUFFERS), # The newest frame id of the data that has got from ring buffer by FrameServer. Padded to 64 bytes to prevent false sharing.
         ("rb_offsets", ctypes.c_uint64 * MAX_LINKED_BUFFERS), # The offset of the ring buffer read_ptr when initialize the FrameServer.
