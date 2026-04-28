@@ -11,8 +11,9 @@ import multiprocessing as mp
 import numpy as np
 from numpy.typing import NDArray
 from typing import Tuple, Any, Optional, List, Callable, Protocol
-from ringbuffers.shared_ring_buffer_v2a import ProcessSafeSharedRingBuffer
-from encoders.videoencoder import BaseVideoEncoder
+from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
+from frameserver.v3.frameserver_v3 import FrameServer
+from encoders.videoencoder_v3 import BaseVideoEncoder
 from encoders.videoencoder_types import EncoderException
 from cameras.abstractcamera.camera import ExtInfoExtractor # Type hinting for timecode extraction
 
@@ -42,7 +43,7 @@ class X264Encoder(BaseVideoEncoder):
     Concrete implementation of BaseVideoEncoder for x264 encoding using x264.exe via pipe.
     """
     def __init__(self,
-                 shared_buffer: ProcessSafeSharedRingBuffer,
+                 frame_server: FrameServer,
                  output_path: str,
                  batch_size: int = 5,
                  inject_logger: Logger = None,
@@ -52,8 +53,7 @@ class X264Encoder(BaseVideoEncoder):
         ):
         """
         Args: 
-            shared_buffer: (ProcessSafeSharedRingBuffer), the shared buffer 
-                instance created externally.
+            frame_server: (FrameServer), the frame server instance created externally.
             output_path: (str), path to the output video file.
             batch_size: (int), number of frames to get from the buffer at once. 
                 Defaults to 5.
@@ -79,7 +79,7 @@ class X264Encoder(BaseVideoEncoder):
         """
         pid, friendly_name = mp.current_process().pid, "X264Encoder"
         fps = kwargs.get('fps', None)
-        super().__init__(shared_buffer, output_path, batch_size=batch_size, expected_fps=fps, inject_logger=inject_logger)
+        super().__init__(frame_server, output_path, batch_size=batch_size, expected_fps=fps, inject_logger=inject_logger)
         self._logger = self._logger.bind(friendly_name=friendly_name)
 
         # Parse kwargs
@@ -112,7 +112,7 @@ class X264Encoder(BaseVideoEncoder):
         
         # Timecode related attributes
         self._timecode_extractor: TimecodeExtractor = timecode_extractor
-        self._mux_timecode: bool = mux_timecode
+        self._do_mux_timecode: bool = mux_timecode
         self._last_timecode_value: Optional[int] = None # For future use: checking monotonicity
         self._timecode_log_path: Optional[str] = None # File path for timecode logging.
         self._timecode_file: Optional[Any] = None # File object for writing timecodes
@@ -363,7 +363,7 @@ class X264Encoder(BaseVideoEncoder):
 
                 except Exception as e:
                     logger.opt(exception=e).error(f"Unexpected error during TC extraction for frame "
-                                 f"{self.frame_encoded}.")
+                                 f"{self._processed_frames}.")
                     pure_image_data_list = list(frame_chunk_arr[:, :height, :width, :]) # Fallback image data
                     timecodes_list = []
             else:
@@ -385,12 +385,12 @@ class X264Encoder(BaseVideoEncoder):
                     if self._timecode_file and timecodes_list:
                         current_tc = timecodes_list[idx]
                         # Rescale tc in timebase to ms(float) for timecode format v2
-                        current_tc_ms = current_tc * 1000.0 / self._timecode_timebase
+                        current_tc_ms = current_tc * 1000.0 / self._timecode_extractor.timebase
                         self._timecode_file.write(f"{current_tc_ms}\n")
                             
                         # Optional: Monotonicity check
                         if self._last_timecode_value is not None and current_tc < self._last_timecode_value:
-                            logger.warning(f"Timecode non-monotonic. Frame {self.frame_encoded}. "
+                            logger.warning(f"Timecode non-monotonic. Frame {self._processed_frames}. "
                                             f"Prev: {self._last_timecode_value}, Curr: {current_tc}")
                         self._last_timecode_value = current_tc
             except BrokenPipeError as e:
@@ -489,7 +489,7 @@ class X264Encoder(BaseVideoEncoder):
 
         self._x264_process = None # All members finished using the Popen obj, reset to None
 
-        if self._timecode_extractor:
+        if self._timecode_extractor and self._do_mux_timecode:
             self._mux_timecode(tc_file=self._timecode_log_path, mp4_file=self._encoder_intermediates, out_file=self._output_path)
 
         logger.info(f"X264 encoder uninitialized.")
@@ -581,6 +581,7 @@ if __name__ == "__main__":
     # 1. 创建 ProcessSafeSharedRingBuffer 实例
     print("Creating shared ring buffer...")
     shared_buffer = None
+    frame_server = None
     try:
         shared_buffer = ProcessSafeSharedRingBuffer(
             create=True,
@@ -590,7 +591,10 @@ if __name__ == "__main__":
         )
         print(f"Shared ring buffer created: Metadata SHM: {shared_buffer.metadata_name}, Data SHM: {shared_buffer.data_name}")
 
-        # 2. 创建 X264Encoder 实例，并传入共享缓冲区
+        print("Creating FrameServer instance...")
+        frame_server = FrameServer(create=True, ring_buffer=shared_buffer)
+
+        # 2. 创建 X264Encoder 实例，并传入 FrameServer
         print("Creating X264Encoder instance...")
 
         # 构建一个字典来存放非必须的编码参数
@@ -603,7 +607,7 @@ if __name__ == "__main__":
         }
 
         encoder = X264Encoder(
-            shared_buffer=shared_buffer, # Pass the shared buffer instance
+            frame_server=frame_server, # Pass the FrameServer instance
             output_path=output_file,
             batch_size=batch_size, # batch_size is a required parameter
             inject_logger=logger,
@@ -653,10 +657,16 @@ if __name__ == "__main__":
         else:
             print("Encoder instance was not created due to an error.")
         
-        print(f"There are {shared_buffer.unread_count} frames left in the buffer.")
+        print(f"There are {shared_buffer.unread_count()} (Not accurate in current FrameServer version) frames left in the buffer.")
 
-        # 6. 关闭并解除链接共享缓冲区
+        # 6. 关闭并解除链接 FrameServer 和共享缓冲区
         print("Cleaning up shared memory...")
+        if frame_server:
+            try:
+                frame_server.close()
+                frame_server.unlink()
+            except Exception as e:
+                print(f"Error closing/unlinking frameserver in main: {e}")
         if shared_buffer:
             try:
                  shared_buffer.close()
@@ -698,6 +708,7 @@ if __name__ == "__main__":
 
     # --- Mock Shared Buffer ---
     mock_shared_buffer = ProcessSafeSharedRingBuffer(create=True, buffer_capacity=10, frame_shape=(10,10,3))
+    mock_frame_server = FrameServer(create=True, ring_buffer=mock_shared_buffer)
 
     print("Creating X264Encoder instance for profiling...")
     encoding_kwargs = {
@@ -710,7 +721,7 @@ if __name__ == "__main__":
 
     # Ensure the X264Encoder class is defined above this block
     encoder = X264Encoder(
-        shared_buffer=mock_shared_buffer,
+        frame_server=mock_frame_server,
         output_path=output_file,
         batch_size=encoder_init_batch_size,
         **encoding_kwargs
@@ -765,6 +776,10 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
     finally:
+        mock_frame_server.close()
+        mock_frame_server.unlink()
+        mock_shared_buffer.close()
+        mock_shared_buffer.unlink()
         if os.path.exists(output_file):
             try:
                 # os.remove(output_file)
