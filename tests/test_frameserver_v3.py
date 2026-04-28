@@ -13,8 +13,8 @@ import multiprocessing as mp
 import random
 
 from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
-from frameserver_v3 import FrameServer
-from frameserver_v3_types import TicketExpireException, MAX_LINKED_BUFFERS
+from frameserver.v3 import FrameServer
+from frameserver.v3 import TicketExpireException, MAX_LINKED_BUFFERS
 
 ctx = mp.get_context("spawn")
 

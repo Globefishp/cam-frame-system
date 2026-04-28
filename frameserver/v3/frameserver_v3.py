@@ -7,7 +7,7 @@
 # Require 64bit system to safely read uint64 atomically.
 # gc_lock is a fine-grained lock, if lock nesting is needed, gc_lock must be acquired 
 #   AFTER holding cid_lock/reg_lock to prevent ABBA dead lock.
-# Lock order (ascending): gc_lock -> cid_lock -> reg_lock -> link_lock.
+# Lock order (inner -> outer): gc_lock -> cid_lock -> reg_lock -> link_lock.
 
 from typing import overload, Literal
 import time
@@ -22,7 +22,8 @@ from numpy.typing import NDArray
 from typing import Optional, List
 from loguru._logger import Logger # for type hint only
 from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
-from frameserver_v3_types import (FrameTicket, TicketExpireException, 
+
+from .frameserver_v3_types import (FrameTicket, TicketExpireException, 
                                   FSMetadata, _METADATA_VER_HASH, 
                                   MAX_CONSUMERS, MAX_TICKETS, _UINT64_MAX,
                                   MAX_LINKED_BUFFERS)
@@ -30,9 +31,9 @@ from frameserver_v3_types import (FrameTicket, TicketExpireException,
 
 class FrameServer:
     """
-    FrameServer V2 enables zero-copy frame distribution to multiple consumers 
+    FrameServer V3 enables zero-copy frame distribution to multiple consumers 
     from a shared ring buffer. Process-safe design, allowing concurrent `get()` 
-    calls. Supports multiple ring buffers ("streams") synchronized in a unified 
+    calls. V3 supports multiple ring buffers ("streams") synchronized in a unified 
     ticket space.
 
     Get ticket from any fs 

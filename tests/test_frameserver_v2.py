@@ -81,7 +81,7 @@ def __basic_use_consumer(fs_module_name, server_master, use_linked_fs, result_qu
     finally:
         server.close()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
 @pytest.mark.parametrize("use_linked_fs", [False, True])
 def test_fs_basic_use(small_buffer, fs_module_name, use_linked_fs):
     """Test frameserver basic registration and sequential flow across processes."""
@@ -170,7 +170,7 @@ def __unified_producer_worker(rb_obj, stop_event, batch_size, result_queue, dela
     result_queue.put(i * batch_size) # 乘以 batch_size 送出实际的帧总数
     buffer.close()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
 def test_fs_concurrent_single_consumer(empty_buffer, fs_module_name):
     """Test concurrent polling inside single CID yielding strictly ordered tickets via MP."""
     fs_mod = importlib.import_module(fs_module_name)
@@ -228,7 +228,7 @@ def test_fs_concurrent_single_consumer(empty_buffer, fs_module_name):
     server.close()
     server.unlink()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
 def test_fs_multi_cid_parallel(empty_buffer, fs_module_name):
     """Test full system saturation with 32 distinct consumers reading concurrently via True MP."""
     fs_mod = importlib.import_module(fs_module_name)
@@ -272,7 +272,7 @@ def test_fs_multi_cid_parallel(empty_buffer, fs_module_name):
     server.close()
     server.unlink()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
 def test_fs_pipeline_backpressure(small_buffer, fs_module_name):
     """Test fast consumer starvation and producer locking by a slow consumer."""
     fs_mod = importlib.import_module(fs_module_name)
@@ -360,7 +360,7 @@ def __barrier_stalker(fs_module_name, fs_obj, stop_event, result_queue):
     result_queue.put(tearing_cnt)
     server.close()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
 def test_fs_async_sync_barrier(empty_buffer, fs_module_name):
     """Stress test tearing memory guard via get_async_copy alongside a real sync consumer."""
     fs_mod = importlib.import_module(fs_module_name)
@@ -405,7 +405,7 @@ def __async_reader_worker(fs_module_name, fs_obj, stop_event, decode_delay, resu
     result_queue.put((success, expired))
     server.close()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
 @pytest.mark.parametrize("cons_num, decode_delay, should_expire", [
     # Low latency decode: GC shouldn't overtake it easily. Over 2.0s it handles the delay perfectly.
     (1, 0.0, False),
@@ -451,7 +451,7 @@ def test_fs_get_async_expire(empty_buffer, fs_module_name, cons_num, decode_dela
     for c in cids: server.unregister_consumer(c)
     server.close(); server.unlink()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
 def test_fs_consumer_drop(small_buffer, fs_module_name):
     """Test drop-consumer triggering explicit buffer eviction."""
     fs_mod = importlib.import_module(fs_module_name)
@@ -481,7 +481,7 @@ def test_fs_consumer_drop(small_buffer, fs_module_name):
     server.close()
     server.unlink()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
 def test_fs_unregister_usage_denial(small_buffer, fs_module_name):
     """Test post-unregistered CID operations correctly get blocked or silenced."""
     fs_mod = importlib.import_module(fs_module_name)
@@ -505,7 +505,7 @@ def test_fs_unregister_usage_denial(small_buffer, fs_module_name):
     server.close()
     server.unlink()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver_v2", "frameserver_v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
 @pytest.mark.parametrize("cons_num, prod_params, cons_params", [
     # 消费者数, 生产(均值,方差)秒, 消费(均值,方差)秒
     # 场景 1：极速并发（测试锁和调度的最高吞吐争抢）

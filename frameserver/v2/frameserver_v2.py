@@ -19,7 +19,8 @@ from numpy.typing import NDArray
 from typing import Optional, List
 from loguru._logger import Logger # for type hint only
 from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
-from frameserver_v2_types import (FrameTicket, TicketExpireException, 
+
+from .frameserver_v2_types import (FrameTicket, TicketExpireException, 
                                   FSMetadata, _METADATA_VER_HASH, 
                                   MAX_CONSUMERS, MAX_TICKETS, _INT64_MAX)
 
