@@ -20,7 +20,7 @@ from typing import Optional, Tuple, Union, Any, List
 from . import mvsdk_mod as mvsdk
 from .mvsdk_mod import CameraException as MvCamException
 from .extensions.unpack_12bit_raw import unpack_12bit_to_16bit_fast
-from .extensions import PrecisionTimer
+from .extensions import PreciseTimer
 from .extensions.raw_processing_cy_V11 import RawV11Processor
 import warnings
 
@@ -54,21 +54,21 @@ class HuatengCamera(AC):
         return DevList
 
     def __init__(self,
-                 DevInfo: mvsdk.tSdkCameraDevInfo,
+                 dev_info: mvsdk.tSdkCameraDevInfo,
                  fps: Optional[float] = None, # None=freerun
                  bitdepth: BitDepth = BitDepth._8,
                  bayer_pattern: BayerPattern = _BAYER_PATTERN, # For Our ISP?
                  ):
         """Initialize HuatengCamera chosen by DevInfo
         
-        :param DevInfo: mvsdk.tSdkCameraDevInfo object chosen by enumerate_cameras()
+        :param dev_info: mvsdk.tSdkCameraDevInfo object chosen by enumerate_cameras()
         :param fps: Target FPS, If `None`, the camera will run in freerun mode.
         :param hibitdepth: Define the raw bit depth grabbed, affect internal processing.
             0 = 8bit, 1 = 12bit(if possible)
         """
         self._features_enabled = CameraFeatures.TIMECODE | CameraFeatures.GAIN
 
-        self._DevInfo: mvsdk.tSdkCameraDevInfo = DevInfo
+        self._DevInfo: mvsdk.tSdkCameraDevInfo = dev_info
         self._hCamera: int = 0 # Camera handle in sdk.
         self._cap: Optional[mvsdk.tSdkCameraCapbility] = None
         self._pFrameBuffer: Optional[ctypes.c_void_p] = None
@@ -80,7 +80,7 @@ class HuatengCamera(AC):
             self._trigger_mode = TriggerMode.FREERUN
         else:
             self._trigger_mode = TriggerMode.SOFT_TRIGGER
-        self._timer: Optional[PrecisionTimer.PrecisionTimer] = None # PrecisionTimer for SW trigger
+        self._timer: Optional[PreciseTimer.PrecisionTimer] = None # PrecisionTimer for SW trigger
         self._target_fps: Optional[float] = fps
         self._exposure_time_ms: float = _FRAME_TIME
         self._gain: float = _GAIN
@@ -166,7 +166,7 @@ class HuatengCamera(AC):
             mvsdk.CameraSetTriggerMode(hCamera, 1)  # 软件触发
             mvsdk.CameraSetTriggerCount(hCamera, 1) # 每次触发1帧
             interval_s = 1.0 / self._target_fps
-            self._timer = PrecisionTimer.PrecisionTimer(
+            self._timer = PreciseTimer.PrecisionTimer(
                 interval_s=interval_s,
                 c_trigger_func=mvsdk._sdk.CameraSoftTrigger,
                 hCamera=hCamera,
