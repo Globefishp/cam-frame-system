@@ -41,6 +41,9 @@ import time
 from typing import Optional, Tuple, Union, Any, TypeVar, ParamSpec, Concatenate, Callable, cast
 from enum import IntFlag
 
+from loguru import logger as file_logger
+from loguru._logger import Logger # for type hint only
+
 # for @require_open
 from functools import wraps
 F = TypeVar('F', bound=Callable[..., Any])
@@ -97,11 +100,24 @@ class AbstractCamera(ABC):
             )
     
     @abstractmethod
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, inject_logger: Logger, **kwargs):
+        """
+        Init the camera with optional logger injection. Whether it is used 
+        depends on subclass implementation. If needed, call 
+        `super().__init__(inject_logger=logger)`
+        """
         # args and kwargs should be as less as possible.
         # Here may pass in some camera specific parameters. The caller may use
         # isinstance to decide pass what parameters.
-        pass
+        self._logger: Logger
+        if inject_logger is not None:
+            if isinstance(inject_logger, Logger):
+                self._logger = inject_logger
+            else:
+                raise TypeError("inject_logger must be a loguru.Logger instance.")
+        else:
+            self._logger = file_logger
+        super().__init__(*args, **kwargs)
 
     # === Camera Obj Lifecycle Management ===
     @abstractmethod

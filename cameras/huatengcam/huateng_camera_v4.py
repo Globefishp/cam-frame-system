@@ -27,9 +27,12 @@ import warnings
 from ..abstractcamera import AbstractCamera as AC
 from ..abstractcamera import CameraFeatures  # 引入您的基类和枚举
 from .huatengcam_types import HuatengSDKException, TriggerMode, BitDepth, BayerPattern
-from loguru import logger
+
+from loguru import logger as file_logger
+from loguru._logger import Logger # for type hint only
 
 NDArray = np.ndarray
+_UINT16_HIGHBYTE = 1 if sys.byteorder == 'little' else 0
 
 # Default values
 _FRAME_TIME = 10
@@ -50,7 +53,7 @@ class HuatengCamera(AC):
     def enumerate_cameras() -> List[mvsdk.tSdkCameraDevInfo]:
         """Enumerate Huateng Cameras by mvsdk.CameraEnumerateDevice()"""
         DevList: List[mvsdk.tSdkCameraDevInfo] = mvsdk.CameraEnumerateDevice()
-        logger.info(f"Enumerated {len(DevList)} cameras.")
+        # logger.info(f"Enumerated {len(DevList)} cameras.") # No suitable logger instance here...
         return DevList
 
     def __init__(self,
@@ -58,14 +61,19 @@ class HuatengCamera(AC):
                  fps: Optional[float] = None, # None=freerun
                  bitdepth: BitDepth = BitDepth._8,
                  bayer_pattern: BayerPattern = _BAYER_PATTERN, # For Our ISP?
+                 inject_logger: Optional[Logger] = None,
                  ):
         """Initialize HuatengCamera chosen by DevInfo
         
         :param dev_info: mvsdk.tSdkCameraDevInfo object chosen by enumerate_cameras()
         :param fps: Target FPS, If `None`, the camera will run in freerun mode.
-        :param hibitdepth: Define the raw bit depth grabbed, affect internal processing.
-            0 = 8bit, 1 = 12bit(if possible)
+        :param bitdepth: Define the raw bit depth grabbed, affect internal processing.
+        :param bayer_pattern: Bayer pattern for specified camera. TODO: auto detect?
+        :param inject_logger: Injected loguru.Logger instance for logging.
         """
+        super().__init__(inject_logger=inject_logger)
+        self._logger = self._logger.bind(friendly_name="HuatengCamera")
+
         self._features_enabled = CameraFeatures.TIMECODE | CameraFeatures.GAIN
 
         self._DevInfo: mvsdk.tSdkCameraDevInfo = dev_info
@@ -119,6 +127,7 @@ class HuatengCamera(AC):
         :return: True if success.
         :raises HuatengSDKException: when failed.
         """
+        logger = self._logger
         if self.is_opened():
             return True
         logger.info(f"Opening camera {self._DevInfo.GetFriendlyName()} ({self._DevInfo.GetProductName()})")
@@ -189,6 +198,7 @@ class HuatengCamera(AC):
         return True
     def _init_raw_processor(self):
         # Initialize Hibitdepth Raw Processor
+        logger = self._logger
         if self._correction_path.exists():
             correction_info = np.load(self._correction_path, allow_pickle=True).item()
         else:
@@ -207,6 +217,7 @@ class HuatengCamera(AC):
         )
 
     def close(self) -> bool:
+        logger = self._logger
         if not self.is_opened():
             return True
         if self._timer is not None:
@@ -238,6 +249,7 @@ class HuatengCamera(AC):
         # Buffer allocation
         # always preserve extra rows regardless of TIMECODE enable.
         # 分配的空间总是有余量, 按照RGB+extra line来分配, 对于raw的话extra info实际上用不了3通道. 
+        logger = self._logger
         try:
             self._pFrameBuffer = mvsdk.CameraAlignMalloc(self.frame_size_bytes, 16)
 
@@ -251,6 +263,7 @@ class HuatengCamera(AC):
     
     @AC.require_open
     def stop_capture(self) -> bool:
+        logger = self._logger
         try:
             mvsdk.CameraStop(self._hCamera)
         except MvCamException as e:
@@ -328,6 +341,7 @@ class HuatengCamera(AC):
     def exposure_time_ms(self, exposure_ms: float):
         """Set the exposure time in ms, if the camera is not opened, 
         cache the setting value for new default."""
+        logger = self._logger
         self._exposure_time_ms = exposure_ms
         if self.is_opened():
             mvsdk.CameraSetExposureTime(self._hCamera, exposure_ms * 1000)
@@ -354,6 +368,7 @@ class HuatengCamera(AC):
     def gain(self, gain: float):
         """Set the analog gain, if the camera is not opened, 
         cache the setting value for new default."""
+        logger = self._logger
         self._gain = gain
         if self.is_opened():
             mvsdk.CameraSetAnalogGainX(self._hCamera, gain)
@@ -422,7 +437,7 @@ class HuatengCamera(AC):
             if e.error_code != mvsdk.CAMERA_STATUS_TIME_OUT:
                 raise HuatengSDKException(e, "Failed to grab frame", extra_info="HuatengCamera.grab_metadata") from e
             else:
-                logger.warning(f"Timeout to grab frame ({self._frames_captured + 1}).")
+                self._logger.warning(f"Timeout to grab frame ({self._frames_captured + 1}).")
                 return None, None
         
         self._frames_captured += 1
@@ -433,11 +448,17 @@ class HuatengCamera(AC):
         frame = self.grab_raw()
         if frame is None: return None
         frame = self._processor.process(frame)
-        return frame
+
+        if self._bit_depth == BitDepth._12: 
+            return frame 
+        else: 
+            # not continuous, zero-copy.
+            return frame.view(np.uint8)[..., _UINT16_HIGHBYTE::2] 
 
 
     def grab_raw(self) -> Optional[np.ndarray]:
         frame, _ = self._grab_extendedbuf_metadata()
+        if frame is None: return None
         frame = self.strip_extended_info(frame)
         return frame
 
