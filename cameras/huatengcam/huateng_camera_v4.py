@@ -37,7 +37,7 @@ _UINT16_HIGHBYTE = 1 if sys.byteorder == 'little' else 0
 # Default values
 _FRAME_TIME = 10
 _GAIN = 1.0
-_BAYER_PATTERN = BayerPattern.BGGR
+_BAYER_PATTERN = BayerPattern.RGGB
 _HUATENGCAM_CURR_DIR = Path(__file__).resolve().parent
 _DEFAULT_CORRECTION_PATH: Path = _HUATENGCAM_CURR_DIR / "corrections/correction_results_D50_250805.npy"
 
@@ -199,16 +199,29 @@ class HuatengCamera(AC):
     def _init_raw_processor(self):
         # Initialize Hibitdepth Raw Processor
         logger = self._logger
+        default_correction = False
         if self._correction_path.exists():
             correction_info = np.load(self._correction_path, allow_pickle=True).item()
+            print(correction_info)
         else:
+            default_correction = True
             logger.warning(f"Color correction file not found: {self._correction_path}, "
                            "color correction disabled.")
-            correction_info['wb_params'] = np.array((1,1,1,0,0,0), dtype=np.float64)
+        if (correction_info["ADC_MAX_LEVEL"] < 255 and self._bit_depth == BitDepth._12) or \
+           (correction_info["ADC_MAX_LEVEL"] > 255 and self._bit_depth == BitDepth._8):
+            default_correction = True
+            logger.warning(f"Correction file ADC max level ({correction_info['ADC_MAX_LEVEL']}) "
+                f"mismatches with current bitdepth settings {self._bit_depth}, "
+                "color correction disabled.")
+        if default_correction:
+            correction_info['BLC'] = 32 if self._bit_depth == BitDepth._12 else 2
+            correction_info['ADC_MAX_LEVEL'] = 4094 if self._bit_depth == BitDepth._12 else 255
+            correction_info['wb_params'] = (1,1,1,0,0,0)
             correction_info['fwd_mtx'] = np.eye(3, dtype=np.float64)
         self._processor = RawV11Processor(
-            self.height, self.width, black_level=32,
-            ADC_max_level=4094 if self._bit_depth == BitDepth._12 else 255,
+            self.height, self.width, 
+            black_level=correction_info["BLC"],
+            ADC_max_level=correction_info["ADC_MAX_LEVEL"],
             bayer_pattern='BGGR' if self._bayer_pattern == BayerPattern.BGGR else 'RGGB',
             wb_params=correction_info['wb_params'],
             fwd_mtx=correction_info['fwd_mtx'],
@@ -609,12 +622,41 @@ if __name__ == '__main__':
     try:
         cam.start_capture()
         frame = cam.grab()
+        print(frame.shape, np.max(frame))
+        cv2.imshow("frame", frame[1024:, :])
+        cv2.waitKey(0)
+        frame = frame.view(np.uint8)[..., _UINT16_HIGHBYTE::2] 
+        print(frame.shape, np.max(frame))
         cv2.imshow("frame", frame[1024:, :])
         cv2.waitKey(0)
         frame = cam.grab_raw()
         print(frame.shape, np.max(frame))
         cv2.imshow("frame", frame[1024:, :]*16)
         cv2.waitKey(0)
+
+        cam.stop_capture()
+        cam.close()
+        cam = HuatengCamera(cam_enum[0], fps=None, bitdepth=BitDepth._8)
+        cam.open()
+        cam.exposure_time_ms = 10; cam.gain = 4
+        cam.start_capture()
+    
+        frame = cam.grab_raw()
+        print(frame.shape, np.max(frame), np.min(frame))
+        cv2.imshow("frame", frame[1024:, :])
+        cv2.waitKey(0)
+        frame = cam.grab()
+        print(frame.shape, np.max(frame))
+        cv2.imshow("frame", frame[1024:, :])
+        cv2.waitKey(0)
+
+        cam.stop_capture()
+        cam.close()
+        cam = HuatengCamera(cam_enum[0], fps=None, bitdepth=BitDepth._12)
+        cam.open()
+        cam.exposure_time_ms = 10; cam.gain = 4
+        cam.start_capture()
+
         frame, timecode = cam.grab_metadata()
         print(timecode)
         cv2.imshow("frame", frame[1024:, :]*16)
