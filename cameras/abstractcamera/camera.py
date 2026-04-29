@@ -109,8 +109,8 @@ class AbstractCamera(ABC):
         """
         Open the camera and initialize resources. Blocking method.
 
-        Will raise if unrecoverable error occurs.
         :return: True if success, False if any warning occurs.
+        :raise CamException: if unrecoverable error occurs.
         """
         pass
     
@@ -124,6 +124,7 @@ class AbstractCamera(ABC):
         capturing when opened.
 
         :return: True if success, False if any warning occurs.
+        :raise CamException: if unrecoverable error occurs.
         """
         pass
     
@@ -142,6 +143,7 @@ class AbstractCamera(ABC):
         Stop capturing frames.
 
         :return: True if success, False if any warning occurs.
+        :raise CamException: if unrecoverable error occurs.
         """
         pass
 
@@ -175,8 +177,8 @@ class AbstractCamera(ABC):
         """
         Close the camera and release resources. Blocking method.
 
-        Will raise if unrecoverable error occurs.
         :return: True if success, False if any warning occurs.
+        :raise CamException: if unrecoverable error occurs.
         """
         pass
 
@@ -548,7 +550,8 @@ class AbstractCamera(ABC):
         Make sure this method(function) is serializable.
         """
         return image[:-extra_lines, ...]
-        
+
+# TODO: use frozen=True to have clearer immutable semantics?
 class ExtInfoExtractor:
     """
     A universal extended info extractor that allows extracting subclass defined

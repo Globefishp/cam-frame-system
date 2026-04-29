@@ -234,7 +234,7 @@ class HuatengCamera(AC):
             return False
     
     @AC.require_open
-    def start_capture(self):
+    def start_capture(self) -> bool:
         # Buffer allocation
         # always preserve extra rows regardless of TIMECODE enable.
         # 分配的空间总是有余量, 按照RGB+extra line来分配, 对于raw的话extra info实际上用不了3通道. 
@@ -247,15 +247,17 @@ class HuatengCamera(AC):
             raise HuatengSDKException(e, src_func="HuatengCamera.start_capture") from e
         self._is_capturing = True
         logger.info(f"Camera {self._DevInfo.GetProductName()} started capturing.")
+        return True
     
     @AC.require_open
-    def stop_capture(self):
+    def stop_capture(self) -> bool:
         try:
             mvsdk.CameraStop(self._hCamera)
         except MvCamException as e:
             raise HuatengSDKException(e, src_func="HuatengCamera.stop_capture") from e
         self._is_capturing = False
         logger.info(f"Camera {self._DevInfo.GetProductName()} stopped capturing.")
+        return True
     
     def is_capturing(self) -> bool:
         return self._is_capturing
