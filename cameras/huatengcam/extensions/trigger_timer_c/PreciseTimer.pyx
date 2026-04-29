@@ -1,4 +1,4 @@
-# file: PrecisionTimer.pyx
+# file: PreciseTimer.pyx
 import ctypes
 
 # Import the C declarations from our header file
@@ -22,7 +22,7 @@ cdef extern from "timer_core.h":
     void timer_core_destroy(TimerState* state)
 
 # The Python-facing class
-cdef class PrecisionTimer:
+cdef class PreciseTimer:
     cdef TimerState* state  # Pointer to our C state object
     cdef public bint is_running
 

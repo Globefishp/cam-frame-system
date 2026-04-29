@@ -15,9 +15,9 @@ else: # Linux, macOS, etc.
 
 extensions = [
     Extension(
-        "PrecisionTimer",
+        "PreciseTimer",
         sources=[
-            "PrecisionTimer.pyx",
+            "PreciseTimer.pyx",
             "timer_core.c"
         ],
         libraries=["Winmm"] if platform.system() == "Windows" else [],
@@ -29,6 +29,6 @@ extensions = [
 setup(
     ext_modules=cythonize(extensions),
     package_data={
-        "PrecisionTimer": ["*.pyi"],
+        "PreciseTimer": ["*.pyi"],
     }
 )

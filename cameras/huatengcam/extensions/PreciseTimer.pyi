@@ -3,7 +3,7 @@
 
 from typing import Any, Callable
 
-class PrecisionTimer:
+class PreciseTimer:
     """
     A high-precision timer that uses a dedicated C-level thread to trigger
     a callback function at a specified interval.
@@ -22,8 +22,7 @@ class PrecisionTimer:
         c_trigger_func: Callable[[int], None] | Any,
         hCamera: int,
         busy_wait_us: int = 2000,
-        priority: int = 0,
-        debug_print: bool = False
+        priority: int = 0
     ) -> None:
         """
         Initializes the high-precision timer.
@@ -32,12 +31,11 @@ class PrecisionTimer:
         ----------
         interval_s : float
             The desired time interval between triggers, in seconds.
-        c_trigger_func : ctypes function object
+        c_trigger_func : ctypes function object or similar
             The C-level trigger function to call. This should be a function
-            pointer from a loaded library, e.g. function object from 
-            `C.windll.LoadLibrary()`. The expected signature is 
-            `int trigger_func(HANDLE hCamera, uint16_t*)`.
-        hCamera : ctypes.c_void_p
+            pointer from a loaded library, e.g., `mvsdk._sdk.CameraSoftTrigger`.
+            The expected signature is `void(int)`.
+        hCamera : int
             The integer handle to the camera, which will be passed to the
             trigger function.
         busy_wait_us : int, optional
@@ -52,9 +50,6 @@ class PrecisionTimer:
             - 1: Above Normal
             - 2: Highest
             - 3: Time Critical (use with caution, can affect system stability)
-        debug_print : bool, optional
-            Whether to print c-level debug messages to stdout.
-            Default is False.
         """
         ...
 

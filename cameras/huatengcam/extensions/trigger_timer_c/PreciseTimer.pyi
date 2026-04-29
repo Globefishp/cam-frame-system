@@ -3,7 +3,7 @@
 
 from typing import Any, Callable
 
-class PrecisionTimer:
+class PreciseTimer:
     """
     A high-precision timer that uses a dedicated C-level thread to trigger
     a callback function at a specified interval.

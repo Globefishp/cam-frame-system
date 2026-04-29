@@ -166,7 +166,7 @@ class HuatengCamera(AC):
             mvsdk.CameraSetTriggerMode(hCamera, 1)  # 软件触发
             mvsdk.CameraSetTriggerCount(hCamera, 1) # 每次触发1帧
             interval_s = 1.0 / self._target_fps
-            self._timer = PreciseTimer.PrecisionTimer(
+            self._timer = PreciseTimer.PreciseTimer(
                 interval_s=interval_s,
                 c_trigger_func=mvsdk._sdk.CameraSoftTrigger,
                 hCamera=hCamera,
