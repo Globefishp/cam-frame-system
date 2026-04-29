@@ -1,11 +1,14 @@
 # utils/mp_obj_proxy.py
 # Author: Google Gemini 3.1 pro, modified & cleanup by Haiyun Huang (260406)
 
+from inspect import getattr_static
 import threading
 import multiprocessing as mp
 from multiprocessing.connection import Connection
 import inspect
-from typing import Any, Tuple, Type, Optional, Set, Callable
+from typing import Any, Tuple, Dict, Type, Optional, Set, Callable
+
+HAS_GETMEMBERS_STATIC = hasattr(inspect, 'getmembers_static')
 
 class MpObjProxy:
     """
@@ -17,6 +20,10 @@ class MpObjProxy:
     Limitations: 
         - Multi-processing must in spawn mode: mp.set_start_method('spawn', force=True)
         - Only allow one to one RPC; 
+        - Properties/methods dynamically created after `__init__` will not be 
+          proxied automatically. Use `mp_rescan` to update member cache (see below)
+          Properties not in `dict` (i.e. `__getattr__` or `__getattribute__`) cannot
+          be detected.
         - returned property object is a copy, not sync'ed with the remote object.
           So any access to `self.obj.obj_value` should be forwarded by 
           `@property self.fwd_obj_value` or using `mp_eval` (see below)
@@ -44,7 +51,9 @@ class MpObjProxy:
             - _pxy_<name>_ are reversed names by proxy;
             - returned properties are copies, not sync'ed with the remote object.
               using `mp_eval` to do complex things.
-
+        
+        # 7. If any methods change the member list of target_obj, call mp_rescan()
+             to let new/deleted members be proxied/unproxied.
     """
 
     def __init__(self, target_cls: Type, *args, **kwargs):
@@ -144,6 +153,15 @@ class MpObjProxy:
         :return: Any serializable object from RPC pipe.
         """
         return self._ipc_send_and_wait("eval", "mp_eval", args=(stmt,), kwargs=kwargs)
+    
+    def mp_rescan(self) -> None:
+        """
+        Rescan the target object, update properties and methods list.
+        Useful when dynamically added/removed attributes in target object.
+        """
+        payload = self._ipc_send_and_wait("rescan", "mp_rescan")
+        self._pxy_remote_methods_ = payload["methods"]
+        self._pxy_remote_properties_ = payload["properties"]
 
     # === Subprocess ===
     def __call__(self) -> Tuple[Any, threading.Lock]:
@@ -166,32 +184,67 @@ class MpObjProxy:
         self.__dict__['_pxy_rpc_lock_'] = threading.Lock()
         self._pxy_shutdown_event_ = threading.Event()
 
-        # Introspection (Methods vs Properties/Fields)
-        methods = set()
-        properties = set()
+        # Introspection and send categorized member names back to Main Process
+        payload = self._inspect_target_obj()
 
-        for name, _ in inspect.getmembers(self._pxy_target_obj_):
-            if name.startswith('__'):  # Ignore magic methods.
-                continue
-                
-            # inspect.isroutine safely captures methods, functions, staticmethods, and C-builtins, 
-            # avoiding misclassifying object with __call__.
-            if inspect.isroutine(getattr(self._pxy_target_obj_, name)):
-                methods.add(name)
-            else:
-                properties.add(name)
-
-        # Send introspection map back to Main Process
-        payload = {
-            "methods": methods,
-            "properties": properties
-        }
         self._pxy_init_tx_.send(payload)
         self._pxy_init_tx_.close() # Close init_tx as it's no longer needed
         del self._pxy_init_tx_
 
         self._pxy_is_ready_ = True
         return self._pxy_target_obj_, self._pxy_rpc_lock_
+
+    if HAS_GETMEMBERS_STATIC:
+        def _inspect_target_obj(self) -> Dict[str, Set[str]]:
+            """
+            Internal helper for introspecting the target object by categorizing into
+            methods (evoke `__call__`) and properties (evoke `getattr`/`setattr`).
+            Python 3.11+
+            """
+            methods = set()
+            properties = set()
+
+            for name, static_member in inspect.getmembers_static(self._pxy_target_obj_):
+                # getmembers_static won't exec user code that may raise.
+                if name.startswith('__'):  # Ignore magic methods.
+                    continue
+                    
+                # inspect.isroutine safely captures methods, functions, staticmethods, and C-builtins, 
+                # avoiding misclassifying object with __call__.
+                if inspect.isroutine(static_member):
+                    methods.add(name)
+                else:
+                    properties.add(name)
+
+            return {"methods": methods, "properties": properties}
+    else:
+        def _inspect_target_obj(self) -> Dict[str, Set[str]]:
+            """
+            Internal helper for introspecting the target object by categorizing into
+            methods (evoke `__call__`) and properties (evoke `getattr`/`setattr`).
+            Python 3.2+
+            """
+            methods = set()
+            properties = set()
+
+            for name in dir(self._pxy_target_obj_): 
+                # `inspect.getmembers` will use `getattr`, which will trigger getter 
+                # function execution for a property. If it raise an error, inspection
+                # will fail. `dir` is a workaround.
+                if name.startswith('__'):  # Ignore magic methods.
+                    continue
+                
+                # `getattr_static` will not invoke descriptor.__get__, thus won't raise.
+                static_member = getattr_static(self._pxy_target_obj_, name)
+                    
+                # inspect.isroutine safely captures methods, functions, staticmethods, and C-builtins, 
+                # avoiding misclassifying object with __call__.
+                if inspect.isroutine(static_member):
+                    methods.add(name)
+                else:
+                    properties.add(name)
+
+            return {"methods": methods, "properties": properties}
 
     def mp_rpc_service_step(self, block: bool = True) -> bool:
         """
@@ -229,6 +282,9 @@ class MpObjProxy:
                     env.update(kwargs)
                     res = eval(args[0], {}, env) # eval(expr, globals, locals)
                     self._pxy_owner_tx_.send((True, res))
+                elif action == "rescan":
+                    payload = self._inspect_target_obj()
+                    self._pxy_owner_tx_.send((True, payload))
                 else:
                     self._pxy_owner_tx_.send((False, RuntimeError(f"Unknown Action: {action}")))
             except Exception as e:
@@ -294,6 +350,9 @@ class MpObjProxy:
                 
             if name in self.__dict__.get('_pxy_remote_methods_', set()):
                 return _RemoteMethodCallable(name, self)
+
+            #TODO: if not found, could be dynamically created in remote object,
+            # re-inspect and try again? or directly fwd to remote and wait for error?
 
         raise AttributeError(f"Remote object '{self._pxy_cls_.__name__}' has no public attribute '{name}'")
 
