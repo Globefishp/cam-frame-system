@@ -61,6 +61,8 @@ class HuatengCamera(AC):
                  fps: Optional[float] = None, # None=freerun
                  bitdepth: BitDepth = BitDepth._8,
                  bayer_pattern: BayerPattern = _BAYER_PATTERN, # For Our ISP?
+                 exposure_time_ms: float = _FRAME_TIME,
+                 gain: float = _GAIN,
                  inject_logger: Optional[Logger] = None,
                  ):
         """Initialize HuatengCamera chosen by DevInfo
@@ -90,8 +92,8 @@ class HuatengCamera(AC):
             self._trigger_mode = TriggerMode.SOFT_TRIGGER
         self._timer: Optional[PreciseTimer.PrecisionTimer] = None # PrecisionTimer for SW trigger
         self._target_fps: Optional[float] = fps
-        self._exposure_time_ms: float = _FRAME_TIME
-        self._gain: float = _GAIN
+        self._exposure_time_ms: float = exposure_time_ms
+        self._gain: float = gain
 
         self._image_width: Optional[int] = None
         self._image_height: Optional[int] = None
@@ -202,7 +204,6 @@ class HuatengCamera(AC):
         default_correction = False
         if self._correction_path.exists():
             correction_info = np.load(self._correction_path, allow_pickle=True).item()
-            print(correction_info)
         else:
             default_correction = True
             logger.warning(f"Color correction file not found: {self._correction_path}, "
