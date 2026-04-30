@@ -138,7 +138,7 @@ class ProcessSafeSharedRingBuffer:
             self._logger = None
         logger = self._logger
 
-        self._gc_func: Optional[Callable[[], None]] = None
+        self._gc_func: Optional[Callable[[int], None]] = None
         
         # Initialize attributes to None or default values, will be set properly later
         self._buffer_capacity: int = 0
@@ -398,9 +398,9 @@ class ProcessSafeSharedRingBuffer:
         
         # Check remaining space outside lock (cover most calls) and trigger GC if needed.
         put_frame_num = frames.shape[0]
-        if self._metadata_ctypes.occupied_count + put_frame_num > self._buffer_capacity:
-            if self._gc_func is not None:
-                self._gc_func()
+        overflow_num = self._metadata_ctypes.occupied_count + put_frame_num - self._buffer_capacity
+        if overflow_num > 0 and self._gc_func is not None:
+            self._gc_func(overflow_num)
         # Reading metadata requires the lock for consistency
         with self._pointer_lock: # Acquire lock for metadata access and synchronization
             # Always use occupied_count to determine if the buffer state, not read_ptr and write_ptr
@@ -600,10 +600,10 @@ class ProcessSafeSharedRingBuffer:
         return actual_release
 
     @property
-    def trigger_release(self):
+    def trigger_release(self) -> Optional[Callable[[int], None]]:
         return self._gc_func
     @trigger_release.setter
-    def trigger_release(self, gc_func: Callable):
+    def trigger_release(self, gc_func: Callable[[int], None]):
         self._gc_func = gc_func
 
     @overload

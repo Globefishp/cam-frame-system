@@ -570,3 +570,91 @@ def test_fs_stochastic_stress(empty_buffer, fs_module_name, cons_num, prod_param
     for cid in cids: server.unregister_consumer(cid)
     server.close()
     server.unlink()
+
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
+def test_fs_no_consumer_async_read(small_buffer, fs_module_name):
+    """
+    Test scenario: No consumers registered, producer keeps putting frames, 
+    and consumer only uses get_async. Buffer should not block producer, 
+    and get_async should continuously get the latest frames.
+    """
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=True, ring_buffer=small_buffer)
+    small_buffer.trigger_release = server._gc
+    
+    # Capacity is 5. We push 10 frames.
+    # Since there are no consumers, it should auto-gc the oldest frames
+    # and NOT block.
+    for i in range(10):
+        # put 1 frame at a time
+        success = small_buffer.put(np.full((1, 2, 2, 3), i, dtype=np.uint32), timeout=0.1)
+        assert success is True, f"Producer blocked at frame {i}"
+        
+        # Async reader checks the latest frame
+        ticket = server.get_async(1)
+        assert ticket is not None
+        assert ticket.head_id == i
+        
+        data_list = server.get_from_ticket(ticket)
+        assert data_list[0][0, 0, 0, 0] == i
+
+    # Batch push testing
+    success = small_buffer.put(np.full((3, 2, 2, 3), 99, dtype=np.uint32), timeout=0.1)
+    assert success is True, "Producer blocked on batch put"
+    
+    # Async reader checks the latest 3 frames
+    ticket = server.get_async(3)
+    assert ticket is not None
+    data_list = server.get_from_ticket(ticket)
+    last_chunk = data_list[-1]
+    assert last_chunk[-1, 0, 0, 0] == 99
+
+    server.close()
+    server.unlink()
+
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
+def test_fs_rw_during_registration(small_buffer, fs_module_name):
+    """
+    Test scenario: Consumer registered as historical_data=True should block 
+    the producer as oldest frames now cannot be overwritten. historical_data=
+    False should not block.
+    """
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=True, ring_buffer=small_buffer)
+    small_buffer.trigger_release = server._gc
+
+    # Fill the buffer
+    for i in range(5):
+        success = small_buffer.put(np.full((1, 2, 2, 3), i, dtype=np.uint32), timeout=0.1)
+        assert success is True, f"Producer blocked at frame {i}"
+    # Once a consumer registered with historical data, the oldest frame is locked.
+    cid = server.register_consumer(historical_data=True)
+    success = small_buffer.put(np.full((1, 2, 2, 3), 100, dtype=np.uint32), timeout=0.1)
+    assert success is False, "Producer do not block after a consumer locked historical data."
+    ticket = server.get_async(1)
+    data_list = server.get_from_ticket(ticket)
+    assert data_list[0][0, 0, 0, 0] == 4
+    ticket = server.get_sync(cid, 1)
+    data_list = server.get_from_ticket(ticket)
+    assert data_list[0][0, 0, 0, 0] == 0
+
+    server.unregister_consumer(cid)
+    ticket = server.get_async(1)
+    data_list = server.get_from_ticket(ticket)
+    assert data_list[0][0, 0, 0, 0] == 4
+
+    # If a consumer do not lock historical data, producer should not block.
+    cid = server.register_consumer(historical_data=False)
+    success = small_buffer.put(np.full((1, 2, 2, 3), 101, dtype=np.uint32), timeout=0.1) # overwrite #0
+    assert success is True, "Producer blocked after a consumer register without historical data."
+    ticket = server.get_async(1)
+    data_list = server.get_from_ticket(ticket)
+    assert data_list[0][0, 0, 0, 0] == 101
+    ticket = server.get_sync(cid,1)
+    data_list = server.get_from_ticket(ticket)
+    assert data_list[0][0, 0, 0, 0] == 101
+    server.release_sync(cid ,ticket)
+    server.unregister_consumer(cid)
+
+    server.close()
+    server.unlink()

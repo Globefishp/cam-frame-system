@@ -424,6 +424,8 @@ class FrameServer:
         if not (0 <= cid < MAX_CONSUMERS):
             raise ValueError(f"Invalid consumer id: {cid}")
         with self._reg_lock:
+            # if cid is the last consumer, no need for gc, to align with previous logics
+            need_gc = (self._c_enable_mask.sum() > 1)
             with self._cid_locks[cid]:
                 if self._c_enable_mask[cid] == True:
                     self._c_enable_mask[cid] = False
@@ -434,7 +436,7 @@ class FrameServer:
                 else:
                     if logger: logger.debug(f"Consumer {cid} is already unregistered.")
 
-        self._gc()
+        if need_gc: self._gc()
 
     def get_sync(self, cid: int, size: int, timeout: Optional[float] = None) -> Optional[FrameTicket]:
         """
@@ -566,15 +568,19 @@ class FrameServer:
             
         self._gc() # avoid unnecessary lock nesting
 
-    def _gc(self) -> int:
+    def _gc(self, request_num: int = _UINT64_MAX) -> int:
         """
         GC function scans the FrameServer metadata and release the expired data 
         from the RingBuffer.
         `_gc()` will acquire `_gc_locks[self.buf_id]`, please avoid unnecessary 
         lock nesting to prevent dead lock.
 
+        Args:
+            request_num (int): number of frames request to release, default is
+                _UINT64_MAX which will release as much frames as possible.
+
         Returns:
-            release_num (int): number of the oldest frames released.
+            released_num (int): number of the oldest frames actually released.
         """
         # _gc() maintains the coupling of buffer release state and write fs_oldest_frame_id.
         logger = self._logger
@@ -593,11 +599,12 @@ class FrameServer:
         if not self._gc_locks[self.buf_id].acquire(block=False):
             return 0 # Let next gc to do works.
 
-        # Has consumers, and has something to release.
         try:
-            if global_occupied_from_id != _UINT64_MAX and global_occupied_from_id > self._rb_oldest_frame_ids[self.buf_id]:
-                to_release = global_occupied_from_id - self._rb_oldest_frame_ids[self.buf_id]
-                release_num = self.buffer.release(to_release)
+            # Has something to release.
+            if global_occupied_from_id > self._rb_oldest_frame_ids[self.buf_id]:
+                # If no active consumer, can_release will be very large, near _UINT64_MAX
+                can_release = global_occupied_from_id - self._rb_oldest_frame_ids[self.buf_id]
+                release_num = self.buffer.release(min(can_release, request_num))
                 # Maintain the couple of FS metadata and buffer status.
                 self._rb_oldest_frame_ids[self.buf_id] += release_num 
                 return release_num
