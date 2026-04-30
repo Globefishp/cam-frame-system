@@ -323,7 +323,7 @@ class FrameServer:
                         self._tickets_arr[cid, available_ticket_slot] = next_frame_id
                         self._next_frame_ids[cid] = next_frame_id + size
                     
-                        return FrameTicket(head_id=int(next_frame_id), size=size)
+                        return FrameTicket(head_id=int(next_frame_id), size=size, cid=cid)
                 else:
                     insufficient_tickets = True
 
@@ -357,28 +357,31 @@ class FrameServer:
                                      len(data) can be 1 or 2.
         
         Raises:
-            TicketExpireException: If the ticket is invalid or expired.
+            TicketExpireException: If the ticket is from a registered consumer 
+                and is expired (released).
         """
-        if ticket.head_id < self._metadata.fs_oldest_frame_id:
+        if ticket.cid >= 0 and ticket.head_id < self._metadata.fs_oldest_frame_id:
             raise TicketExpireException(ticket, self._metadata.fs_oldest_frame_id)
         
         relative_ptr = (ticket.head_id + self._metadata.rb_offset) % self.buffer.buffer_capacity
         return self.buffer.read_from(relative_ptr, ticket.size)
 
-    def release_sync(self, cid: int, ticket: FrameTicket):
+    def release_sync(self, ticket: FrameTicket):
         """
-        Release a ticket for a named consumer. Currently will also trigger GC.
-        Do nothing if a ticket is already released or consumer is unregistered.
+        Release the ticket acquired from a named consumer. Currently will also 
+        trigger GC. Do nothing if a ticket is already released or consumer is 
+        unregistered.
 
         Args:
-            cid (int): consumer id.
-            ticket (FrameTicket): The ticket to release.
+            ticket (FrameTicket): The ticket acquired from a named consumer to 
+                release.
         
         Raises:
-            ValueError: If the consumer id is invalid.
+            ValueError: If the ticket is from `get_async` or has invalid cid.
         """
+        cid = ticket.cid
         if not (0 <= cid < MAX_CONSUMERS):
-            raise ValueError(f"Invalid consumer id: {cid}")
+            raise ValueError(f"Invalid ticket with consumer id: {cid}")
 
         with self._cid_locks[cid]:
             match_idx = np.where(self._tickets_arr[cid] == ticket.head_id)[0]
@@ -431,7 +434,11 @@ class FrameServer:
 
     def get_async(self, size: int) -> Optional[FrameTicket]:
         """
-        Get the latest `size` frames from the buffer.
+        Get the latest `size` frames from the buffer. Due to TOCTOU, when 
+        `get_from_ticket` is called to get data view, it may not be the newest
+        and may be corrupted or overwritten by producer. Thus this is a 
+        dirty-read API. If data integrity should be guaranteed, use 
+        `get_async_copy` instead.
 
         Returns:
             Optional[FrameTicket]: The ticket for the latest `size` frames, 
@@ -444,7 +451,7 @@ class FrameServer:
             buffer_frontier_id = self._metadata.fs_oldest_frame_id + self.buffer.occupied_count_
         
         head_id = buffer_frontier_id - size
-        return FrameTicket(head_id=head_id, size=size)
+        return FrameTicket(head_id=head_id, size=size, cid=-1)
 
     def get_async_copy(self, size: int) -> Optional[List[NDArray]]:
         """

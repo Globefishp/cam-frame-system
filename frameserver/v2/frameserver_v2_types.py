@@ -13,6 +13,7 @@ class FrameTicket:
     """
     head_id: np.int64  # The global index maintained by FrameServer
     size: int          # The continuous frames to get started from head_id.
+    cid: int           # The id of which consumer this ticket belongs to. -1 = issued by `get_async`.
 
 class TicketExpireException(Exception):
     """Ticket is expired."""

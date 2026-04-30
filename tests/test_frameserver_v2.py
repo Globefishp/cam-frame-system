@@ -71,7 +71,7 @@ def __basic_use_consumer(fs_module_name, server_master, use_linked_fs, result_qu
             val = int(data_list[0][0, 0, 0, 0])
             collected.append(val)
             
-            server.release_sync(cid, ticket)
+            server.release_sync(ticket)
             
         server.unregister_consumer(cid)
             
@@ -145,7 +145,7 @@ def __unified_consumer_worker(fs_module_name, fs_obj, cid, stop_event, fetch_siz
                 __spin_delay(load_time)
                 
                 tickets.append((ticket.head_id, ts))
-                server.release_sync(cid, ticket)
+                server.release_sync(ticket)
         result_queue.put(tickets)
     except Exception as e:
         result_queue.put(e)
@@ -289,7 +289,7 @@ def test_fs_pipeline_backpressure(small_buffer, fs_module_name):
     # Fast consumer gets and releases all 5
     for _ in range(5):
         t = server.get_sync(cid_fast, 1)
-        server.release_sync(cid_fast, t)
+        server.release_sync(t)
         
     # Slow consumer gets them but DOES NOT release
     tickets_slow = []
@@ -304,7 +304,7 @@ def test_fs_pipeline_backpressure(small_buffer, fs_module_name):
     assert server.get_sync(cid_fast, 1, timeout=0.1) is None
     
     # Slow consumer finally releases oldest frame!
-    server.release_sync(cid_slow, tickets_slow[0])
+    server.release_sync(tickets_slow[0])
     
     # The release triggers GC -> frees space -> unlocks Producer
     assert small_buffer.put(np.full((1, 2, 2, 3), 99, dtype=np.uint32), timeout=0.1) is True
@@ -341,7 +341,7 @@ def __barrier_consumer(fs_module_name, fs_obj, cid, stop_event):
     while not stop_event.is_set():
         # High frequency read/release to provoke gc sliding frame pointers
         t = server.get_sync(cid, 5, timeout=0)
-        if t: server.release_sync(cid, t)
+        if t: server.release_sync(t)
     server.close()
 
 def __barrier_stalker(fs_module_name, fs_obj, stop_event, result_queue):
@@ -387,68 +387,23 @@ def test_fs_async_sync_barrier(empty_buffer, fs_module_name):
     assert tearing_cnt == 0
     server.close(); server.unlink()
 
-
-def __async_reader_worker(fs_module_name, fs_obj, stop_event, decode_delay, result_queue):
-    fs_mod = importlib.import_module(fs_module_name)
-    server = fs_mod.FrameServer(create=False, frameserver=fs_obj)
-    expired = 0
-    success = 0
-    while not stop_event.is_set():
-        ticket = server.get_async(1)
-        if ticket is not None:
-            time.sleep(decode_delay)
-            try:
-                server.get_from_ticket(ticket)
-                success += 1
-            except fs_mod.TicketExpireException:
-                expired += 1
-    result_queue.put((success, expired))
-    server.close()
-
 @pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
-@pytest.mark.parametrize("cons_num, decode_delay, should_expire", [
-    # Low latency decode: GC shouldn't overtake it easily. Over 2.0s it handles the delay perfectly.
-    (1, 0.0, False),
-    # High latency decode: 5 sync consumers blasting GC, while this async reader stalls for 0.05s.
-    # The Buffer capacity is 60. So during 0.05s stall, 5 sync consumers could process 50+ frames effortlessly. Ticket will EXPIRE!
-    (5, 0.05, True) 
-])
-def test_fs_get_async_expire(empty_buffer, fs_module_name, cons_num, decode_delay, should_expire):
-    """Test that `get_async` properly delegates decoding exceptions and is influenced by consumer GC."""
+def test_fs_release_async_ticket_raises(small_buffer, fs_module_name):
+    """Test that trying to release an async ticket raises ValueError."""
     fs_mod = importlib.import_module(fs_module_name)
-    server = fs_mod.FrameServer(create=True, ring_buffer=empty_buffer)
-    empty_buffer.trigger_release = server._gc
-    cids = [server.register_consumer() for _ in range(cons_num)]
+    server = fs_mod.FrameServer(create=True, ring_buffer=small_buffer)
     
-    stop_event = ctx.Event()
+    # Fill buffer
+    small_buffer.put(np.full((1, 2, 2, 3), 1, dtype=np.uint32))
     
-    prod = ctx.Process(target=__barrier_producer, args=(fs_module_name, server, empty_buffer, stop_event))
-    cons_procs = [ctx.Process(target=__barrier_consumer, args=(fs_module_name, server, c, stop_event)) for c in cids]
+    # Get async ticket (cid = -1)
+    async_ticket = server.get_async(1)
+    assert async_ticket.cid == -1
     
-    queue = ctx.Queue()
-    async_reader = ctx.Process(target=__async_reader_worker, args=(fs_module_name, server, stop_event, decode_delay, queue))
-    
-    prod.start()
-    for c in cons_procs: c.start()
-    async_reader.start()
-    
-    time.sleep(2.0)
-    stop_event.set()
-    
-    success, expired = queue.get()
-    prod.join()
-    for c in cons_procs: c.join()
-    async_reader.join()
-    
-    print(f"Async Success: {success}, Expired: {expired} with delay: {decode_delay}")
-    
-    if should_expire:
-        assert expired > 0
-    else:
-        # Sometimes GC is so incredibly fast it overtakes even 1ms delay. We expect VERY few or zero expirations.
-        assert expired < success / 1000 # a relative small proportion.
+    # Try to release, should raise ValueError
+    with pytest.raises(ValueError, match="Invalid ticket"):
+        server.release_sync(async_ticket)
         
-    for c in cids: server.unregister_consumer(c)
     server.close(); server.unlink()
 
 @pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
@@ -467,7 +422,7 @@ def test_fs_consumer_drop(small_buffer, fs_module_name):
     for _ in range(5):
         t = server.get_sync(cid_slow, 1) # Holds all 5 tickets unreleased
         t2 = server.get_sync(cid_fast, 1)
-        server.release_sync(cid_fast, t2)
+        server.release_sync(t2)
         
     assert small_buffer.put(np.full((1, 2, 2, 3), 99, dtype=np.uint32), timeout=0.1) is False
     
@@ -496,7 +451,7 @@ def test_fs_unregister_usage_denial(small_buffer, fs_module_name):
     server.unregister_consumer(cid)
     
     # Use unreg cid to release should silently do nothing and not crash
-    server.release_sync(cid, t)
+    server.release_sync(t)
     
     # Using unreg cid to get should throw runtime error appropriately rather than wait
     with pytest.raises(RuntimeError, match="not activated"):
@@ -653,7 +608,7 @@ def test_fs_rw_during_registration(small_buffer, fs_module_name):
     ticket = server.get_sync(cid,1)
     data_list = server.get_from_ticket(ticket)
     assert data_list[0][0, 0, 0, 0] == 101
-    server.release_sync(cid ,ticket)
+    server.release_sync(ticket)
     server.unregister_consumer(cid)
 
     server.close()

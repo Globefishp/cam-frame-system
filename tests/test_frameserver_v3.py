@@ -65,7 +65,7 @@ def test_fs3_init(empty_buffer: ProcessSafeSharedRingBuffer):
 
     data = fs.get_from_ticket(ticket)
     assert data[0][0, 0, 0, 0] == 1 # 2nd frame produced.
-    fs.release_sync(cid, ticket)
+    fs.release_sync(ticket)
     fs.unregister_consumer(cid)
 
     cid = fs.register_consumer(historical_data=True)
@@ -76,7 +76,7 @@ def test_fs3_init(empty_buffer: ProcessSafeSharedRingBuffer):
     data = fs.get_from_ticket(ticket)
     assert data[0][0, 0, 0, 0] == 2 
 
-    fs.release_sync(cid, ticket)
+    fs.release_sync(ticket)
     ticket = fs.get_sync(cid, 1, timeout=0.1)
     # no more frames in buffer
     assert ticket == None 
@@ -98,7 +98,7 @@ def test_fs3_init_sync(empty_buffer):
     # Consumer reads 5 frames
     for _ in range(3):
         t = fs.get_sync(cid, 1)
-        fs.release_sync(cid, t)
+        fs.release_sync(t)
 
     rb_b = ProcessSafeSharedRingBuffer(create=True, buffer_capacity=60, frame_shape=(10, 10, 3), dtype=np.uint32)
     for i in range(100, 105):
@@ -226,10 +226,10 @@ def __multi_stream_consumer_worker(servers, cid, stop_event, fetch_size, result_
                         if idx == slow_stream_idx:
                             pass # Don't release on the slow stream
                         else:
-                            s.release_sync(cid, ticket)
+                            s.release_sync(ticket)
                 else:
                     for s in servers:
-                        s.release_sync(cid, ticket)
+                        s.release_sync(ticket)
                         
         result_queue.put(tickets)
     except Exception as e:
