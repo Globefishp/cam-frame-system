@@ -46,6 +46,8 @@ class X264Encoder(BaseVideoEncoder):
                  frame_server: FrameServer,
                  output_path: str,
                  batch_size: int = 5,
+                 target_fps: Optional[float] = None,
+                 stat_interval: float = 1.0,
                  inject_logger: Logger = None,
                  timecode_extractor: Optional[TimecodeExtractor] = None,
                  mux_timecode: bool = False,
@@ -57,6 +59,8 @@ class X264Encoder(BaseVideoEncoder):
             output_path: (str), path to the output video file.
             batch_size: (int), number of frames to get from the buffer at once. 
                 Defaults to 5.
+            stat_interval: (float), the interval for reporting statistics. 
+                Defaults to 1.0 second. 
             inject_logger: (Optional[Logger]), the loguru logger instance for logging.
                 enqueue=True is required. if None, a default logger acquired 
                 from current process will be used and could differ from the 
@@ -71,15 +75,19 @@ class X264Encoder(BaseVideoEncoder):
                 frame_size: (Tuple[int, int, int]), the frame size of the input frames.
                 crf: (int), the constant rate factor for x264 encoding.
                 bitrate: (int), the bitrate for x264 encoding. Should have at least one of crf or bitrate.
-                fps: (int), the expected fps of the output video. Defaults to 30.
+                fps: (int), the fps metadata of the output video. Defaults same as `target_fps`.
                 threads: (int), the number of threads to use for x264 encoding. Defaults to 0 (all available threads).
                 preset: (str), the preset for x264 encoding. Defaults to 'fast'.
                 rc_lookahead: (int), the rc_lookahead for x264 encoding. Defaults to None.
                 timebase: (int), the timebase for x264 encoding. Defaults to None.
+            Any additional kwargs will be passed to x264 cmd line as `--str(key) str(value)`.
+                input-csp: (str), the color space of the input frames. Defaults to 'bgr'.
+                input-depth: (str), the depth of the input frames. Defaults to '8'.
         """
         pid, friendly_name = mp.current_process().pid, "X264Encoder"
-        fps = kwargs.get('fps', None)
-        super().__init__(frame_server, output_path, batch_size=batch_size, expected_fps=fps, inject_logger=inject_logger)
+        fps = kwargs.get('fps', target_fps)
+        super().__init__(frame_server, output_path, batch_size=batch_size, 
+            target_fps=fps, stat_interval=stat_interval, inject_logger=inject_logger)
         self._logger = self._logger.bind(friendly_name=friendly_name)
 
         # Parse kwargs
@@ -242,34 +250,37 @@ class X264Encoder(BaseVideoEncoder):
         # --- Build x264 command line ---
         height, width, channels = self._frame_size
 
-        x264_cmd = [
-            str(x264_executable),
-            '--input-res', f'{width}x{height}',
-            '--fps', str(self._fps),
-            '--input-csp', 'bgr',       # Input color space
-            '--demuxer', 'raw',         # Expect raw video frames
-            '-',                        # Input from stdin
-            '--preset', self._preset,
-            '--threads', str(self._threads),
-        ]
-
-        extra_kwargs = [f'--{key} {value}' for key, value in self._encoder_kwargs.items()]
-        x264_cmd.extend(extra_kwargs)
+        # default internal params
+        x264_params = {
+            'input-res': f'{width}x{height}',
+            'fps': str(self._fps),
+            'input-csp': 'bgr',       # Input color space, usually BGR.
+            'preset': self._preset,
+            'threads': str(self._threads),
+            'output': self._encoder_intermediates
+            # x264.exe typically overwrites by default, no explicit -y needed.
+        }
+        x264_params.update(self._encoder_kwargs) # Overwrite user cfg.
 
         # Favour CRF first, then consider using bitrate.
         if self._crf is not None:
-            x264_cmd.extend(['--crf', str(self._crf)])
+            x264_params['crf'] = str(self._crf)
         elif self._bitrate is not None:
             # x264.exe expects bitrate in kbps
             bitrate_kbps = int(self._bitrate) // 1000
-            x264_cmd.extend(['--bitrate', str(bitrate_kbps)])
+            x264_params['bitrate'] = str(bitrate_kbps)
         # If neither is provided, use default CRF 23 (specified in __init__)
-        
         if self._rc_lookahead is not None:
-            x264_cmd.extend(['--rc-lookahead', str(self._rc_lookahead)])
+            x264_params['rc-lookahead'] = str(self._rc_lookahead)
 
-        x264_cmd.extend(['--output', self._encoder_intermediates])
-        # x264.exe typically overwrites by default, no explicit -y needed.
+        # IO params
+        x264_params['demuxer'] = 'raw'
+
+        x264_cmd = [str(x264_executable),]
+        # Convert dict to command line args
+        for key, value in x264_params.items():
+            x264_cmd.extend([f'--{key}', str(value)])
+        x264_cmd.append('-') # stdin Input
 
         logger.info(f"Starting x264.exe with command: {' '.join(x264_cmd)}")
 

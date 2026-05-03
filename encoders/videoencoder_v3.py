@@ -50,8 +50,8 @@ class BaseVideoEncoder(ABC):
                  frame_server: FrameServer,
                  output_path: str, # although not used in IPC, required by most encoder.
                  batch_size: int = 5,
-                 expected_fps: Optional[float] = None,
-                 stat_interval: float = 5.0,
+                 target_fps: Optional[float] = None,
+                 stat_interval: float = 1.0,
                  inject_logger: Optional[Logger] = None, 
                  # Extra kwargs should be handled and store per subclass implementation.
         ):
@@ -64,10 +64,10 @@ class BaseVideoEncoder(ABC):
             output_path: (str), path to the output video file.
             batch_size: (int), number of frames to get from the buffer at once. 
                 Defaults to 5.
-            expected_fps: (Optional[float]), expected encoding speed in fps. Used in speed
-                warning, NOT related with the encoding procedure. Defaults to None.
+            target_fps: (Optional[float]), target encoding speed in fps. Used in speed
+                warning for base class. Subclass may also use it. Defaults to None.
             stat_interval: (float), interval between status updates and warning checks
-                in seconds. Defaults to 5.0.
+                in seconds. Defaults to 1.0.
             inject_logger: (Optional[Logger]), the loguru logger instance for logging.
                 enqueue=True is required. if None, a default logger is acquired 
                 from *current process* (i.e. could differ from the logger instance 
@@ -80,7 +80,7 @@ class BaseVideoEncoder(ABC):
         # TODO: change below code to v3.
         self._output_path: str = output_path
         self._batch_size: int = batch_size
-        self._expected_fps: Optional[float] = expected_fps
+        self._target_fps: Optional[float] = target_fps
         self._stat_interval: float = stat_interval
         self._logger: Logger # For subclass use
         if inject_logger is not None:
@@ -291,8 +291,8 @@ class BaseVideoEncoder(ABC):
             return # Exit worker process on initialization failure
 
         # --- Speed Calculation Initialization ---
-        if self._expected_fps:
-            logger.info(f"Expected encoding speed: {self._expected_fps} fps. Speed warning enabled.")
+        if self._target_fps:
+            logger.info(f"Expected encoding speed: {self._target_fps} fps. Speed warning enabled.")
         else:
             logger.info(f"Have no `expected_fps`, Encoding speed warning disabled.")
         frame_count_since_last_check = 0
@@ -302,6 +302,7 @@ class BaseVideoEncoder(ABC):
         # 2. Main processing loop
         try:
             # Signal readiness for the next frame BEFORE waiting
+            last_ticket = None
             self._worker_ready.set()
             while self._not_eager_stop.is_set():
                 # v2: Graded stop signal, still process remaining frames until eager_stop.
@@ -309,6 +310,8 @@ class BaseVideoEncoder(ABC):
                     # --- Get frames from the frame server (blocks if no enough data) ---
                     # Get a batch of frames from the frame server
                     ticket = frame_server.get_sync(cid, self._batch_size, timeout=0.1)
+                    # Release after next ticket is got.
+                    if last_ticket is not None: frame_server.release_sync(last_ticket)
 
                     if ticket is None:
                         # Timeout occurred, check if still running
@@ -320,50 +323,50 @@ class BaseVideoEncoder(ABC):
                                 break # Exit loop
 
                     if ticket is not None:
-                        try:
-                            frames_list = frame_server.get_from_ticket(ticket, timeout=0.1)
-                            
-                            # --- Encode the batch of frames ---
-                            if frames_list:
-                                # Calculate number of frames processed in this batch
-                                num_frames_processed = sum(arr.shape[0] for arr in frames_list)
-                                if num_frames_processed == 0: # Should not happen
-                                    continue # Skip if no frames were actually processed
-        
-                                # Blocking method, Pass the list of frame views
-                                self._encode_frames(frames_list)
-                                self._frame_count.value += num_frames_processed
-        
-                                # Update Speed Calculation 
-                                frame_count_since_last_check += num_frames_processed
-                                current_time = time.monotonic()
-                                time_elapsed = current_time - time_last_check
-        
-                                # Update status
-                                if time_elapsed >= self._stat_interval:
-                                    encoding_speed = frame_count_since_last_check / time_elapsed
-                                    self._status_update({"frame_count": self._frame_count.value, "fps": encoding_speed})
-                                    if self._expected_fps is not None:
-                                        # Check if speed is noticeably low and issue warning (throttled)
-                                        if encoding_speed < self._expected_fps * 0.9:
-                                            logger.warning(f"VideoEncoder encoding speed ({encoding_speed:.2f} FPS) "
-                                                  f"is noticeably lower than target FPS ({self._expected_fps:.2f}). "
-                                                  "Frames might be dropped after buffer filled.")
-                                    if frame_server.buffer.occupied_count_ / frame_server.buffer.buffer_capacity > 0.5:
-                                        logger.warning(f"Current buffer load: {frame_server.buffer.occupied_count_} frames, "
-                                                f"{frame_server.buffer.occupied_count_ / frame_server.buffer.buffer_capacity * 100:.2f}%")
-        
-                                    # Reset for next measurement interval
-                                    frame_count_since_last_check = 0
-                                    time_last_check = current_time
-                        finally:
-                            frame_server.release_sync(ticket)
+                        frames_list = frame_server.get_from_ticket(ticket, timeout=0.1)
+                        
+                        # --- Encode the batch of frames ---
+                        if frames_list:
+                            # Calculate number of frames processed in this batch
+                            num_frames_processed = sum(arr.shape[0] for arr in frames_list)
+                            if num_frames_processed == 0: # Should not happen
+                                continue # Skip if no frames were actually processed
+    
+                            # Blocking method, Pass the list of frame views
+                            self._encode_frames(frames_list)
+                            self._frame_count.value += num_frames_processed
+    
+                            # Update Speed Calculation 
+                            frame_count_since_last_check += num_frames_processed
+                            current_time = time.monotonic()
+                            time_elapsed = current_time - time_last_check
+    
+                            # Update status
+                            if time_elapsed >= self._stat_interval:
+                                encoding_speed = frame_count_since_last_check / time_elapsed
+                                self._status_update({"frame_count": self._frame_count.value, "fps": encoding_speed})
+                                if self._target_fps is not None:
+                                    # Check if speed is noticeably low and issue warning (throttled)
+                                    if encoding_speed < self._target_fps * 0.9:
+                                        logger.warning(f"VideoEncoder encoding speed ({encoding_speed:.2f} FPS) "
+                                                f"is noticeably lower than target FPS ({self._target_fps:.2f}). "
+                                                "Frames might be dropped after buffer filled.")
+                                if frame_server.buffer.occupied_count_ / frame_server.buffer.buffer_capacity > 0.5:
+                                    logger.warning(f"Current buffer load: {frame_server.buffer.occupied_count_} frames, "
+                                            f"{frame_server.buffer.occupied_count_ / frame_server.buffer.buffer_capacity * 100:.2f}%")
+    
+                                # Reset for next measurement interval
+                                frame_count_since_last_check = 0
+                                time_last_check = current_time
+                    # Release is deferred to the next cycle to avoid async consumer starvation.
+                    last_ticket = ticket
                 except EncoderException as e:
-                    logger.error(f"[{e.name} ({e.pid})] {e.message}")
+                    logger.opt(exception=e).error(f"[{e.name} ({e.pid})] {e.message}")
                     self._not_eager_stop.clear() # exit immediately
                 except Exception as e: # Framework error, should not happen.
                     logger.opt(exception=e).error(f"Unexpected error in encoder working loop.")
                     self._not_eager_stop.clear()
+
             self._worker_ready.clear()
             logger.info(f"Encoder worker exited working loop.")
 
@@ -375,6 +378,8 @@ class BaseVideoEncoder(ABC):
             except Exception as e:
                 logger.opt(exception=e).error(f"Encoder worker failed during uninitialization.")
 
+            if ticket is not None: frame_server.release_sync(ticket)
+            if last_ticket is not None: frame_server.release_sync(last_ticket)
             frame_server.unregister_consumer(cid)
             frame_server.close() # Close connection on exit
             logger.success(f"Encoder worker cleanup completed.")
@@ -433,7 +438,7 @@ class BaseVideoEncoder(ABC):
             self.stop() # Use stop to ensure cleanup
             raise # Re-raise the exception after cleanup attempt
 
-    def stop(self, exit_timeout=5.0, terminate_timeout=20.0):
+    def stop(self, exit_timeout=None, terminate_timeout=20.0):
         """
         Stops the video encoder.
             Signals the worker process to stop, waits for it to join,
@@ -444,7 +449,9 @@ class BaseVideoEncoder(ABC):
         Does nothing if the encoder is already stopped.
 
         Args:
-            exit_timeout (float): Timeout for the worker process to exit.
+            exit_timeout (float): Timeout for the worker process to exit. Default None
+                represents auto determined by buffer size and `target_fps`. If not
+                available, use 10s.
             terminate_timeout (float): Timeout for the worker process to be terminated.
 
         Raises:
@@ -453,6 +460,11 @@ class BaseVideoEncoder(ABC):
         pid = mp.current_process().pid
         logger = self.__logger
         wp = self._worker_process
+        buffer = self._frame_server.buffer
+        if self._target_fps is not None:
+            exit_timeout = buffer.buffer_capacity / self._target_fps * 1.5 
+        else:
+            exit_timeout = 10
         
         if wp is None:
             logger.info("Encoder already stopped, cannot stop twice.")
@@ -464,7 +476,8 @@ class BaseVideoEncoder(ABC):
 
         # Wait for worker process to finish
         if wp.is_alive():
-            logger.info(f"Waiting for VideoEncoder worker ({wp.pid}) to join...")
+            logger.info(f"Waiting for VideoEncoder worker ({wp.pid}) to join..."
+                        f"Buffer load: {buffer.occupied_count_} frames.")
             # Wait mainly for all buffered frame get encoded, but sometimes waiting _uninit_encoder,
             # depends on the impl. of encoder (whether _encoder_frame is blocking or not)
             wp.join(timeout=exit_timeout) 
