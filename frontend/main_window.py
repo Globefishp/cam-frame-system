@@ -1,7 +1,8 @@
 import sys
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QPushButton, QLabel, QSlider, QFileDialog, QLineEdit, QSizePolicy)
-from PySide6.QtCore import Qt
+                             QPushButton, QLabel, QSlider, QFileDialog, QLineEdit, 
+                             QSizePolicy, QGroupBox)
+from PySide6.QtCore import Qt, QTimer
 
 from frontend.gl_widget import CameraDisplayWidget
 from frontend.upload_thread import GLTextureUploadThread
@@ -62,7 +63,26 @@ class MainWindow(QMainWindow):
         
         controls_layout.addStretch(1)
 
-        # 4. Main Action Buttons
+        # 4. Status Display
+        status_group = QGroupBox("Statistics")
+        status_vbox = QVBoxLayout(status_group)
+        
+        self.buffer_label = QLabel(f"Buffer load: 0 / {backend.frame_server.buffer.buffer_capacity} frames (0.0 %)")
+        self.encoded_frames_label = QLabel("Encoded: 0 frames")
+        self.encoding_fps_label = QLabel("Encoding Speed: 0.0 FPS")
+        
+        status_vbox.addWidget(self.buffer_label)
+        status_vbox.addWidget(self.encoded_frames_label)
+        status_vbox.addWidget(self.encoding_fps_label)
+        
+        controls_layout.addWidget(status_group)
+
+        # Status Update Timer
+        self.status_timer = QTimer(self)
+        self.status_timer.timeout.connect(self._update_status)
+        self.status_timer.start(500)
+
+        # 5. Main Action Buttons
         self.capture_button = QPushButton("Start Capture")
         self.capture_button.setCheckable(True)
         controls_layout.addWidget(self.capture_button)
@@ -100,10 +120,33 @@ class MainWindow(QMainWindow):
 
         self.render_thread.start()
 
+    def _update_status(self):
+        """Update status in UI"""
+        # buffer load
+        buffer_count = self.backend.frame_server.buffer.occupied_count_
+        buffer_capacity = self.backend.frame_server.buffer.buffer_capacity
+        self.buffer_label.setText(f"Buffer load: {buffer_count} / {buffer_capacity} frames "
+                                  f"({buffer_count / buffer_capacity * 100:.1f}%)")
+
+        # encoder status
+        encoder = getattr(self.backend, 'encoder', None)
+        status = getattr(encoder, 'status', {}) if encoder else {}
+
+        # encoder frame count
+        frame_count = status.get('frame_count', 0)
+        fps = status.get('fps', 0.0)
+
+        self.encoded_frames_label.setText(f"Encoded: {frame_count} frames")
+        self.encoding_fps_label.setText(f"Encoding Speed: {fps:.1f} FPS")
+        
+        # TODO: can add color warning based on buffer load
+
     def _on_frame_swapped(self):
         """Triggered on VSync. Wakes up render thread and requests next frame draw."""
-        self.render_thread.vsync_event.set()
-        self.display_widget.update()
+        if self.capture_button.isChecked():
+            # Do not send vsync signal to save CPU.
+            self.render_thread.vsync_event.set()
+            self.display_widget.update()
 
     def _on_exposure_changed(self, value):
         self.exposure_label.setText(f"{value} ms")
@@ -142,9 +185,11 @@ class MainWindow(QMainWindow):
                 return
             self.record_button.setText("Stop Recording")
             self.backend.start_recording(output_path)
+            self.fps_slider.setEnabled(False)
         else:
             self.record_button.setText("Start Recording")
             self.backend.stop_recording()
+            self.fps_slider.setEnabled(True)
 
     def closeEvent(self, event):
         """Handle cleanup on exit."""
