@@ -273,3 +273,74 @@ def test_status_update_and_lifecycle(ring_buffer, frame_server, record_dict):
     assert encoder.status["frame_count"] <= 7
     
     encoder.stop()
+
+
+def test_seamless_rotation_lifecycle_and_integrity(ring_buffer, frame_server, record_dict):
+    """
+    验证正常的无缝切片流：正常的 Rotation 生命周期管理，以及帧的连续性。
+    """
+    encoder = DummyValidEncoder(
+        frame_server=frame_server, output_path="dummy1.mp4", 
+        batch_size=2, mp_record_dict=record_dict
+    )
+    encoder.start()
+    
+    # 生产者写入 5 帧 (0~4)
+    p1 = mp.Process(target=process_producer, args=(ring_buffer, 0, 5))
+    p1.start()
+    p1.join()
+    
+    # 模拟文件切片，保留 cid
+    encoder.stop(resumable=True)
+    assert encoder._fs_cid is not None
+    assert record_dict['uninit_calls'] == 1
+    
+    # 换个新输出继续
+    encoder.output_path = "dummy2.mp4"
+    encoder.start()
+    
+    # 生产者再写入 5 帧 (5~9)
+    p2 = mp.Process(target=process_producer, args=(ring_buffer, 5, 5))
+    p2.start()
+    p2.join()
+    
+    # 彻底停止
+    encoder.stop(resumable=False)
+    assert encoder._fs_cid is None
+    assert record_dict['uninit_calls'] == 2
+    assert record_dict['init_calls'] == 2
+    # 验证完整性：0~9帧都不丢
+    assert list(record_dict['encoded_frames']) == list(range(10))
+
+
+def test_seamless_rotation_with_eager_stop(ring_buffer, frame_server, record_dict):
+    """
+    测试切片时碰巧发生 eager_stop 的边界情况，依然保证帧不丢失。
+    """
+    encoder = DummyValidEncoder(
+        frame_server=frame_server, output_path="dummy1.mp4", 
+        batch_size=2, mp_record_dict=record_dict
+    )
+    encoder.start()
+    
+    # 生产者写入 8 帧
+    p1 = mp.Process(target=process_producer, args=(ring_buffer, 0, 8))
+    p1.start()
+    p1.join()
+    
+    # 强制极短的 timeout 触发 eager_stop
+    encoder.stop(resumable=True, exit_timeout=0.01)
+    
+    # 修改输出路径，启动新的 worker
+    encoder.output_path = "dummy2.mp4"
+    encoder.start()
+    
+    # 生产者再写入 2 帧
+    p2 = mp.Process(target=process_producer, args=(ring_buffer, 8, 2))
+    p2.start()
+    p2.join()
+    
+    encoder.stop(resumable=False)
+    
+    # 验证完整性：所有帧依然无损获取
+    assert list(record_dict['encoded_frames']) == list(range(10))

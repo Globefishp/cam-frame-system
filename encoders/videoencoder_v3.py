@@ -24,13 +24,16 @@ from multiprocessing.connection import Connection
 import multiprocessing.synchronize as mp_sync
 import numpy as np
 import threading as t
-from typing import Tuple, Any, Optional, List
+from typing import Tuple, Any, Optional, List, TypeVar, Callable, cast
+from functools import wraps
 from .videoencoder_types import EncoderException
 from frameserver import FrameServer # Import the FrameServer class
 import time # Import time for speed calculation and warning throttling
 
 from loguru import logger as file_logger
 from loguru._logger import Logger # For Type Hinting Only
+
+F = TypeVar('F', bound=Callable[..., Any])
 
 class BaseVideoEncoder(ABC):
     """
@@ -45,6 +48,18 @@ class BaseVideoEncoder(ABC):
     Cannot do standard picklization due to internal IPC resources.
     Probably process-safe, but not tested.
     """
+
+    @staticmethod
+    def require_stop(func: F) -> F:
+        """Decorator to ensure the encoder is stopped before calling the method."""
+        @wraps(func)
+        def wrapper(self: "BaseVideoEncoder", *args, **kwargs):
+            if self._worker_enable.is_set() or self._worker_process is not None:
+                cls_name = self.__class__.__name__
+                func_name = func.__name__
+                raise RuntimeError(f"Operation failed, VideoEncoder is currently running. src_func={cls_name}.{func_name}")
+            return func(self, *args, **kwargs)
+        return cast(F, wrapper)
 
     def __init__(self,
                  frame_server: FrameServer,
@@ -75,6 +90,7 @@ class BaseVideoEncoder(ABC):
         """
         if isinstance(frame_server, FrameServer):
             self._frame_server : FrameServer = frame_server
+            self._fs_cid: Optional[int] = None # read-only in worker
         else:
             raise TypeError("frame_server must be a FrameServer instance.")
         # TODO: change below code to v3.
@@ -203,6 +219,17 @@ class BaseVideoEncoder(ABC):
         """Return encoded frame count. Process-safe."""
         return self._frame_count.value
 
+    @property
+    def output_path(self) -> str:
+        """The output path of the video encoder."""
+        return self._output_path
+
+    @output_path.setter
+    @require_stop
+    def output_path(self, value: str):
+        """Set the output path. Only allowed when the encoder is stopped."""
+        self._output_path = value
+
     @abstractmethod
     def _initialize_encoder(self):
         """
@@ -262,18 +289,18 @@ class BaseVideoEncoder(ABC):
         """
         raise NotImplementedError
 
-    def _worker(self):
+    def _worker(self, cid: int):
         """
         The main function executed by the background worker process.
             - Initializes the encoder,
-            - Processes frames from the shared ring buffer,
-                - Handles buffer underflow gracefully,
-                - Encodes the frames,
-            - When the process is stopped, it ensures the encoder is uninitialized.
+            - Get frames from the frame server via cid,
+                - Encodes the frames by calling subclass method `_encode_frames`,
+                - Update statistics, 
+            - When the is signal to stop, it ensures the encoder the remaining 
+              frames is encoded and the subclass encoder is uninitialized.
         """
         # --- Init Cross-process Resources ---
         frame_server = self._frame_server
-        cid = frame_server.register_consumer(historical_data=True)
 
         pid = mp.current_process().pid
         logger = self.__logger
@@ -286,7 +313,6 @@ class BaseVideoEncoder(ABC):
             logger.success(f"Encoder worker initialized successfully.")
         except Exception as e:
             logger.opt(exception=e).error(f"Encoder worker failed during initialization.")
-            frame_server.unregister_consumer(cid)
             frame_server.close() # Close frameserver connection on init failure
             return # Exit worker process on initialization failure
 
@@ -380,7 +406,6 @@ class BaseVideoEncoder(ABC):
 
             if ticket is not None: frame_server.release_sync(ticket)
             if last_ticket is not None: frame_server.release_sync(last_ticket)
-            frame_server.unregister_consumer(cid)
             frame_server.close() # Close connection on exit
             logger.success(f"Encoder worker cleanup completed.")
             logger.complete() # Flush logging buffer
@@ -400,13 +425,13 @@ class BaseVideoEncoder(ABC):
             return
 
         logger.info("Starting VideoEncoder...")
+        if self._fs_cid is None:
+            try:
+                self._fs_cid = self._frame_server.register_consumer(historical_data=True)
+            except RuntimeError as e:
+                logger.error(f"Failed to register consumer in frame server: {e}")
+                return
         try:
-            # Ensure FrameServer instance was provided during initialization
-            if self._frame_server is None:
-                raise ValueError("FrameServer instance must be provided during initialization.")
-            if not isinstance(self._frame_server, FrameServer):
-                 raise TypeError("Provided frame_server is not a FrameServer instance.")
-
             # Set running state and start worker process
             self._worker_enable.set()
             self._frame_count.value = 0 # Reset counter.
@@ -417,8 +442,8 @@ class BaseVideoEncoder(ABC):
             
             logger.info("Starting worker process...")
 
-            # v2: No arguments need to be passed.
-            wp = mp.Process(target=self._worker)
+            # v3: pass in cid, allow multiple sessions rotate seamlessly.
+            wp = mp.Process(target=self._worker, args=(self._fs_cid,))
             self._worker_process = wp
             wp.start()
 
@@ -438,7 +463,7 @@ class BaseVideoEncoder(ABC):
             self.stop() # Use stop to ensure cleanup
             raise # Re-raise the exception after cleanup attempt
 
-    def stop(self, exit_timeout=None, terminate_timeout=20.0):
+    def stop(self, resumable: bool=False, exit_timeout=None, terminate_timeout=20.0):
         """
         Stops the video encoder.
             Signals the worker process to stop, waits for it to join,
@@ -449,6 +474,10 @@ class BaseVideoEncoder(ABC):
         Does nothing if the encoder is already stopped.
 
         Args:
+            resumable (bool): If True, will not release the consumer from frame 
+                server, so the encoder can be resumed later seamlessly. 
+                Useful for file rotation. To fully release resources, call `stop()`
+                with `resumable=False` again. Default False.
             exit_timeout (float): Timeout for the worker process to exit. Default None
                 represents auto determined by buffer size and `target_fps`. If not
                 available, use 10s.
@@ -466,38 +495,45 @@ class BaseVideoEncoder(ABC):
         else:
             exit_timeout = 10
         
-        if wp is None:
-            logger.info("Encoder already stopped, cannot stop twice.")
+        if wp is None and self._fs_cid is None:
+            logger.info("VideoEncoder already stopped.")
             return
 
-        logger.info(f"Stopping VideoEncoder (PID {wp.pid})...")
-        # Signal worker to stop
-        self._worker_enable.clear()
+        if wp is not None:
+            logger.info(f"Stopping VideoEncoder worker (PID {wp.pid})...")
+            # Signal worker to stop
+            self._worker_enable.clear()
 
-        # Wait for worker process to finish
-        if wp.is_alive():
-            logger.info(f"Waiting for VideoEncoder worker ({wp.pid}) to join..."
-                        f"Buffer load: {buffer.occupied_count_} frames.")
-            # Wait mainly for all buffered frame get encoded, but sometimes waiting _uninit_encoder,
-            # depends on the impl. of encoder (whether _encoder_frame is blocking or not)
-            wp.join(timeout=exit_timeout) 
+            # Wait for worker process to finish
             if wp.is_alive():
-                logger.warning(f"Worker process {wp.pid} did not exit within "
-                               f"timeout ({exit_timeout}s). Signal eager stop, "
-                               f"unprocessed frames may be lost...")
-                self._not_eager_stop.clear() # Eager stop. Turn to _uninit_encoder as soon as possible.
-            # Wait mainly for _uninit_encoder to finish, a large timeout.
-            wp.join(timeout=terminate_timeout)
-            if wp.is_alive():
-                logger.warning(f"Worker process {wp.pid} did not exit within "
-                               f"timeout ({terminate_timeout}s). System-level force terminating, "
-                               f"data may corrupted...")
-                # TODO: Signal outside to choose behaviour?
-                wp.terminate() # Force terminate if join times out
-            time.sleep(1.0) # Wait for the process to actually terminate
-            if wp.is_alive():
-                raise TimeoutError("Worker process did not terminate within timeout.")
-            logger.info(f"Worker process ({wp.pid}) joined.")
+                logger.info(f"Waiting for VideoEncoder worker ({wp.pid}) to join. "
+                            f"Buffer load: {buffer.occupied_count_} frames.")
+                # Wait mainly for all buffered frame get encoded, but sometimes waiting _uninit_encoder,
+                # depends on the impl. of encoder (whether _encoder_frame is blocking or not)
+                wp.join(timeout=exit_timeout) 
+                if wp.is_alive():
+                    logger.warning(f"Worker process {wp.pid} did not exit within "
+                                f"timeout ({exit_timeout}s). Signal eager stop, "
+                                f"unprocessed frames may be lost...")
+                    self._not_eager_stop.clear() # Eager stop. Turn to _uninit_encoder as soon as possible.
+                # Wait mainly for _uninit_encoder to finish, a large timeout.
+                wp.join(timeout=terminate_timeout)
+                if wp.is_alive():
+                    logger.warning(f"Worker process {wp.pid} did not exit within "
+                                f"timeout ({terminate_timeout}s). System-level force terminating, "
+                                f"data may corrupted...")
+                    # TODO: Signal outside to choose behaviour?
+                    wp.terminate() # Force terminate if join times out
+                time.sleep(1.0) # Wait for the process to actually terminate
+                if wp.is_alive():
+                    raise TimeoutError("Worker process did not terminate within timeout.")
+                logger.info(f"Worker process ({wp.pid}) joined.")
 
-        self._stop_status_ipc()
-        logger.success("VideoEncoder stopped.")
+            self._worker_process = None
+            self._stop_status_ipc()
+        
+        if self._fs_cid is not None and not resumable:
+            self._frame_server.unregister_consumer(self._fs_cid)
+            self._fs_cid = None
+
+        logger.success(f"VideoEncoder stopped{'.' if self._fs_cid is None else ' without releasing buffer.'}")
