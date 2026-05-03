@@ -39,6 +39,7 @@ class MpObjProxy:
 
         # 3. Instantiate target object in subprocess
         target_obj, rpc_lock = proxy()
+        proxy.start_service_thread()
 
         # 4. Wait for initialization (# 3) in Main Process
         proxy.wait_handshake()
@@ -48,7 +49,9 @@ class MpObjProxy:
 
         # 6. In main process, use proxy as the target_obj
         Limitations: 
-            - _pxy_<name>_ are reversed names by proxy;
+            - _pxy_<name>_ properties and functions like `wait_handshake`, 
+              `start_service_thread`, `mp_rescan`, `mp_eval`, `__call__` are 
+              reserved names by proxy;
             - returned properties are copies, not sync'ed with the remote object.
               using `mp_eval` to do complex things.
         
@@ -246,7 +249,7 @@ class MpObjProxy:
 
             return {"methods": methods, "properties": properties}
 
-    def mp_rpc_service_step(self, block: bool = True) -> bool:
+    def _rpc_service_step(self, block: bool = True) -> bool:
         """
         Single atomic step of RPC execution in subprocess.
         Executes incoming commands holding `self._pxy_rpc_lock_`.
@@ -302,7 +305,7 @@ class MpObjProxy:
         def _loop():
             while not self._pxy_shutdown_event_.is_set():
                 if self._pxy_owner_rx_.poll(0.01): # 10ms timeout check
-                    self.mp_rpc_service_step(block=True)
+                    self._rpc_service_step(block=True)
                     
         self._pxy_service_thread_ = threading.Thread(target=_loop, daemon=True, name=f"RPCProxy_{self._pxy_cls_.__name__}")
         self._pxy_service_thread_.start()
