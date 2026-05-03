@@ -224,3 +224,52 @@ def test_exception_handling_init_error(ring_buffer, frame_server, record_dict):
     # 验证：未走到 encode 和 uninit 流程
     assert record_dict['uninit_calls'] == 0
     assert len(record_dict['encoded_frames']) == 0
+
+
+def test_status_update_and_lifecycle(ring_buffer, frame_server, record_dict):
+    """
+    验证状态更新机制的正确性及生命周期 (IPC Pipe 同步)
+    - 启动时赋予较小的 stat_interval
+    - 写入部分帧，验证主进程能否通过 encoder.status 读取到 frame_count 和 fps
+    - 验证多次 stop/start 之间状态是否能被正确重置和重建
+    """
+    # 1. 实例化 Encoder，设置 stat_interval=0.2 (触发较快)
+    encoder = DummyValidEncoder(
+        frame_server=frame_server, output_path="dummy.mp4", 
+        batch_size=2, mp_record_dict=record_dict, stat_interval=0.1
+    )
+    
+    # 2. 首次启动并写入 10 帧 (耗时约 10 * 0.05 = 0.5s)
+    encoder.start()
+    p1 = mp.Process(target=process_producer, args=(ring_buffer, 0, 10))
+    p1.start()
+    p1.join()
+    
+    # 等待一小会儿确保 pipe 数据已经被主进程守护线程 poll 读取
+    time.sleep(0.5) 
+    
+    # 3. 验证正确性
+    status = encoder.status
+    assert "frame_count" in status, "状态字典应包含 frame_count"
+    assert status["frame_count"] >= 8, f"在4个interval中至少会获取8帧 {status}"
+    assert "fps" in status, "状态字典应包含 fps"
+    assert status["fps"] > 0, "fps 应该大于 0"
+
+    # 5. 停止编码器
+    encoder.stop()
+
+    # 6. 重启编码器验证生命周期重建
+    encoder.start()
+    # 刚刚 start 后，状态应该被重置，且没有新状态发过来
+    assert encoder.status == {}
+
+    # 写入 7 帧
+    p3 = mp.Process(target=process_producer, args=(ring_buffer, 10, 7))
+    p3.start()
+    p3.join()
+    time.sleep(0.6)
+    
+    assert encoder.status["frame_count"] >= 4
+    assert encoder.status["frame_count"] <= 7
+    
+    encoder.stop()

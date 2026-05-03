@@ -20,8 +20,10 @@ import inspect
 from abc import ABC, abstractmethod
 import multiprocessing as mp
 from multiprocessing.sharedctypes import Synchronized
+from multiprocessing.connection import Connection
 import multiprocessing.synchronize as mp_sync
 import numpy as np
+import threading as t
 from typing import Tuple, Any, Optional, List
 from .videoencoder_types import EncoderException
 from frameserver import FrameServer # Import the FrameServer class
@@ -49,6 +51,7 @@ class BaseVideoEncoder(ABC):
                  output_path: str, # although not used in IPC, required by most encoder.
                  batch_size: int = 5,
                  expected_fps: Optional[float] = None,
+                 stat_interval: float = 5.0,
                  inject_logger: Optional[Logger] = None, 
                  # Extra kwargs should be handled and store per subclass implementation.
         ):
@@ -63,6 +66,8 @@ class BaseVideoEncoder(ABC):
                 Defaults to 5.
             expected_fps: (Optional[float]), expected encoding speed in fps. Used in speed
                 warning, NOT related with the encoding procedure. Defaults to None.
+            stat_interval: (float), interval between status updates and warning checks
+                in seconds. Defaults to 5.0.
             inject_logger: (Optional[Logger]), the loguru logger instance for logging.
                 enqueue=True is required. if None, a default logger is acquired 
                 from *current process* (i.e. could differ from the logger instance 
@@ -76,6 +81,7 @@ class BaseVideoEncoder(ABC):
         self._output_path: str = output_path
         self._batch_size: int = batch_size
         self._expected_fps: Optional[float] = expected_fps
+        self._stat_interval: float = stat_interval
         self._logger: Logger # For subclass use
         if inject_logger is not None:
             if isinstance(inject_logger, Logger):
@@ -95,6 +101,97 @@ class BaseVideoEncoder(ABC):
         self._not_eager_stop.set() # Default True
         self._worker_ready : mp_sync.Event = mp.Event() # Signals when the worker is ready, write in run, read only outside.
         self._worker_process: Optional[mp.Process] = None 
+
+        self._status_lock: t.Lock
+        self._status_thread: Optional[t.Thread] = None
+        self._status_rx: Optional[Connection] = None
+        self._status_tx: Optional[Connection] = None
+        
+        self._status: dict = {}
+        
+        self._init_status_ipc()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Remove resources that cannot be pickled (Lock, Thread, Rx Connection)
+        state.pop('_status_lock', None)
+        state.pop('_status_thread', None)
+        state.pop('_status_rx', None)
+        return state
+
+    def _init_status_ipc(self):
+        """Initializes or resets the status IPC resources."""
+        self._status = {}
+        self._status_lock = t.Lock()
+        self._status_thread = None # discard history thread ref, let it leak.
+        
+        self._status_rx, self._status_tx = mp.Pipe(duplex=False)
+
+    def _status_worker(self):
+        """Daemon thread loop for receiving status updates from child process."""
+        while self._worker_enable.is_set():
+            try:
+                if self._status_rx.poll(0.5):
+                    msg_type, data = self._status_rx.recv()
+                    with self._status_lock:
+                        if msg_type == 'update':
+                            self._status.update(data)
+                        elif msg_type == 'del':
+                            for k in data:
+                                self._status.pop(k, None)
+                        elif msg_type == 'overwrite':
+                            self._status.clear()
+                            self._status.update(data)
+            except (EOFError, BrokenPipeError):
+                break
+            except Exception as e:
+                self.__logger.opt(exception=e).error("Error in daemon thread for status dict.")
+
+    def _start_status_ipc(self):
+        """Starts the background status fetching thread."""
+        self._status_thread = t.Thread(target=self._status_worker, daemon=True)
+        self._status_thread.start()
+
+    def _stop_status_ipc(self):
+        """Stops the status thread and closes pipes to reset state."""
+        # Close pipes to interrupt any pending reads or writes
+        if self._status_rx:
+            self._status_rx.close()
+            self._status_rx = None
+        if self._status_tx:
+            self._status_tx.close()
+            self._status_tx = None
+
+        if self._status_thread and self._status_thread.is_alive():
+            self._status_thread.join(timeout=1.0)
+            if self._status_thread.is_alive():
+                self.__logger.warning("Daemon thread for encoder status did not join, resources may leak.")
+                # keep reference for future handling.
+            else:
+                self._status_thread = None
+
+    @property
+    def status(self) -> dict:
+        """Current encoder status, read-only. 
+        Will be syncronized between parent and child processes."""
+        with self._status_lock:
+            return self._status.copy()
+
+    def _status_update(self, data: dict):
+        """Subclass specific method to update status."""
+        self._status.update(data) # Update local resource.
+        self._status_tx.send(('update', data)) # Update remote resource.
+
+    def _status_del(self, keys: list):
+        """Subclass specific method to delete key in status dict."""
+        for k in keys: self._status.pop(k, None)
+        self._status_tx.send(('del', keys))
+
+    def _status_overwrite(self, data: dict):
+        """Subclass specific method to overwrite status dict."""
+        self._status.clear()
+        self._status.update(data)
+        self._status_tx.send(('overwrite', data))
 
     @property
     def is_ready(self) -> bool:
@@ -200,7 +297,6 @@ class BaseVideoEncoder(ABC):
             logger.info(f"Have no `expected_fps`, Encoding speed warning disabled.")
         frame_count_since_last_check = 0
         time_last_check = time.monotonic()
-        check_interval = 5.0 # Seconds between warnings
         # --- End Speed Calculation Initialization ---
 
         # 2. Main processing loop
@@ -243,12 +339,11 @@ class BaseVideoEncoder(ABC):
                                 current_time = time.monotonic()
                                 time_elapsed = current_time - time_last_check
         
-                                # Check speed periodically if target_fps specified
-                                if time_elapsed >= check_interval:
+                                # Update status
+                                if time_elapsed >= self._stat_interval:
+                                    encoding_speed = frame_count_since_last_check / time_elapsed
+                                    self._status_update({"frame_count": self._frame_count.value, "fps": encoding_speed})
                                     if self._expected_fps is not None:
-                                        encoding_speed = frame_count_since_last_check / time_elapsed
-                                        # print(f"Debug: Avg encoding speed over {time_elapsed:.2f}s: {encoding_speed:.2f} FPS") # Optional debug
-        
                                         # Check if speed is noticeably low and issue warning (throttled)
                                         if encoding_speed < self._expected_fps * 0.9:
                                             logger.warning(f"VideoEncoder encoding speed ({encoding_speed:.2f} FPS) "
@@ -262,7 +357,7 @@ class BaseVideoEncoder(ABC):
                                     frame_count_since_last_check = 0
                                     time_last_check = current_time
                         finally:
-                            frame_server.release_sync(cid, ticket)
+                            frame_server.release_sync(ticket)
                 except EncoderException as e:
                     logger.error(f"[{e.name} ({e.pid})] {e.message}")
                     self._not_eager_stop.clear() # exit immediately
@@ -310,6 +405,11 @@ class BaseVideoEncoder(ABC):
             # Set running state and start worker process
             self._worker_enable.set()
             self._frame_count.value = 0 # Reset counter.
+            
+            # Start status IPC before worker
+            self._init_status_ipc()
+            self._start_status_ipc()
+            
             logger.info("Starting worker process...")
 
             # v2: No arguments need to be passed.
@@ -386,4 +486,5 @@ class BaseVideoEncoder(ABC):
                 raise TimeoutError("Worker process did not terminate within timeout.")
             logger.info(f"Worker process ({wp.pid}) joined.")
 
+        self._stop_status_ipc()
         logger.success("VideoEncoder stopped.")
