@@ -1,3 +1,4 @@
+from OpenGL.GL.ARB import compressed_texture_pixel_storage
 import numpy as np
 from numpy.typing import NDArray
 from typing import Optional, Dict
@@ -37,6 +38,7 @@ class CameraDisplayWidget(QOpenGLWidget):
 
         # Transform matrix
         self._transform_mtx: NDArray = np.eye(4, dtype='f4')
+        self._ts_transform_mtx: NDArray = np.eye(4, dtype='f4')
 
         # FBO and its cache
         self.fbo: Optional[moderngl.Framebuffer] = None
@@ -89,7 +91,7 @@ class CameraDisplayWidget(QOpenGLWidget):
             -1.0,  1.0,  0.0, 0.0, # Top left
              1.0,  1.0,  1.0, 0.0, # Top right
         ], dtype='f4')
-        self.vbo = self.ctx.buffer(vertices.tobytes())
+        self.vbo = self.ctx.buffer(vertices)
         self.vao = self.ctx.vertex_array(self.prog, [(self.vbo, '2f 2f', 'in_vert', 'in_uv')])
         
         
@@ -107,12 +109,12 @@ class CameraDisplayWidget(QOpenGLWidget):
         
         # Position: Top right, small size
         ts_vertices = np.array([
-            -1.0,  0.925,  0.0, 1.0,
-            -0.5,  0.925,  1.0, 1.0,
-            -1.0,  1.0,    0.0, 0.0,
-            -0.5,  1.0,    1.0, 0.0,
+            -1.0, -1.0,  0.0, 1.0,
+             1.0, -1.0,  1.0, 1.0,
+            -1.0,  1.0,  0.0, 0.0,
+             1.0,  1.0,  1.0, 0.0,
         ], dtype='f4')
-        self.ts_vbo = self.ctx.buffer(ts_vertices.tobytes())
+        self.ts_vbo = self.ctx.buffer(ts_vertices)
         self.ts_vao = self.ctx.vertex_array(self.ts_prog, [(self.ts_vbo, '2f 2f', 'in_vert', 'in_uv')])
 
         self.fbo = self.ctx.detect_framebuffer(self.defaultFramebufferObject())
@@ -121,7 +123,7 @@ class CameraDisplayWidget(QOpenGLWidget):
     def on_frame_ready(self, tex_glo, ts_glo, w, h, channels):
         """Slot to receive updated texture metadata from the background thread."""
         if (w,h) != (self.tex_w, self.tex_h):
-            self._transform_mtx = self._compute_transform_mtx(self.width(), self.height(), w, h)
+            self._update_transform_mtx(w, h)
 
         self.current_tex_glo = tex_glo
         self.current_ts_glo = ts_glo
@@ -132,7 +134,14 @@ class CameraDisplayWidget(QOpenGLWidget):
         self.update()
 
     def resizeGL(self, w: int, h: int):
-        self._transform_mtx = self._compute_transform_mtx(self.width(), self.height(), self.tex_w, self.tex_h)
+        self._update_transform_mtx(self.tex_w, self.tex_h)
+    
+    def _update_transform_mtx(self, tex_w, tex_h):
+        frame_mtx = self._frame_transform_mtx(self.width(), self.height(), tex_w, tex_h)
+        ts_extra_mtx = self._timestamp_transform_mtx(200, 30)
+        # modernGL.context.write() require C-continuous memory, but GLSL interprete as F-continuous.
+        self._transform_mtx = frame_mtx.T.copy()
+        self._ts_transform_mtx = (frame_mtx @ ts_extra_mtx).T.copy()
 
     def paintGL(self):
         # 1. Ensure ModernGL renders to Qt's FBO, not the default window Framebuffer 0
@@ -187,16 +196,13 @@ class CameraDisplayWidget(QOpenGLWidget):
                 else:
                     self._ts_texture_cache[self.current_ts_glo] = ts_tex
             ts_tex.use(location=0)
-            self.ts_prog['transform'].write(self._transform_mtx)
+            self.ts_prog['transform'].write(self._ts_transform_mtx)
             self.ts_prog['Texture'].value = 0
             self.ts_vao.render(moderngl.TRIANGLE_STRIP)
 
     @staticmethod
-    def _compute_transform_mtx(w: int, h: int, tex_w: int, tex_h: int) -> NDArray:
+    def _frame_transform_mtx(w: int, h: int, tex_w: int, tex_h: int) -> NDArray:
         """Calculate aspect ratio preserving matrix"""
-        # Note that GLSL interpret matrix as F-continuous. 
-        # PyGLM returns F-continuous, and `np.array` can wrap glm.mat4x4 correctly.
-        # modernGL.context.write() require NDArray to be "C", no need for using order='F'.
         if tex_w == 0 or tex_h == 0 or w == 0 or h == 0:
             return np.eye(4, dtype='f4')
             
@@ -213,3 +219,17 @@ class CameraDisplayWidget(QOpenGLWidget):
         mat[0, 0] = scale_x
         mat[1, 1] = scale_y
         return mat
+
+    @staticmethod
+    def _timestamp_transform_mtx(ts_w, ts_h):
+        """Calculate the timestamp transform matrix to snap it to upper-left 
+        inside the frame, targeting **frame** normalized coordinate [-1,1]."""
+        target_h = 0.04 * 2
+        target_w = target_h * (ts_w / ts_h)
+
+        mat_ts = np.eye(4, dtype='f4')
+        mat_ts[0, 0] = target_w / 2
+        mat_ts[1, 1] = target_h / 2
+        mat_ts[0, 3] = -1.0 + target_w / 2 
+        mat_ts[1, 3] =  1.0 - target_h / 2
+        return mat_ts
