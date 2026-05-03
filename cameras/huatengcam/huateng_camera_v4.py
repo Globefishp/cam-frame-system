@@ -25,7 +25,7 @@ from .extensions.raw_processing_cy_V11 import RawV11Processor
 import warnings
 
 from ..abstractcamera import AbstractCamera as AC
-from ..abstractcamera import CameraFeatures  # 引入您的基类和枚举
+from ..abstractcamera import CameraFeatures, CamException
 from .huatengcam_types import HuatengSDKException, TriggerMode, BitDepth, BayerPattern
 
 from loguru import logger as file_logger
@@ -172,22 +172,6 @@ class HuatengCamera(AC):
         
         mvsdk.CameraSetRawStartBit(hCamera, -1) # Get full dynamic range
 
-        # Set trigger mode
-        if self._trigger_mode == TriggerMode.SOFT_TRIGGER:
-            mvsdk.CameraSetTriggerMode(hCamera, 1)  # 软件触发
-            mvsdk.CameraSetTriggerCount(hCamera, 1) # 每次触发1帧
-            interval_s = 1.0 / self._target_fps
-            self._timer = PreciseTimer(
-                interval_s=interval_s,
-                c_trigger_func=mvsdk._sdk.CameraSoftTrigger,
-                hCamera=hCamera,
-                busy_wait_us=2000,
-                priority=2
-            )
-            self._timer.start()
-        elif self._trigger_mode == TriggerMode.FREERUN:
-            mvsdk.CameraSetTriggerMode(hCamera, 0)
-
         # Camera "Opened", call property setters
         mvsdk.CameraSetAeState(hCamera, 0) # 手动曝光
         self.exposure_time_ms = self._exposure_time_ms
@@ -268,6 +252,22 @@ class HuatengCamera(AC):
         # 分配的空间总是有余量, 按照RGB+extra line来分配, 对于raw的话extra info实际上用不了3通道. 
         logger = self._logger
         try:
+            # Set trigger mode
+            if self._trigger_mode == TriggerMode.SOFT_TRIGGER:
+                mvsdk.CameraSetTriggerMode(self._hCamera, 1)  # 软件触发
+                mvsdk.CameraSetTriggerCount(self._hCamera, 1) # 每次触发1帧
+                interval_s = 1.0 / self._target_fps
+                self._timer = PreciseTimer(
+                    interval_s=interval_s,
+                    c_trigger_func=mvsdk._sdk.CameraSoftTrigger,
+                    hCamera=self._hCamera,
+                    busy_wait_us=2000,
+                    priority=2
+                )
+                self._timer.start()
+            elif self._trigger_mode == TriggerMode.FREERUN:
+                mvsdk.CameraSetTriggerMode(self._hCamera, 0)
+
             self._pFrameBuffer = mvsdk.CameraAlignMalloc(self.frame_size_bytes, 16)
 
             mvsdk.CameraRstTimeStamp(self._hCamera) # 重置时间戳
@@ -281,10 +281,16 @@ class HuatengCamera(AC):
     @AC.require_open
     def stop_capture(self) -> bool:
         logger = self._logger
+
         try:
-            mvsdk.CameraStop(self._hCamera)
+            mvsdk.CameraStop(self._hCamera) # Free run mode
         except MvCamException as e:
             raise HuatengSDKException(e, src_func="HuatengCamera.stop_capture") from e
+
+        if self._timer is not None: # SoftTrigger mode
+            self._timer.stop()
+            self._timer.join()
+            self._timer = None
         self._is_capturing = False
         logger.info(f"Camera {self._DevInfo.GetProductName()} stopped capturing.")
         return True
@@ -303,19 +309,28 @@ class HuatengCamera(AC):
     def features_enabled(self) -> CameraFeatures: return self._features_enabled
 
     @property
-    def width(self) -> int: return self._image_width
+    def width(self) -> int: 
+        if self._image_width is not None: return self._image_width
+        else: raise CamException("The property requires the camera to be opened at least once.", src_func="HuatengCamera.width")
     @property
-    def height(self) -> int: return self._image_height
+    def height(self) -> int: 
+        if self._image_height is not None: return self._image_height
+        else: raise CamException("The property requires the camera to be opened at least once.", src_func="HuatengCamera.height")
     @property
-    def full_width(self) -> int: return self._image_width
+    def full_width(self) -> int: 
+        if self._image_width is not None: return self._image_width
+        else: raise CamException("The property requires the camera to be opened at least once.", src_func="HuatengCamera.full_width")
     @property
-    def full_height(self) -> int: return self._image_height
+    def full_height(self) -> int: 
+        if self._image_height is not None: return self._image_height
+        else: raise CamException("The property requires the camera to be opened at least once.", src_func="HuatengCamera.full_height")
+    @property
+    def channels(self) -> int: 
+        if self._image_channels is not None: return self._image_channels
+        else: raise CamException("The property requires the camera to be opened at least once.", src_func="HuatengCamera.channels")
 
     @property
-    def channels(self) -> int: return self._image_channels
-
-    @property
-    def dtype(self) -> np.dtype: 
+    def dtype(self) -> np.dtype:
         return np.dtype("uint8") if self._bit_depth == BitDepth._8 else np.dtype("uint16")
 
     @property
