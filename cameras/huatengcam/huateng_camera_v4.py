@@ -20,7 +20,7 @@ from typing import Optional, Tuple, Union, Any, List
 from . import mvsdk_mod as mvsdk
 from .mvsdk_mod import CameraException as MvCamException
 from .extensions.unpack_12bit_raw import unpack_12bit_to_16bit_fast
-from .extensions import PreciseTimer
+from .extensions.PreciseTimer import PreciseTimer
 from .extensions.raw_processing_cy_V11 import RawV11Processor
 import warnings
 
@@ -90,7 +90,7 @@ class HuatengCamera(AC):
             self._trigger_mode = TriggerMode.FREERUN
         else:
             self._trigger_mode = TriggerMode.SOFT_TRIGGER
-        self._timer: Optional[PreciseTimer.PrecisionTimer] = None # PrecisionTimer for SW trigger
+        self._timer: Optional[PreciseTimer] = None # PrecisionTimer for SW trigger
         self._target_fps: Optional[float] = fps
         self._exposure_time_ms: float = exposure_time_ms
         self._gain: float = gain
@@ -177,7 +177,7 @@ class HuatengCamera(AC):
             mvsdk.CameraSetTriggerMode(hCamera, 1)  # 软件触发
             mvsdk.CameraSetTriggerCount(hCamera, 1) # 每次触发1帧
             interval_s = 1.0 / self._target_fps
-            self._timer = PreciseTimer.PreciseTimer(
+            self._timer = PreciseTimer(
                 interval_s=interval_s,
                 c_trigger_func=mvsdk._sdk.CameraSoftTrigger,
                 hCamera=hCamera,
@@ -202,6 +202,7 @@ class HuatengCamera(AC):
         # Initialize Hibitdepth Raw Processor
         logger = self._logger
         default_correction = False
+        correction_info: dict = {}
         if self._correction_path.exists():
             correction_info = np.load(self._correction_path, allow_pickle=True).item()
         else:
@@ -219,6 +220,8 @@ class HuatengCamera(AC):
             correction_info['ADC_MAX_LEVEL'] = 4094 if self._bit_depth == BitDepth._12 else 255
             correction_info['wb_params'] = (1,1,1,0,0,0)
             correction_info['fwd_mtx'] = np.eye(3, dtype=np.float64)
+        else:
+            logger.success(f"Loaded color correction from {self._correction_path}")
         self._processor = RawV11Processor(
             self.height, self.width, 
             black_level=correction_info["BLC"],
@@ -322,6 +325,25 @@ class HuatengCamera(AC):
         else:
             return 1000.0 / self.exposure_time_ms 
             # TODO: Freerun, max fps cannot be acquired from SDK...
+    @target_fps.setter
+    def target_fps(self, fps: float):
+        logger = self._logger
+        if self._trigger_mode == TriggerMode.SOFT_TRIGGER:
+            if self._timer is not None:
+                # Reset timer
+                self._timer.stop()
+                self._timer = PreciseTimer(
+                    interval_s= 1.0 / fps,
+                    c_trigger_func=mvsdk._sdk.CameraSoftTrigger,
+                    hCamera=self._hCamera,
+                    busy_wait_us=2000,
+                    priority=2
+                )
+                self._timer.start()
+            self._target_fps = fps
+            logger.info(f"Set target fps to {fps:.1f}.")
+        else: # Defined by exposure time
+            logger.warning(f"Freerun mode, target fps is ignored.")
         
     @property
     @AC.require_open
@@ -418,8 +440,10 @@ class HuatengCamera(AC):
         
         # property access use internal cache, rather than `property`.
         try:
-            # Timeout = 2 * exposure time.
-            timeout = max(200, int(self._exposure_time_ms * 2))
+            # Timeout = 2 * exposure time or 2 * frame_interval.
+            timeout = max(int(2000 / self._target_fps) if self._target_fps is not None else \
+                            int(self._exposure_time_ms * 2), 
+                          200)
             pRawData, FrameHead = mvsdk.CameraGetImageBuffer(self._hCamera, timeout) 
             timecode_val: int = FrameHead.uiTimeStamp
 
