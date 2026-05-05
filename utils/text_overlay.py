@@ -20,16 +20,18 @@ class TextOverlayGen:
         self.text_rgb = text_rgb
         self.text_alpha = text_alpha
         self.font = QFont(font_family, font_size, QFont.Weight.Bold if font_bold else QFont.Weight.Normal)
+
+        self.image = QImage(self.width, self.height, QImage.Format_RGBA8888)
         
-    def generate(self, text: str = None) -> bytes:
+    def generate(self, text: str = None) -> memoryview:
         """Generate image for given text, if None, timestamp by default.
         :param text: The text to generate image for.
-        :return: NDArray for the image in RGBA format.
+        :return: memoryview for the QImage in RGBA format.
         """
         if text is None:
             text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-        img = QImage(self.width, self.height, QImage.Format_RGBA8888)
+
+        img = self.image
         img.fill(QColor(*self.bg_rgb, self.bg_alpha))
         
         painter = QPainter(img)
@@ -42,5 +44,5 @@ class TextOverlayGen:
         painter.drawText(img.rect(), Qt.AlignCenter, text)
         painter.end()
 
-        ptr = img.bits()
-        return np.array(ptr)
+        ptr = img.constBits()
+        return memoryview(ptr)
