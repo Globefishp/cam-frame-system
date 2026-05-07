@@ -6,7 +6,7 @@ import numpy as np
 import tensorflow as tf
 import multiprocessing as mp
 from analyzers.nnanalyzer import NNAnalyzer
-from camera.huateng_camera_tc import extract_tc_from_frames
+from cameras.huateng_camera_tc import extract_tc_from_frames
 from analyzers.sleap_peak_postprocessing import find_local_peaks
 from typing import Optional, Tuple # 引入类型提示
 
