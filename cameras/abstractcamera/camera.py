@@ -319,14 +319,14 @@ class AbstractCamera(ABC):
     
     def get_extended_info_extractor(self) -> Callable[[NDArray], dict[str, Any]]:
         """
-        Get the extractor for the extended info. Should be serializable.
+        Get the serializable extractor for the extended info.
 
         Subclass should implement following private functions:
         - _get_ext_info_decode_func() -> Callable[[NDArray, **kwargs], dict[str, Any]]: 
             returns a serializable function that decodes the extended info from
             the image.
         - _get_ext_info_decode_func_kwargs() -> dict[str, Any]: 
-            returns the kwargs for the decode function.
+            returns the kwargs(serializable dict) for the decode function.
         
         Upon calling this function, the extractor is created, decode function 
         and kwargs are snapshoted, and further __call__ on the extractor will 
@@ -335,8 +335,8 @@ class AbstractCamera(ABC):
 
         You may not need to rewrite this method.
         
-        :return: The extractor function. Receives a NDArray of image data.
-                 Returns a dict[str, Any] of metadata.
+        :return: The extractor object which is callable and serializable. 
+        Receives a NDArray of image data. Returns a dict[str, Any] of metadata.
         """
         decode_payload: dict = self._get_decode_ext_info_func_kwargs()
         strip_payload: dict = self._get_strip_ext_info_func_kwargs()
