@@ -236,6 +236,15 @@ class AbstractCamera(ABC):
         return feature in self.features_enabled
 
     # === Camera Actions ===
+    @abstractmethod
+    def grab_raw(self, **kwargs) -> Optional[NDArray]:
+        """
+        Grab a raw image frame from the camera. Core function.
+                
+        :return: NDArray of image data. `None` if failed.
+        """
+        pass
+
     def grab(self, **kwargs) -> Optional[NDArray]:
         """
         Grab a processed image frame from the camera. Default is to return 
@@ -248,18 +257,9 @@ class AbstractCamera(ABC):
         image = self.grab_raw(**kwargs)
         return image
 
-    @abstractmethod
-    def grab_raw(self, **kwargs) -> Optional[NDArray]:
-        """
-        Grab a raw image frame from the camera. Core function.
-                
-        :return: NDArray of image data. `None` if failed.
-        """
-        pass
-
     def grab_metadata(self, **kwargs) -> Tuple[Optional[NDArray], Any]:
         """
-        Grab a image with metadata. Sometimes useful for immediate parsing.
+        Grab a processed image with metadata. Sometimes useful for immediate parsing.
                 
         :return: (NDArray, Any). 
                  First element is the NDArray of image data. `None` if failed. 
@@ -269,15 +269,19 @@ class AbstractCamera(ABC):
 
     def grab_extended_info(self, **kwargs) -> Optional[NDArray]:
         """
-        Grab image frame with extended info line (e.g. pickled metadata).
+        Grab processed image frame with extended info line (e.g. pickled metadata).
         Default is to append a software timecode with a full frame copy action.
         Overwrite this method to use native larger buffer provided by 
         camera SDK that fits the extended info line.
         A reference implementation is provided, see `_append_metadata_to_image`.
+        
+        .. note:: If requiring the raw image with extended info, overwrite 
+            `grab_raw` to add extended info from the beginning, and **keep it** in 
+            following steps.
 
         :return: NDArray of image data. None if failed. 
         """
-        image = self.grab_raw(**kwargs)
+        image = self.grab(**kwargs)
         metadata = {'sw_timecode': time.time()}
         if image is None:
             return None
