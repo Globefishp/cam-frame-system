@@ -385,6 +385,9 @@ class ProcessSafeSharedRingBuffer:
             RuntimeError: If the shared buffer has been uninitialized.
             ValueError: If the frame count exceeds buffer capacity or frame size/dtype mismatch.
         """
+        # If a single frame: add frame_num dimension.
+        if frames.ndim == 3: frames = np.expand_dims(axis=0)
+
         # Validate frame counts to put
         if len(frames) > self._buffer_capacity:
             raise ValueError(f"Frame count {len(frames)} exceeds buffer capacity {self._buffer_capacity}.")
