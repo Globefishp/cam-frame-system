@@ -1,4 +1,4 @@
-# analyzers/base_analyzer.py
+# analyzers/analyzer.py
 # Refactored by Gemini 3.1 pro, Reviewed & Corrected by Haiyun Huang (260507)
 
 import multiprocessing as mp
@@ -67,23 +67,23 @@ class BaseAnalyzer(ABC):
         Initialize BaseAnalyzer resource management.
 
         Args:
-            frame_server: (FrameServer), the frame server instance to get frame from.
-            tensor_type: (TensorType), specify the data structure that will be 
+            frame_server (FrameServer): The frame server instance to get frame from.
+            tensor_type (TensorType): Specify the data structure that will be 
                 accepted by `_analyze()`
-            device: (DeviceType), If `tensor_type=TensorType.TORCH`, it is configurable
+            device (DeviceType): If `tensor_type=TensorType.TORCH`, it is configurable
                 where the tensor is stored when passed to `_analyze()`. `DeviceType.CUDA` 
                 will accelerate further GPU operations. If `tensor_type=TensorType.NUMPY`, 
                 this argument has no effect.
-            consumer_mode: (ConsumerMode), control the behaviour to fetch a frame. 
+            consumer_mode (ConsumerMode): Control the behaviour to fetch a frame. 
                 `ConsumerMode.SYNC` will ensure no frame skipping, but also have the risk
                 of filling up the buffer if the analyzer is too slow; `ConsumerMode.ASYNC` 
                 will always fetch the newest frame non-blockingly to avoid buffer overflow.
-            continuous_mode: (bool), control the behaviour of the worker loop. 
+            continuous_mode (bool): Control the behaviour of the worker loop. 
                 `continuous_mode=True` will fetch and analyze frames continuously. 
                 `continuous_mode=False` will wait for explicit `step()` calls.
-            fetch_timeout: Timeout for fetching a single frame.
-            stat_interval: Interval for statistics.
-            inject_logger: Logger instance.
+            fetch_timeout (float): Timeout for fetching a single frame.
+            stat_interval (float): Interval for statistics update.
+            inject_logger (Optional[Logger]): Loguru logger instance.
         """
         if not isinstance(frame_server, FrameServer):
             raise TypeError("frame_server must be a FrameServer instance.")
