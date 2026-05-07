@@ -1,4 +1,4 @@
-# encoders/videoencoder.py
+# encoders/videoencoder_v3.py
 # History:
 #  v2   (260407): Using ring buffer v2a, supports functional cross-process 
 #                 pickle (not standard pickle, but works for mp) ->
@@ -75,7 +75,7 @@ class BaseVideoEncoder(ABC):
 
         Args:
             frame_server: (FrameServer), the frame server instance to get frame from.
-                Should be registered as a strict consumer of the frame server.
+                The VideoEncoder instance will be registered as a strict consumer.
             output_path: (str), path to the output video file.
             batch_size: (int), number of frames to get from the buffer at once. 
                 Defaults to 5.
@@ -143,11 +143,12 @@ class BaseVideoEncoder(ABC):
         
         self._status_rx, self._status_tx = mp.Pipe(duplex=False)
 
-    def _status_worker(self):
+    def _status_upd_worker(self):
         """Daemon thread loop for receiving status updates from child process."""
+        logger = self.__logger
         while self._worker_enable.is_set():
             try:
-                if self._status_rx.poll(0.5):
+                if self._status_rx.poll(0.1):
                     msg_type, data = self._status_rx.recv()
                     with self._status_lock:
                         if msg_type == 'update':
@@ -159,13 +160,14 @@ class BaseVideoEncoder(ABC):
                             self._status.clear()
                             self._status.update(data)
             except (EOFError, BrokenPipeError):
+                logger.debug("Status worker exited due to EOF or BrokenPipe.")
                 break
             except Exception as e:
-                self.__logger.opt(exception=e).error("Error in daemon thread for status dict.")
+                logger.opt(exception=e).error("Error in daemon thread for status dict.")
 
     def _start_status_ipc(self):
         """Starts the background status fetching thread."""
-        self._status_thread = t.Thread(target=self._status_worker, daemon=True)
+        self._status_thread = t.Thread(target=self._status_upd_worker, daemon=True, name="EncoderStatusUpd")
         self._status_thread.start()
 
     def _stop_status_ipc(self):
@@ -181,8 +183,8 @@ class BaseVideoEncoder(ABC):
         if self._status_thread and self._status_thread.is_alive():
             self._status_thread.join(timeout=1.0)
             if self._status_thread.is_alive():
-                self.__logger.warning("Daemon thread for encoder status did not join, resources may leak.")
-                # keep reference for future handling.
+                self.__logger.warning("Status updater thread failed to join.")
+                # keep reference for future handling if needed (currently none)
             else:
                 self._status_thread = None
 
@@ -240,9 +242,6 @@ class BaseVideoEncoder(ABC):
         Raises:
             EncoderException: when critical error occurs and continue encoding is 
                 not possible.
-        
-        Logging: Should have `pid` and `name` fields.
-
         """
         raise NotImplementedError
 
@@ -264,8 +263,6 @@ class BaseVideoEncoder(ABC):
             EncoderException: when critical error occurs and continue encoding is 
                 not possible.
         
-        Logging: Should have `pid` and `name` fields.
-        
         Notes:
             np.concat(List[np.ndarray], axis=0) will results in a full batch
             of frames with shape (batch_size(ideally), height, width, channel), 
@@ -284,8 +281,6 @@ class BaseVideoEncoder(ABC):
         Raises:
             EncoderException: when critical error occurs and continue encoding is 
                 not possible.
-        
-        Logging: Should have `pid` and `name` fields.
         """
         raise NotImplementedError
 
@@ -394,11 +389,10 @@ class BaseVideoEncoder(ABC):
                     self._not_eager_stop.clear()
 
             self._worker_ready.clear()
-            logger.info(f"Encoder worker exited working loop.")
 
         finally:
             # Ensure uninitialization and unregister consumer are attempted
-            logger.info(f"Encoder worker uninitializing encoder and unregistering from FrameServer.")
+            logger.debug(f"Encoder worker exited working loop, cleaning up...")
             try:
                 self._uninitialize_encoder()
             except Exception as e:
@@ -416,6 +410,7 @@ class BaseVideoEncoder(ABC):
         Launches the background worker process and starts the video encoder.
 
         Does nothing if the encoder is already running.
+        It is not safe to call `start` and `stop` concurrently.
         """
         pid = mp.current_process().pid
         logger = self.__logger
@@ -440,7 +435,7 @@ class BaseVideoEncoder(ABC):
             self._init_status_ipc()
             self._start_status_ipc()
             
-            logger.info("Starting worker process...")
+            logger.debug("Starting worker process...")
 
             # v3: pass in cid, allow multiple sessions rotate seamlessly.
             wp = mp.Process(target=self._worker, args=(self._fs_cid,))
@@ -448,7 +443,7 @@ class BaseVideoEncoder(ABC):
             wp.start()
 
             # Wait for worker to signal readiness
-            logger.info(f"Worker process started (PID {wp.pid}), waiting to be ready...")
+            logger.debug(f"Worker process started (PID {wp.pid}), waiting to be ready...")
 
             # Add timeout to worker ready wait
             if not self._worker_ready.wait(timeout=10.0): # e.g., 10 seconds timeout
@@ -472,6 +467,7 @@ class BaseVideoEncoder(ABC):
             set to a large value.
 
         Does nothing if the encoder is already stopped.
+        It is not safe to call `start` and `stop` concurrently.
 
         Args:
             resumable (bool): If True, will not release the consumer from frame 
@@ -506,7 +502,7 @@ class BaseVideoEncoder(ABC):
 
             # Wait for worker process to finish
             if wp.is_alive():
-                logger.info(f"Waiting for VideoEncoder worker ({wp.pid}) to join. "
+                logger.info(f"Waiting for VideoEncoder worker {wp.pid} to join. "
                             f"Buffer load: {buffer.occupied_count_} frames.")
                 # Wait mainly for all buffered frame get encoded, but sometimes waiting _uninit_encoder,
                 # depends on the impl. of encoder (whether _encoder_frame is blocking or not)
@@ -524,10 +520,10 @@ class BaseVideoEncoder(ABC):
                                 f"data may corrupted...")
                     # TODO: Signal outside to choose behaviour?
                     wp.terminate() # Force terminate if join times out
-                time.sleep(1.0) # Wait for the process to actually terminate
+                wp.join(timeout=1.0) # Wait for the process to actually terminate
                 if wp.is_alive():
                     raise TimeoutError("Worker process did not terminate within timeout.")
-                logger.info(f"Worker process ({wp.pid}) joined.")
+                logger.info(f"Worker process {wp.pid} joined.")
 
             self._worker_process = None
             self._stop_status_ipc()
