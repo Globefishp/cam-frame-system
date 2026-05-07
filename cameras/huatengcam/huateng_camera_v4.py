@@ -524,7 +524,11 @@ class HuatengCamera(AC):
     def grab_extended_info(self) -> Optional[np.ndarray]:
         frame, tc_val = self._grab_extendedbuf_metadata()
         if frame is None: return None
+        frame = self._processor.process(frame) # Return uint16
 
+        if self._bit_depth == BitDepth._8: 
+            frame = frame.view(np.uint8)[..., _UINT16_HIGHBYTE::2]
+        
         # Write metadata to extra_line, 
         print(tc_val)
         metadata = HuatengCamera.HuatengCamMetadata(hw_timecode=tc_val)
@@ -543,14 +547,14 @@ class HuatengCamera(AC):
 
     def _append_metadata_to_image(self, image: NDArray, metadata: HuatengCamMetadata) -> NDArray:
         """
-        Append metadata to the image with extra lines. To make the process
-        zero-copy, the input image should be C-contiguous.
+        Append metadata to the image with extra lines. Zero-copy, 
+        Supports non-C-contiguous view use .flat
 
         :param image: Input image with shape (H + extra_lines, W).
         :type image: NDArray
         :param metadata: Metadata to append.
         :type metadata: HuatengCamMetadata
-        :return: Image with metadata appended. (if zero-copy, same ptr as input)
+        :return: Image with metadata appended. (Zero-copy, same ptr as input)
         :rtype: NDArray
         """
         length = ctypes.sizeof(metadata)
@@ -560,9 +564,9 @@ class HuatengCamera(AC):
             return image
 
         extra_rows_np = image[-extra_lines:]
-        extra_byte_view = extra_rows_np.view(np.uint8).ravel() # C-contiguous to avoid copy.
+        extra_byte_view = extra_rows_np.view(np.uint8).flat # .flat view supports non-C-contiguous array.
 
-        if length > len(extra_byte_view):
+        if length > extra_byte_view.size:
             raise RuntimeError(f"Metadata bytes ({length}B) is too large to fit in "
                          f"{extra_lines} extra lines ({len(extra_byte_view)}B)."
                         "Metadata is truncated.")
@@ -606,7 +610,7 @@ class HuatengCamera(AC):
         
         metadata_struct: ctypes.Structure = metadata_class()
         # dst_addr = ctypes.addressof(metadata_struct)
-        if len(extra_byte_view) >= ctypes.sizeof(metadata_class):
+        if extra_byte_view.size >= ctypes.sizeof(metadata_class):
             # ctypes.memmove(dst_addr, extra_byte_view.ctypes.data, ctypes.sizeof(metadata_class))
             metadata_struct = metadata_class.from_buffer_copy(extra_byte_view)
 
