@@ -585,7 +585,7 @@ class HuatengCamera(AC):
     def extract_extended_info(self, image: NDArray) -> dict[str, Any]:
         return self._extract_extended_info(image, self.extra_lines, self.__class__.HuatengCamMetadata)
     def strip_extended_info(self, image):
-        return super().strip_extended_info(image)
+        return self._strip_metadata_from_image(image, self.extra_lines)
     
     @staticmethod
     def _extract_extended_info(image: NDArray, 
