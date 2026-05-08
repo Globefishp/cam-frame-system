@@ -8,9 +8,10 @@ from multiprocessing.connection import Connection
 import threading as t
 import time
 from abc import ABC, abstractmethod
-from typing import Optional, Any, Union, Callable, TypeVar, cast, TYPE_CHECKING
+from typing import Optional, Any, Union, Callable, Tuple, List, Dict, TypeVar, cast, TYPE_CHECKING
 from functools import wraps
 import numpy as np
+from numpy.typing import NDArray
 
 if TYPE_CHECKING: import torch # Lazy import for env that don't have pytorch.
 # CUDAPinner is lazy imported.
@@ -61,6 +62,7 @@ class BaseAnalyzer(ABC):
                  continuous_mode: bool = True,
                  fetch_timeout: float = 0.1,        # Timeout for fetching a single frame.
                  stat_interval: float = 1.0,
+                 extinfo_extractor: Optional[Callable[[NDArray,], Tuple[NDArray, List[Dict[str, Any]]]]] = None,
                  inject_logger: Optional[Logger] = None,
                  **kwargs):
         """
@@ -83,6 +85,11 @@ class BaseAnalyzer(ABC):
                 `continuous_mode=False` will wait for explicit `step()` calls.
             fetch_timeout (float): Timeout for fetching a single frame.
             stat_interval (float): Interval for statistics update.
+            extinfo_extractor (Optional[Callable[[NDArray,], Tuple[NDArray, List[Dict[str, Any]]]]]):
+                A callable object that accepts a batch of frames with extended info, 
+                returns a tuple of (NDArray of frames, ordered list of Dict of extended info).
+                If provided, the list of extended info will be add to kwargs that pass in 
+                `_analyze()`, as key='ext_info'.
             inject_logger (Optional[Logger]): Loguru logger instance.
         """
         if not isinstance(frame_server, FrameServer):
@@ -91,13 +98,14 @@ class BaseAnalyzer(ABC):
         self._frame_server: FrameServer = frame_server
         self._fs_cid: Optional[int] = None
         
-        self._batch_size = batch_size
-        self._tensor_type = tensor_type
-        self._device = device
-        self._consumer_mode = consumer_mode
-        self._continuous_mode = continuous_mode
-        self._fetch_timeout = fetch_timeout if consumer_mode == ConsumerMode.SYNC else 0 # get_async is non-blocking
-        self._stat_interval = stat_interval
+        self._batch_size        = batch_size
+        self._tensor_type       = tensor_type
+        self._device            = device
+        self._consumer_mode     = consumer_mode
+        self._continuous_mode   = continuous_mode
+        self._fetch_timeout     = fetch_timeout if consumer_mode == ConsumerMode.SYNC else 0.0 # get_async is non-blocking
+        self._stat_interval     = stat_interval
+        self._extinfo_extractor = extinfo_extractor
         
         if inject_logger is not None:
             if isinstance(inject_logger, Logger):
@@ -273,7 +281,8 @@ class BaseAnalyzer(ABC):
         Trigger a single analysis step asynchronously. To check the result, 
         see `get_error()`.
 
-        :params kwargs: Parameters passed to the analyzer.
+        :params kwargs: Parameters dict that will be added to kwargs that passed
+            to the `_analyze()`.
         :return: `step_id` to query error status in get_error(step_id). 
             `-1` if `continuous_mode` is True.
         """
@@ -326,11 +335,12 @@ class BaseAnalyzer(ABC):
         pass
 
     @abstractmethod
-    def _analyze(self, frame: Union[np.ndarray, "torch.Tensor"], **kwargs) -> Any:
+    def _analyze(self, frame: Union[np.ndarray, "torch.Tensor"], ext_info: Optional[List[dict]] = None, **kwargs) -> Any:
         """
         Analyze a frame.
         Args:
             frame: NDArray or Torch Tensor depending on configuration.
+            ext_info: List of extended information dicts for the frames.
             kwargs: Parameters passed via step() if continuous_mode=False.
         """
         pass
@@ -499,6 +509,15 @@ class BaseAnalyzer(ABC):
                 
                 frames_list = frame_server.get_from_ticket(ticket, timeout=0.1)
                 if frames_list:
+                    extinfo_list = None
+                    if self._extinfo_extractor is not None:
+                        extinfo_list = []
+                        for i in range(len(frames_list)):
+                            frames_list[i], extinfo_block = self._extinfo_extractor(frames_list[i])
+                            # frames_list now is pure frame without extra_line. 
+                            # This step is usually zero-copy, depends on the impl of Extractor.
+                            extinfo_list.extend(extinfo_block)
+                    
                     # Handle Frame Tensor / Array wrapping logic
                     if len(frames_list) == 1:
                         data = frames_list[0]
@@ -508,15 +527,15 @@ class BaseAnalyzer(ABC):
                             if self._device == DeviceType.CUDA:
                                 data = data.to('cuda', non_blocking=True) # TODO: will it crash when other process write the address?
                     else:
-                        part1, part2 = frames_list
+                        block1, block2 = frames_list
                         if self._tensor_type == TensorType.TORCH:
-                            t1 = torch.from_numpy(part1)
-                            t2 = torch.from_numpy(part2)
+                            t1 = torch.from_numpy(block1)
+                            t2 = torch.from_numpy(block2)
                             if self._device == DeviceType.CUDA:
                                 # Pre-allocate on GPU and use 2 async copy_ to avoid host concatenation & slow transfer
-                                data = torch.empty((self._batch_size, *part1.shape[1:]), dtype=t1.dtype, device='cuda')
-                                data[:part1.shape[0]].copy_(t1, non_blocking=True)
-                                data[part1.shape[0]:].copy_(t2, non_blocking=True)
+                                data = torch.empty((self._batch_size, *block1.shape[1:]), dtype=t1.dtype, device='cuda')
+                                data[:block1.shape[0]].copy_(t1, non_blocking=True)
+                                data[block1.shape[0]:].copy_(t2, non_blocking=True)
                             else:
                                 data = torch.cat([t1, t2], dim=0)
                         else:
@@ -524,7 +543,7 @@ class BaseAnalyzer(ABC):
 
                     # Execute Analysis
                     try:
-                        self._analyze(data, **kwargs)
+                        self._analyze(data, ext_info=extinfo_list, **kwargs)
                         frame_count += self._batch_size
                         
                         # Statistics Interval Update

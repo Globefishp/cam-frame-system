@@ -3,10 +3,27 @@
 
 import torch
 import numpy as np
+from numpy.typing import NDArray
 import threading as t
-from typing import Optional, Any, Tuple, Union, Dict, List
+import time
+import os
+from io import TextIOWrapper
+from pathlib import Path
+from typing import Optional, Any, Tuple, Union, Dict, List, Callable, Protocol
 from .yolo_analyzer import YOLOBaseAnalyzer
 from .analyzer_types import DeviceType
+
+class TimecodeExtractor(Protocol):
+    def __call__(self, image: NDArray, **kwargs: Any) -> tuple[NDArray, List[Dict[str, Any]]]:
+        pass
+    @property
+    def timebase(self) -> int:
+        """1/timebase equals time per tick in second."""
+        pass
+    @property
+    def timecode_key(self) -> str:
+        """The key to extract timecode from the extended info dict."""
+        pass
 
 class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
     """
@@ -14,53 +31,125 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
     box inner grayscale statistics.
     
     Features:
-        - Image Tiling (1 frame -> N tiles) to maintain resolution on large images.
+        - Image Tiling (1 frame -> N tiles) for batch processing multiple ROIs.
         - Continuous execution mode by default, managing its own `frame_counter`.
-        - Pure GPU transformation for grayscale.
+        - GPU transformation for grayscale.
     """
 
     def __init__(self,
                  frame_server: Any,
-                 model_path: str,
+                 model_path: Union[str, Path],
                  batch_size: int,
                  tile_grids: List[Tuple[int, int]],
                  tile_shape: Tuple[int, int],
                  color_weights: Optional[Tuple[float, float, float]] = None,
+                 save_path: Optional[Union[str, Path]] = None,
+                 extinfo_extractor: Optional[TimecodeExtractor] = None,
                  **kwargs):
         """
         Args:
+            frame_server (FrameServer): The FrameServer instance.
+            model_path (str | Path): Path to the .pt YOLO model file.
             batch_size (int): Batch size for YOLO inference.
-            tile_grids (List[Tuple[int, int]]): A list of (x, y) tuples defining the upper-left of tiles.
+            tile_grids (List[Tuple[int, int]]): A list of (x, y) tuples defining 
+                the upper-left of tiles.
             tile_shape (Tuple[int, int]): The shape of all tiles (height, width).
-            color_weights (Optional[Tuple[float, float, float]]): RGB transformation weights for grayscale. 
-                Default is np.eye(3)*(0.299, 0.587, 0.114).
+            color_weights (Optional[Tuple[float, float, float]]): RGB transformation 
+                weights for grayscale. Default is np.eye(3)*(0.299, 0.587, 0.114).
+            save_path (Optional[Path]): CSV file path to save results. 
+                If None, no CSV file will be saved.
+            tc_extractor (Optional[TimecodeExtractor]): 
+                Extractor for hardware timecode. If None, will record POSIX 
+                nanoseconds of process finish time.
+            kwargs:
+                batch_size (int): The number of frames to process in a batch. 
+                tensor_type (TensorType): TensorType.TORCH is used.
+                device (DeviceType): if CUDA available, use GPU.
+                consumer_mode (ConsumerMode): control whether frame drop may happens
+                    at the cost of blocking the buffer, see FrameServer for details.
+                continuous_mode (bool): control whether the analyzer fetch frames 
+                    continuously or upon `step()` call (in BaseAnalyzer)
+                fetch_timeout (float): (only used when ConsumerMode.SYNC and 
+                    continuous_mode=False) timeout for fetch a batch of frames 
+                    after `step()`
+                stat_interval (float): interval for statistics update.
+                inject_logger (Optional[Logger]): loguru logger instance.
         """
         # Force continuous mode for self-managed frame counter streaming
         kwargs['continuous_mode'] = True 
         kwargs['batch_size'] = batch_size
+        kwargs['extinfo_extractor'] = extinfo_extractor
         super().__init__(frame_server=frame_server, model_path=model_path, **kwargs)
+        self._timecode_extractor = extinfo_extractor
         
-        self._tile_grids = tile_grids
-        self._tile_shape = tile_shape
+        self._tile_grids: List[Tuple[int, int]] = tile_grids
+        self._tile_shape: Tuple[int, int] = tile_shape
         
         # Fallback to standard RGB->Gray luminance weights
         if color_weights is None:
             color_weights = (0.299, 0.587, 0.114)
-        self._color_weights = color_weights
+        self._color_weights: Tuple[float, float, float] = color_weights
+        
+        self._save_path: Optional[Path] = Path(save_path) if save_path else None
+        self._csv_file_handle: Optional[TextIOWrapper] = None
         
         # State Management
         self._frame_counter: int = 0
         self._prev_center: Optional[Tuple[float, float]] = None
-        self._history_lock = t.Lock()
+        # pickle problem, defer init to _initialize_analyzer which is run in subprocess
+        self._history_lock: Optional[t.Lock] = None 
         
         # Subprocess device-specific tensor (initialized in _initialize_analyzer)
         self._color_matrix: Optional[torch.Tensor] = None
 
+    @property
+    def model_path(self) -> Path:
+        return Path(self._model_path)
+    @model_path.setter
+    @YOLOBaseAnalyzer.require_stop
+    def model_path(self, path: Union[str, Path]):
+        self._model_path = Path(path)
+
+    @property
+    def save_path(self) -> Optional[Path]:
+        return Path(self._save_path)
+    @save_path.setter
+    @YOLOBaseAnalyzer.require_stop
+    def save_path(self, path: Optional[Union[str, Path]]):
+        self._save_path = Path(path)
+
     def _initialize_analyzer(self):
         super()._initialize_analyzer()
+        self._history_lock = t.Lock()
+
+        logger = self._logger
         device_str = 'cuda' if self._device == DeviceType.CUDA else 'cpu'
         # Shape (3, 1) for matrix multiplication with (H, W, 3)
         self._color_matrix = torch.tensor(self._color_weights, device=device_str, dtype=torch.float32).view(3, 1)
+        
+        if self._save_path:
+            # Create directories if not exist
+            try:
+                os.makedirs(self._save_path.parent, exist_ok=True)
+            except (PermissionError, OSError) as e:
+                import tempfile
+                self._save_path = Path(f"{tempfile.gettempdir()}/{self._save_path.name}")
+                try:
+                    os.makedirs(self._save_path.parent, exist_ok=True)
+                except Exception as e:
+                    raise
+                logger.warning(f"Failed to create save directory: {e}, fall back to use {self._save_path}")
+            file_exists = self._save_path.exists()
+            self._csv_file_handle = open(self._save_path, "a", encoding="utf-8")
+            if not file_exists or self._save_path.stat().st_size == 0:
+                self._csv_file_handle.write("FrameIndex,Timestamp,Displacement,Grayscale,BBox\n")
+            self._csv_file_handle.flush()
+
+    def _uninitialize_analyzer(self):
+        if self._csv_file_handle is not None:
+            self._csv_file_handle.close()
+            self._csv_file_handle = None
+        super()._uninitialize_analyzer()
 
     def _handle_command(self, cmd_name: str, payload: Any):
         """Handle async commands from main process concurrently."""
@@ -73,29 +162,29 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
         else:
             self._status_subdict_update("error", {"cmd": f"Unknown command {cmd_name}"})
 
-    def _preprocess(self, frame: torch.Tensor, **kwargs) -> Tuple[torch.Tensor, Dict]:
+    def _preprocess(self, frames: torch.Tensor, ext_info: Optional[List[dict]] = None, **kwargs) -> Tuple[torch.Tensor, Dict]:
         """
         Handle arbitrary Tiling (List of (x,y) and (h,w)), Type Casting, and NHWC to NCHW rearrangement.
         """
         # frame shape: (B, H, W, C)
-        B, H, W, C = frame.shape
+        B, H, W, C = frames.shape
         N = len(self._tile_grids)
         H_t, W_t = self._tile_shape
         
         # Pre-allocate the final contiguous float32 tensor in NCHW format
         # Shape: (B * N, C, H_t, W_t)
-        tiles = torch.empty((B * N, C, H_t, W_t), dtype=torch.float32, device=frame.device)
+        tiles = torch.empty((B * N, C, H_t, W_t), dtype=torch.float32, device=frames.device)
         
         for i, (tx, ty) in enumerate(self._tile_grids):
             # Slice the patch (B, H_t, W_t, C) and permute to (B, C, H_t, W_t)
             # view, no extra memory copy
-            patch = frame[:, ty:ty+H_t, tx:tx+W_t, :].permute(0, 3, 1, 2)
+            patch = frames[:, ty:ty+H_t, tx:tx+W_t, :].permute(0, 3, 1, 2)
             
             # Copy to pre-allocated tensor with fused Normalization
             # i::N perfectly maps the batch size for N tiles.
-            if frame.dtype == torch.uint8:
+            if frames.dtype == torch.uint8:
                 tiles[i::N] = patch.float() / 255.0
-            elif frame.dtype in (torch.int16, torch.uint16, torch.int32): 
+            elif frames.dtype in (torch.int16, torch.uint16, torch.int32): 
                 # 16-bit images loaded via generic pipelines are often int16/int32
                 tiles[i::N] = patch.float() / 65535.0
             else:
@@ -106,10 +195,9 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
             "original_h": H,
             "original_w": W
         }
-        
         return tiles, metadata
 
-    def _postprocess(self, results: list, original_frame: torch.Tensor, metadata: Dict, **kwargs):
+    def _postprocess(self, results: list, original_frames: torch.Tensor, metadata: Dict, ext_info: Optional[List[dict]] = None, **kwargs):
         """
         Map bounding boxes back to global coordinates, calculate displacement,
         compute grayscale via pure GPU Matrix Ops, and update results via IPC.
@@ -179,7 +267,7 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
                 x1, y1, x2, y2 = best_bbox
                 # Grayscale Calculation (Pure GPU Matrix operation)
                 # original_frame shape is (B, H, W, C). Slice ROI.
-                roi = original_frame[b, y1:y2, x1:x2, :]
+                roi = original_frames[b, y1:y2, x1:x2, :]
                 
                 if roi.numel() > 0:
                     # Convert ROI to float (if not already) for matrix multiplication
@@ -189,13 +277,32 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
                     # Squeeze to (h, w) and mean
                     gray_value = roi_gray.mean().item()
             
-            # 3. Format payload using frame_id as Key
+            # 3. Get Timecode from extended info (parsed in BaseAnalyzer)
+            timecode = None
+            if ext_info:
+                timecode = int(ext_info[b][self._timecode_extractor.timecode_key] *
+                               1_000_000_000 / self._timecode_extractor.timebase)
+
+            if timecode is None:
+                timecode = time.time_ns()
+
+            bbox_str = f"{best_bbox[0]},{best_bbox[1]},{best_bbox[2]},{best_bbox[3]}" if best_bbox else "None"
+            
+            # 4. Format payload using frame_id as Key
             batch_results_dict[current_frame_id] = {
+                "timestamp": timecode,
                 "status": "detected" if best_bbox else "lost",
                 "bbox": best_bbox,          # Format: Tuple(x1, y1, x2, y2)
                 "displacement": displacement,
                 "grayscale": gray_value
             }
+            
+            # 5. Stream to CSV
+            if self._csv_file_handle is not None:
+                self._csv_file_handle.write(f"{current_frame_id},{timecode},{displacement},{gray_value},\"{bbox_str}\"\n")
         
+        if self._csv_file_handle is not None:
+            self._csv_file_handle.flush()
+
         # Commit batched updates via IPC to Main Process
         self._result_update(batch_results_dict)
