@@ -609,6 +609,6 @@ class ExtInfoExtractor:
             tuple[NDArray, list[dict[str, Any]]]: Image (or batch of images) 
                 without extended info and List of extended info dict.
         """
-        extended_info = self.decode_func(image, **self.decode_kwargs)
-        stripped_image = self.strip_func(image, **self.strip_kwargs)
+        extended_info = self.static_decode_func(image, **self.decode_kwargs)
+        stripped_image = self.static_strip_func(image, **self.strip_kwargs)
         return stripped_image, extended_info
