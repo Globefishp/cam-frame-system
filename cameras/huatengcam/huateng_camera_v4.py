@@ -63,6 +63,7 @@ class HuatengCamera(AC):
                  bayer_pattern: BayerPattern = _BAYER_PATTERN, # For Our ISP?
                  exposure_time_ms: float = _FRAME_TIME,
                  gain: float = _GAIN,
+                 timecode_en: bool = True,
                  inject_logger: Optional[Logger] = None,
                  ):
         """Initialize HuatengCamera chosen by DevInfo
@@ -71,12 +72,18 @@ class HuatengCamera(AC):
         :param fps: Target FPS, If `None`, the camera will run in freerun mode.
         :param bitdepth: Define the raw bit depth grabbed, affect internal processing.
         :param bayer_pattern: Bayer pattern for specified camera. TODO: auto detect?
+        :param timecode_en: Enable timecode feature will allocate one extra line of 
+            space to store metadata, the `full_height` but not `height` property will 
+            change correspondingly. Use `ExtInfoExtractor` to get pure frame and 
+            'hw_timecode'.
         :param inject_logger: Injected loguru.Logger instance for logging.
         """
         super().__init__(inject_logger=inject_logger)
         self._logger = self._logger.bind(friendly_name="HuatengCamera")
 
-        self._features_enabled = CameraFeatures.TIMECODE | CameraFeatures.GAIN
+        self._features_enabled = CameraFeatures.GAIN
+        if timecode_en:
+            self._features_enabled |= CameraFeatures.TIMECODE
 
         self._DevInfo: mvsdk.tSdkCameraDevInfo = dev_info
         self._hCamera: int = 0 # Camera handle in sdk.
@@ -207,7 +214,7 @@ class HuatengCamera(AC):
         else:
             logger.success(f"Loaded color correction from {self._correction_path}")
         self._processor = RawV11Processor(
-            self.height, self.width, 
+            self.full_height, self.full_width, 
             black_level=correction_info["BLC"],
             ADC_max_level=correction_info["ADC_MAX_LEVEL"],
             bayer_pattern='BGGR' if self._bayer_pattern == BayerPattern.BGGR else 'RGGB',
@@ -322,7 +329,8 @@ class HuatengCamera(AC):
         else: raise CamException("The property requires the camera to be opened at least once.", src_func="HuatengCamera.full_width")
     @property
     def full_height(self) -> int: 
-        if self._image_height is not None: return self._image_height
+        if self._image_height is not None: 
+            return self._image_height + self.extra_lines if self.is_feature_enabled(CameraFeatures.TIMECODE) else self._image_height
         else: raise CamException("The property requires the camera to be opened at least once.", src_func="HuatengCamera.full_height")
     @property
     def channels(self) -> int: 
@@ -500,7 +508,9 @@ class HuatengCamera(AC):
         # TODO: Impl. Fused ISP (ProcessorV12)
         frame = self.grab_raw()
         if frame is None: return None
-        frame = self._processor.process(frame)
+        frame = self._processor.process(frame) # output dimension defined when processor init.
+        if self.is_feature_enabled(CameraFeatures.TIMECODE):
+            frame = self.strip_extended_info(frame)
 
         if self._bit_depth == BitDepth._12: 
             return frame 
@@ -522,6 +532,8 @@ class HuatengCamera(AC):
         return frame, {'hw_timecode': tc_val}
 
     def grab_extended_info(self) -> Optional[np.ndarray]:
+        if not self.is_feature_enabled(CameraFeatures.TIMECODE):
+            raise CamException("TIMECODE is not enabled during initialization.", src_func="HuatengCamera.grab_extended_info")
         frame, tc_val = self._grab_extendedbuf_metadata()
         if frame is None: return None
         frame = self._processor.process(frame) # Return uint16
@@ -530,7 +542,6 @@ class HuatengCamera(AC):
             frame = frame.view(np.uint8)[..., _UINT16_HIGHBYTE::2]
         
         # Write metadata to extra_line, 
-        print(tc_val)
         metadata = HuatengCamera.HuatengCamMetadata(hw_timecode=tc_val)
         frame = self._append_metadata_to_image(frame, metadata)
 
@@ -566,7 +577,7 @@ class HuatengCamera(AC):
         extra_rows_np = image[-extra_lines:]
         extra_byte_view = extra_rows_np.view(np.uint8).flat # .flat view supports non-C-contiguous array.
 
-        if length > extra_byte_view.size:
+        if length > extra_rows_np.size:
             raise RuntimeError(f"Metadata bytes ({length}B) is too large to fit in "
                          f"{extra_lines} extra lines ({len(extra_byte_view)}B)."
                         "Metadata is truncated.")
@@ -665,7 +676,7 @@ if __name__ == '__main__':
     import cv2
     cam_enum = HuatengCamera.enumerate_cameras()
     print(cam_enum)
-    cam = HuatengCamera(cam_enum[0], fps=None, bitdepth=BitDepth._12)
+    cam = HuatengCamera(cam_enum[0], fps=None, bitdepth=BitDepth._12, timecode_en=True)
     cam.open()
     print(cam.height)
     print(cam.exposure_time_ms_range)
@@ -711,7 +722,7 @@ if __name__ == '__main__':
         cam.start_capture()
 
         frame, timecode = cam.grab_metadata()
-        print(timecode)
+        print("grab_metadata", timecode)
         cv2.imshow("frame", frame[1024:, :]*16)
         cv2.waitKey(0)
         frame = cam.grab_extended_info()
@@ -720,7 +731,7 @@ if __name__ == '__main__':
         cv2.waitKey(0)
         ext_info_extractor = cam.get_extended_info_extractor()
         frame, ext_info = ext_info_extractor(frame)
-        print(ext_info)
+        print("ext_info", ext_info)
         print(frame.shape)
         cv2.imshow("frame", frame[1024:, :]*16)
         cv2.waitKey(0)
