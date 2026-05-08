@@ -589,7 +589,7 @@ class HuatengCamera(AC):
     
     @staticmethod
     def _extract_extended_info(image: NDArray, 
-            extra_lines: int, metadata_class: type[ctypes.Structure]) -> dict[str, Any]:
+            extra_lines: int, metadata_class: type[ctypes.Structure]) -> list[dict[str, Any]]:
         """
         Extract metadata from the image
 
@@ -599,27 +599,36 @@ class HuatengCamera(AC):
         :type extra_lines: int
         :param metadata_class: Metadata class to extract.
         :type metadata_class: type[ctypes.Structure]
-        :return: Metadata dictionary.
-        :rtype: dict[str, Any]
+        :return: list of Metadata dictionary for each frame.
+        :rtype: list[dict[str, Any]]
         """
-        if image.shape[0] <= extra_lines or extra_lines <= 0:
+        is_batch = image.ndim == 4
+        if image.shape[-3] <= extra_lines or extra_lines <= 0:
             # No extra lines to extract.
-            return {}
-        extra_rows = image[-extra_lines:, ...]
-        extra_byte_view = extra_rows.view(np.uint8).ravel()
-        
-        metadata_struct: ctypes.Structure = metadata_class()
-        # dst_addr = ctypes.addressof(metadata_struct)
-        if extra_byte_view.size >= ctypes.sizeof(metadata_class):
-            # ctypes.memmove(dst_addr, extra_byte_view.ctypes.data, ctypes.sizeof(metadata_class))
-            metadata_struct = metadata_class.from_buffer_copy(extra_byte_view)
+            return [{}]
+        extra_rows = image[:, -extra_lines:, ...] if is_batch else image[-extra_lines:, ...]
 
-        # Translate back to dict.
-        return {field[0]: getattr(metadata_struct, field[0]) for field in metadata_struct._fields_}
+        def _extract_ctypes_struct(extra_rows: NDArray) -> dict:
+            extra_byte_view = extra_rows.view(np.uint8).ravel() # Use ravel() to collect non-contiguous memory.
+            
+            metadata_struct: ctypes.Structure = metadata_class()
+            # dst_addr = ctypes.addressof(metadata_struct)
+            if extra_byte_view.size >= ctypes.sizeof(metadata_class):
+                # ctypes.memmove(dst_addr, extra_byte_view.ctypes.data, ctypes.sizeof(metadata_class))
+                metadata_struct = metadata_class.from_buffer_copy(extra_byte_view)
+
+            # Translate back to dict.
+            return {field[0]: getattr(metadata_struct, field[0], None) for field in metadata_struct._fields_}
+        
+        if is_batch:
+            return [_extract_ctypes_struct(extra_rows[i]) for i in range(image.shape[0])]
+        else:
+            return [_extract_ctypes_struct(extra_rows),]
     
     @staticmethod
     def _strip_metadata_from_image(image, extra_lines):
-        return image[:-extra_lines, ...]
+        if image.ndim == 4: return image[:, :-extra_lines, ...]
+        else:               return image[:-extra_lines, ...]
     
     def _get_decode_ext_info_func(self):
         return self.__class__._extract_extended_info # TODO: a wrapper to enable multi frame processing like V3 API?
