@@ -580,8 +580,7 @@ class AbstractCamera(ABC):
         if image.ndim == 4: return image[:, :-extra_lines, ...]
         else:               return image[:-extra_lines, ...]
 
-# TODO: use frozen=True to have clearer immutable semantics?
-@dataclass(frozen=True)
+@dataclass
 class ExtInfoExtractor:
     """
     A universal extended info extractor that allows extracting subclass defined
