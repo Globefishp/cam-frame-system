@@ -23,8 +23,9 @@ from multiprocessing.sharedctypes import Synchronized
 from multiprocessing.connection import Connection
 import multiprocessing.synchronize as mp_sync
 import numpy as np
+from numpy.typing import NDArray
 import threading as t
-from typing import Tuple, Any, Optional, List, TypeVar, Callable, cast
+from typing import Tuple, Any, Optional, List, Dict, TypeVar, Callable, cast
 from functools import wraps
 from .videoencoder_types import EncoderException
 from frameserver import FrameServer # Import the FrameServer class
@@ -67,6 +68,7 @@ class BaseVideoEncoder(ABC):
                  batch_size: int = 5,
                  target_fps: Optional[float] = None,
                  stat_interval: float = 1.0,
+                 extinfo_extractor: Optional[Callable[[NDArray,], tuple[NDArray, List[Dict[str, Any]]]]] = None,
                  inject_logger: Optional[Logger] = None,
                  **kwargs 
                  # Extra kwargs should be handled and store per subclass implementation.
@@ -84,6 +86,9 @@ class BaseVideoEncoder(ABC):
                 warning for base class. Subclass may also use it. Defaults to None.
             stat_interval: (float), interval between status updates and warning checks
                 in seconds. Defaults to 1.0.
+            extinfo_extractor: (Optional[Callable[[NDArray,], tuple[NDArray, List[Dict[str, Any]]]]]), 
+                the extended info extractor instance for extracting timecodes from 
+                frames. if None, timecodes will not be extracted. Default to None. 
             inject_logger: (Optional[Logger]), the loguru logger instance for logging.
                 enqueue=True is required. if None, a default logger is acquired 
                 from *current process* (i.e. could differ from the logger instance 
@@ -109,6 +114,7 @@ class BaseVideoEncoder(ABC):
             self._logger = file_logger 
         # Base class bind its own friendly_name for logging.
         self.__logger: Logger = self._logger.bind(friendly_name="VideoEncoder")
+        self._extinfo_extractor = extinfo_extractor
 
         # Multiprocessing resources
         # v2: Graded signal for running and exiting in multiprocessing env.
@@ -247,16 +253,18 @@ class BaseVideoEncoder(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def _encode_frames(self, frames: List[np.ndarray]):
+    def _encode_frames(self, frames: List[np.ndarray], ext_info: Optional[List[dict]] = None, **kwargs):
         """
         Encode a batch of frames using the specific video encoder.
         This method MUST be implemented by subclasses.
         Args:
-            frames: (List[np.ndarray]), a list of input frames to encode.
+            frames (List[np.ndarray]): a list of input frames to encode.
                     the list contains **1 OR 2** np.ndarray objects,
                     each with shape (frame, height, width, channel).
                     The total number of frames should ideally match batch_size,
                     but **MAY BE LESS** for the last batch.
+            ext_info (Optional[List[dict]]): List of extended information dicts
+                extracted by ExtInfoExtractor. None if extractor is not provided.
         Returns:
             bool: True if encoding was successful, False otherwise.
 
@@ -349,13 +357,22 @@ class BaseVideoEncoder(ABC):
                         
                         # --- Encode the batch of frames ---
                         if frames_list:
+                            # Extract extended info and update frames_list with pure image data
+                            if self._extinfo_extractor is not None:
+                                ext_info_list = []
+                                for i, frames in enumerate(frames_list):
+                                    frames_list[i], ext_info_block = self._extinfo_extractor(frames)
+                                    ext_info_list.extend(ext_info_block)
+                            else:
+                                ext_info_list = None
+
                             # Calculate number of frames processed in this batch
                             num_frames_processed = sum(arr.shape[0] for arr in frames_list)
                             if num_frames_processed == 0: # Should not happen
                                 continue # Skip if no frames were actually processed
     
                             # Blocking method, Pass the list of frame views
-                            self._encode_frames(frames_list)
+                            self._encode_frames(frames_list, ext_info=ext_info_list)
                             self._frame_count.value += num_frames_processed
     
                             # Update Speed Calculation 

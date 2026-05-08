@@ -10,7 +10,7 @@
 import multiprocessing as mp
 import numpy as np
 from numpy.typing import NDArray
-from typing import Tuple, Any, Optional, List, Callable, Protocol
+from typing import Tuple, Any, Optional, List, Dict, Callable, Protocol
 from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
 from frameserver.v3.frameserver_v3 import FrameServer
 from encoders.videoencoder_v3 import BaseVideoEncoder
@@ -30,11 +30,15 @@ from loguru._logger import Logger # For Type Hinting Only
 _ENCODER_CURR_DIR = Path(__file__).resolve().parent
 
 class TimecodeExtractor(Protocol):
-    def __call__(self, image: NDArray, **kwargs: Any) -> tuple[NDArray, int]:
+    def __call__(self, image: NDArray, **kwargs: Any) -> tuple[NDArray, List[Dict[str, Any]]]:
         pass
     @property
     def timebase(self) -> int:
         """1/timebase equals time per tick in second."""
+        pass
+    @property
+    def timecode_key(self) -> str:
+        """The key to extract timecode from the extended info dict."""
         pass
     # TODO: Wrapper for ExtInfoExtractor, done in Backend (top level that responsible for DI)
 
@@ -49,7 +53,7 @@ class X264Encoder(BaseVideoEncoder):
                  target_fps: Optional[float] = None,
                  stat_interval: float = 1.0,
                  inject_logger: Logger = None,
-                 timecode_extractor: Optional[TimecodeExtractor] = None,
+                 extinfo_extractor: Optional[TimecodeExtractor] = None,
                  mux_timecode: bool = False,
                  **kwargs
         ):
@@ -70,7 +74,9 @@ class X264Encoder(BaseVideoEncoder):
                 not be extracted. Default to None. 
             mux_timecode: (bool), whether to mux the timecodes into the output video. 
                 Defaults to False. If True, uninit will blocking for long time. 
-                Ineffective when timecode_extractor is None.
+            extinfo_extractor: (Optional[TimecodeExtractor]), 
+                the extended info extractor instance for extracting timecodes from 
+                frames. if None, timecodes will not be extracted. Default to None. 
             kwargs: 
                 frame_size: (Tuple[int, int, int]), the frame size of the input frames.
                 crf: (int), the constant rate factor for x264 encoding.
@@ -87,7 +93,8 @@ class X264Encoder(BaseVideoEncoder):
         pid, friendly_name = mp.current_process().pid, "X264Encoder"
         fps = kwargs.get('fps', target_fps)
         super().__init__(frame_server, output_path, batch_size=batch_size, 
-            target_fps=fps, stat_interval=stat_interval, inject_logger=inject_logger)
+            target_fps=fps, stat_interval=stat_interval, extinfo_extractor=extinfo_extractor, 
+            inject_logger=inject_logger)
         self._logger = self._logger.bind(friendly_name=friendly_name)
 
         # Parse kwargs
@@ -119,7 +126,7 @@ class X264Encoder(BaseVideoEncoder):
         self._x264_finished: Optional[threading.Event] = None
         
         # Timecode related attributes
-        self._timecode_extractor: TimecodeExtractor = timecode_extractor
+        self._timecode_extractor: TimecodeExtractor = extinfo_extractor
         self._do_mux_timecode: bool = mux_timecode
         self._last_timecode_value: Optional[int] = None # For future use: checking monotonicity
         self._timecode_log_path: Optional[str] = None # File path for timecode logging.
@@ -325,7 +332,7 @@ class X264Encoder(BaseVideoEncoder):
             raise # Re-raise the exception to indicate initialization failure
 
 
-    def _encode_frames(self, frames_list: List[np.ndarray]) -> bool:
+    def _encode_frames(self, frames_list: List[np.ndarray], ext_info: Optional[List[dict]] = None, **kwargs) -> bool:
         """
         Encodes a list of frame chunks using the initialized x264 encoder.
         Each chunk in the list is an np.ndarray of frames.
@@ -361,34 +368,13 @@ class X264Encoder(BaseVideoEncoder):
                 logger.warning(f"Received empty or None frame_chunk_arr in list. Skip encoding.")
                 continue # Skip this chunk
             
-            pure_image_data_list = []
-            timecodes_list = []
-
-            # --- Process timecode and strip extra info using provided extractor ---
-            if self._timecode_extractor is not None:
-                try:
-                    for frame in frame_chunk_arr:
-                        pure_frame, timecode = self._timecode_extractor(frame) # return view is better.
-                        pure_image_data_list.append(pure_frame)
-                        timecodes_list.append(timecode)
-
-                except Exception as e:
-                    logger.opt(exception=e).error(f"Unexpected error during TC extraction for frame "
-                                 f"{self._processed_frames}.")
-                    pure_image_data_list = list(frame_chunk_arr[:, :height, :width, :]) # Fallback image data
-                    timecodes_list = []
-            else:
-                pure_image_data_list = list(frame_chunk_arr)
-                timecodes_list = []
+            if ext_info:
+                timecodes_list = [item[self._timecode_extractor.timecode_key] for item in ext_info]
+            else: timecodes_list = []
             
             # --- Write Image Data for this chunk to x264 stdin (frame by frame) ---
             try:
-                for idx, frame_view in enumerate(pure_image_data_list):
-                    # Check in case the array is not C-contiguous (should not happen)
-                    if not frame_view.flags["C_CONTIGUOUS"]:
-                        logger.warning(f"Image view is not C_Contiguous. Extra copy will significantly "
-                            "decrease encoding performance")
-                        frame_view = np.ascontiguousarray(frame_view)
+                for idx, frame_view in enumerate(frame_chunk_arr):
 
                     self._x264_process.stdin.write(frame_view.tobytes())
                     self._processed_frames += 1
