@@ -435,7 +435,7 @@ class X264Encoder(BaseVideoEncoder):
 
         # Signal x264.exe to finish by closing stdin
         if self._x264_process and self._x264_process.stdin:
-            logger.info(f"Closing x264.exe stdin to signal end of stream.")
+            logger.trace(f"Closing x264.exe stdin to signal end of stream.")
             try:
                 self._x264_process.stdin.close()
             except Exception as e:
@@ -443,7 +443,7 @@ class X264Encoder(BaseVideoEncoder):
 
         # Close the timecode log file if it was opened
         if self._timecode_file:
-            logger.info(f"Closing timecode log file.")
+            logger.trace(f"Closing timecode log file.")
             try:
                 self._timecode_file.close()
             except Exception as e:
@@ -485,14 +485,14 @@ class X264Encoder(BaseVideoEncoder):
         # Signal reader threads to stop and join them
         # The threads' loops check self._running, which is cleared by BaseVideoEncoder.stop()
         if self._stdout_thread and self._stdout_thread.is_alive():
-            logger.info(f"Waiting for stdout reader thread to join...")
+            logger.trace(f"Waiting for stdout reader thread to join...")
             self._stdout_thread.join(timeout=5.0)
             if self._stdout_thread.is_alive():
                  logger.warning(f"Stdout reader thread did not exit gracefully.")
             self._stdout_thread = None
 
         if self._stderr_thread and self._stderr_thread.is_alive():
-            logger.info(f"Waiting for stderr reader thread to join...")
+            logger.trace(f"Waiting for stderr reader thread to join...")
             self._stderr_thread.join(timeout=5.0)
             if self._stderr_thread.is_alive():
                  logger.warning(f"Stderr reader thread did not exit gracefully.")
@@ -503,7 +503,7 @@ class X264Encoder(BaseVideoEncoder):
         if self._timecode_extractor and self._do_mux_timecode:
             self._mux_timecode(tc_file=self._timecode_log_path, mp4_file=self._encoder_intermediates, out_file=self._output_path)
 
-        logger.info(f"X264 encoder uninitialized.")
+        logger.success(f"X264 encoder uninitialized.")
     
     def _mux_timecode(self, tc_file, mp4_file, out_file) -> bool:
         """

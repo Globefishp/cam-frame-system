@@ -67,7 +67,8 @@ class BaseVideoEncoder(ABC):
                  batch_size: int = 5,
                  target_fps: Optional[float] = None,
                  stat_interval: float = 1.0,
-                 inject_logger: Optional[Logger] = None, 
+                 inject_logger: Optional[Logger] = None,
+                 **kwargs 
                  # Extra kwargs should be handled and store per subclass implementation.
         ):
         """
