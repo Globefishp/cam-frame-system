@@ -488,7 +488,7 @@ class AbstractCamera(ABC):
         """Get the size of each frame in bytes. Useful for user to allocate memory."""
         return self.width * (self.height + self.extra_lines) * self.channels * np.dtype(self.dtype).itemsize
 
-    # === Camera Hardware Description ===
+    # === Camera Hardware Description: Max possible dimension for buffer allocation ===
     @property
     @abstractmethod
     def full_width(self)  -> int: pass
