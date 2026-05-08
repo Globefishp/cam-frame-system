@@ -35,6 +35,7 @@
 
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 import numpy as np
 import pickle
 import time
@@ -533,62 +534,81 @@ class AbstractCamera(ABC):
         return np.concatenate((image, extra_rows), axis=0)
     
     @staticmethod
-    def _extract_metadata_from_image(image: NDArray, extra_lines: int) -> dict:
+    def _extract_metadata_from_image(image: NDArray, extra_lines: int) -> list[dict[str, Any]]:
         """
-        Static method to extract serialized dict from the image with given 
-        `extra_lines` (positive integer). 
+        Static method to extract serialized dict(s) from the image or batch of images
+        with given `extra_lines` (positive integer). 
 
         Rewrite this staticmethod for subclass specific metadata extraction.
         Make sure this method(function) is serializable.
         """
-        if image.shape[0] <= extra_lines or extra_lines <= 0:
+        is_batch = image.ndim == 4
+        if image.shape[-3] <= extra_lines or extra_lines <= 0:
             # No extra lines to extract.
-            return {}
-        extra_rows = image[-extra_lines:, ...]
-        extra_byte_view = extra_rows.view(np.uint8).ravel()
+            return [{}]
+        extra_rows = image[:, -extra_lines:, ...] if is_batch else image[-extra_lines:, ...]
 
-        length = extra_byte_view[:4].view(np.uint32)[0]
-        
-        # Simple check to make sure length is not corrupted.
-        if length == 0 or length > len(extra_byte_view) - 4:
-            return {}
-            
-        serialized_bytes = extra_byte_view[4:4+length].tobytes()
+        def _extract_pickled_data(extra_rows: NDArray) -> Any:
+            extra_byte_view = extra_rows.view(np.uint8).ravel()
 
-        try:
-            return pickle.loads(serialized_bytes)
-        except pickle.PickleError:
-            return {}
+            length = extra_byte_view[:4].view(np.uint32)[0]
+            # Simple check to make sure length is not corrupted.
+            if length == 0 or length > len(extra_byte_view) - 4:
+                return {}
+                
+            serialized_bytes = extra_byte_view[4:4+length].tobytes()
+            try:
+                return pickle.loads(serialized_bytes)
+            except pickle.PickleError:
+                return {}
+
+        if is_batch:
+            return [_extract_pickled_data(extra_rows[i]) for i in range(image.shape[0])]
+        else:
+            return [_extract_pickled_data(extra_rows),]
+
     
     @staticmethod
     def _strip_metadata_from_image(image: NDArray, extra_lines: int) -> NDArray:
         """
-        Static method to strip extended info from the image with given 
-        `extra_lines` (positive integer). 
+        Static method to strip extended info from the image (or batch of images) 
+        with given `extra_lines` (positive integer). 
 
         Rewrite this staticmethod for subclass specific metadata extraction.
         Make sure this method(function) is serializable.
         """
-        return image[:-extra_lines, ...]
+        if image.ndim == 4: return image[:, :-extra_lines, ...]
+        else:               return image[:-extra_lines, ...]
 
 # TODO: use frozen=True to have clearer immutable semantics?
+@dataclass(frozen=True)
 class ExtInfoExtractor:
     """
     A universal extended info extractor that allows extracting subclass defined
     extended info from the image. Can be serialized thus is multi-process safe.
-    """
-    def __init__(self, static_decode_func: Callable[Concatenate[NDArray, P], dict[str, Any]], 
-                 static_strip_func: Callable[[NDArray], NDArray],
-                 decode_kwargs: dict[str, Any] = {},
-                 strip_kwargs: dict[str, Any] = {}):
-        """Save the static decode function and its context."""
-        self.decode_func = static_decode_func
-        self.strip_func = static_strip_func
-        self.decode_kwargs: dict[str, Any] = decode_kwargs # payload for extraction, such as ctype.Structure etc.
-        self.strip_kwargs: dict[str, Any] = strip_kwargs # payload for stripping
 
-    def __call__(self, image: NDArray) -> tuple[NDArray, dict[str, Any]]:
-        """Call the static decode function with the image and kwargs(Context)."""
+    Should be compatible to extract batch of frames (NDArray: NHWC or HWC) and 
+    return a list of extended information dict.
+
+    `static_decode_func` and `static_strip_func` should be serializable.
+    """
+    # Save the static decode function and its context.
+    static_decode_func: Callable[Concatenate[NDArray, P], list[dict[str, Any]]]
+    static_strip_func: Callable[Concatenate[NDArray, P], NDArray]
+    decode_kwargs: dict[str, Any] = field(default_factory=dict)
+    strip_kwargs: dict[str, Any] = field(default_factory=dict)
+
+    def __call__(self, image: NDArray) -> tuple[NDArray, list[dict[str, Any]]]:
+        """
+        Call the static decode function with the image and kwargs(Context).
+        
+        Args:
+            image (NDArray): Image (or batch of images) to extract extended info from.
+        
+        Returns:
+            tuple[NDArray, list[dict[str, Any]]]: Image (or batch of images) 
+                without extended info and List of extended info dict.
+        """
         extended_info = self.decode_func(image, **self.decode_kwargs)
         stripped_image = self.strip_func(image, **self.strip_kwargs)
         return stripped_image, extended_info
