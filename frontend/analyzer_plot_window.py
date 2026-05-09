@@ -1,6 +1,6 @@
 import pyqtgraph as pg
 from PySide6.QtWidgets import QMainWindow, QVBoxLayout, QWidget, QTabWidget, QPushButton
-from PySide6.QtCore import Slot, Qt
+from PySide6.QtCore import Slot, Qt, QTimer
 
 class AnalyzerPlotWindow(QMainWindow):
     """
@@ -30,9 +30,24 @@ class AnalyzerPlotWindow(QMainWindow):
         # Storage: tile_id -> data/ui objects
         self.data_buffers = {} # tile_id -> {"ts": [], "disp": [], "gray": []}
         self.curves = {}       # tile_id -> {"disp": curve, "gray": curve}
+
+        # tab index -> tile id mapping
+        self.tab_id_map = [] 
         
         self.start_time = None
         self.max_points = 3600
+        
+        self._needs_update = False
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._refresh_plots)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.timer.start(33) # ~30 FPS
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.timer.stop()
 
     def _add_tile_tab(self, tile_id: int):
         """Dynamically create a new tab for a tile."""
@@ -47,16 +62,21 @@ class AnalyzerPlotWindow(QMainWindow):
         self.data_buffers[tile_id] = {"ts": [], "disp": [], "gray": []}
         
         self.tab_widget.addTab(plot_widget, f"Tile {tile_id}")
+        self.tab_id_map.append(tile_id)
 
     @Slot(int, 'qint64', object, object, object)
-    def update_plot(self, frame_id, timestamp, disps, grays, bboxes):
+    def update_plot(self, frame_id, timestamp, disps: dict[int, float], grays: dict[int, float], bboxes: dict[int, tuple]):
         """Update the plot curves for all tiles."""
         if self.start_time is None:
             self.start_time = timestamp
             
         relative_time = (timestamp - self.start_time) / 1e9 # convert ns to seconds
         
-        for tid, (disp, gray) in enumerate(zip(disps, grays)):
+        tids = set(disps.keys()) | set(grays.keys())
+        for tid in tids:
+            disp = disps.get(tid, float('nan'))
+            gray = grays.get(tid, float('nan'))
+            
             if tid not in self.data_buffers:
                 self._add_tile_tab(tid)
             
@@ -70,18 +90,31 @@ class AnalyzerPlotWindow(QMainWindow):
                 buf["ts"] = buf["ts"][-self.max_points:]
                 buf["disp"] = buf["disp"][-self.max_points:]
                 buf["gray"] = buf["gray"][-self.max_points:]
-            
-            # Update UI only for the currently visible tab and if window is visible
-            if self.isVisible() and self.tab_widget.currentIndex() == tid:
-                self.curves[tid]["disp"].setData(buf["ts"], buf["disp"])
-                self.curves[tid]["gray"].setData(buf["ts"], buf["gray"])
+
+            self._needs_update = True
 
     def _on_tab_changed(self, index: int):
         """Sync plot data immediately when switching tabs."""
-        if index in self.data_buffers:
-            buf = self.data_buffers[index]
-            self.curves[index]["disp"].setData(buf["ts"], buf["disp"])
-            self.curves[index]["gray"].setData(buf["ts"], buf["gray"])
+        if 0 <= index < len(self.tab_id_map):
+            tid = self.tab_id_map[index]
+            if tid in self.data_buffers:
+                buf = self.data_buffers[tid]
+                self.curves[tid]["disp"].setData(buf["ts"], buf["disp"])
+                self.curves[tid]["gray"].setData(buf["ts"], buf["gray"])
+
+    def _refresh_plots(self):
+        """Timer callback: Update the plot curves for the active tile."""
+        if not self._needs_update or not self.isVisible():
+            return
+        
+        index = self.tab_widget.currentIndex()
+        if 0 <= index < len(self.tab_id_map):
+            tid = self.tab_id_map[index]
+            if tid in self.data_buffers:
+                buf = self.data_buffers[tid]
+                self.curves[tid]["disp"].setData(buf["ts"], buf["disp"])
+                self.curves[tid]["gray"].setData(buf["ts"], buf["gray"])
+            self._needs_update = False
 
     def reset_plot(self):
         """Reset plot data for all tiles."""

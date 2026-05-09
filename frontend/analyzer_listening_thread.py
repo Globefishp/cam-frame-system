@@ -33,24 +33,24 @@ class AnalyzerListeningThread(QThread):
                 # res is a mixed dict: {"timestamp": ts, 0: {info}, 1: {info}, ...}
                 timestamp = res.get("timestamp", 0)
                 
-                all_disps = []
-                all_grays = []
-                all_bboxes = []
+                all_disps = {}
+                all_grays = {}
+                all_bboxes = {}
                 
-                # Sort integer keys to maintain tile order
-                tile_ids = sorted([k for k in res.keys() if isinstance(k, int)])
-                for tid in tile_ids:
-                    info = res[tid]
-                    all_disps.append(info.get('displacement', float('nan')))
-                    all_grays.append(info.get('grayscale', float('nan')))
+                # Extract all tile info into dicts to preserve tile ID mapping
+                for tid, info in res.items():
+                    if not isinstance(tid, int):
+                        continue
+                    all_disps[tid] = info.get('displacement', float('nan'))
+                    all_grays[tid] = info.get('grayscale', float('nan'))
                     if info.get('bbox'):
-                        all_bboxes.append(info['bbox'])
+                        all_bboxes[tid] = info['bbox']
                 
                 self.result_ready.emit(self._current_frame_id, timestamp, all_disps, all_grays, all_bboxes)
                 self._current_frame_id += 1
 
         # Force clear UI overlay
-        self.result_ready.emit(0, 0, [], [], [])
+        self.result_ready.emit(0, 0, {}, {}, {})
 
     def stop(self):
         self._running = False

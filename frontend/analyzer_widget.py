@@ -2,7 +2,7 @@ import os
 import numpy as np
 from PySide6.QtWidgets import (QGroupBox, QVBoxLayout, QHBoxLayout,
                                QPushButton, QLabel, QLineEdit, QFileDialog, QMessageBox)
-from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtCore import Qt, Signal, Slot, QTimer
 from .analyzer_listening_thread import AnalyzerListeningThread
 from .analyzer_plot_window import AnalyzerPlotWindow
 
@@ -19,6 +19,11 @@ class AnalyzerWidget(QGroupBox):
         super().__init__("Analyzer Controls", parent)
         self.backend = backend
         self._init_ui()
+        
+        # Status polling timer
+        self.status_timer = QTimer(self)
+        self.status_timer.timeout.connect(self._update_status)
+        self.status_timer.start(500)
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -47,7 +52,15 @@ class AnalyzerWidget(QGroupBox):
         save_layout.addWidget(self.btn_browse_save)
         layout.addLayout(save_layout)
 
-        # 3. Start/Stop Button & Show Plot
+        # 3. Status Display
+        status_layout = QVBoxLayout()
+        self.analyzed_label = QLabel("Analyzed: 0 frames")
+        self.speed_label = QLabel("Analysis Speed: 0.0 FPS")
+        status_layout.addWidget(self.analyzed_label)
+        status_layout.addWidget(self.speed_label)
+        layout.addLayout(status_layout)
+
+        # 4. Start/Stop Button & Show Plot
         action_layout = QHBoxLayout()
         self.btn_toggle_analyzer = QPushButton("Start Analyzer")
         self.btn_toggle_analyzer.setCheckable(True)
@@ -58,17 +71,18 @@ class AnalyzerWidget(QGroupBox):
         action_layout.addWidget(self.btn_show_plot)
         layout.addLayout(action_layout)
 
-        # 4. Plot Window & Worker
+        # 5. Plot Window & Worker
         self.plot_window = AnalyzerPlotWindow(self)
         self.btn_show_plot.clicked.connect(self.plot_window.show)
 
-        # 4. Start Worker Thread and Connect Signals
+        # 6. Start Worker Thread and Connect Signals
         self.analyzer_worker = AnalyzerListeningThread(self.backend)
         self.analyzer_worker.result_ready.connect(self.plot_window.update_plot, Qt.QueuedConnection)
         self.analyzer_worker.result_ready.connect(self._on_analyzer_result_ready, Qt.QueuedConnection)
 
     def stop(self):
         """Cleanup resources: stop the worker thread and close the plot window."""
+        self.status_timer.stop()
         if hasattr(self, 'analyzer_worker'):
             self.analyzer_worker.stop()
         if hasattr(self, 'plot_window'):
@@ -76,9 +90,11 @@ class AnalyzerWidget(QGroupBox):
             self.plot_window.close()
     
     @Slot(int, 'qint64', object, object, object)
-    def _on_analyzer_result_ready(self, frame_id, timestamp, disps, grays, bboxes: list[tuple]):
+    def _on_analyzer_result_ready(self, frame_id, timestamp, disps, grays, bboxes: dict[int, tuple]):
         if bboxes:
             color = [0.0, 1.0, 0.0, 1.0] # Green bounding box
+            # Extract list of bboxes from dict
+            bboxes = list(bboxes.values())
             # Preallocate memory, 8 points per bbox, 6f4 per point.
             lines_arr = np.empty((8 * len(bboxes), 6), dtype='f4')
 
@@ -148,3 +164,17 @@ class AnalyzerWidget(QGroupBox):
             self.backend.stop_analyzer()
             self.btn_toggle_analyzer.setText("Start Analyzer")
             self.btn_toggle_analyzer.setStyleSheet("")
+
+    def _update_status(self):
+        """Poll analyzer status from backend."""
+        analyzer = getattr(self.backend, 'analyzer', None)
+        if analyzer:
+            status = analyzer.status
+            frame_count = status.get('frame_count', 0)
+            fps = status.get('fps', 0.0)
+            self.analyzed_label.setText(f"Analyzed: {frame_count} frames")
+            self.speed_label.setText(f"Analysis Speed: {fps:.1f} FPS")
+        elif not self.btn_toggle_analyzer.isChecked():
+            # Reset labels if not running
+            self.analyzed_label.setText("Analyzed: 0 frames")
+            self.speed_label.setText("Analysis Speed: 0.0 FPS")
