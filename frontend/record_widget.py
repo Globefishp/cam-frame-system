@@ -1,28 +1,40 @@
 import os
 import time
 import threading
-from PySide6.QtWidgets import (QGroupBox, QVBoxLayout, QHBoxLayout,
+from typing import Optional, Any
+from PySide6.QtWidgets import (QGroupBox, QVBoxLayout, QHBoxLayout, QWidget,
                                QPushButton, QLabel, QLineEdit, QFileDialog, QMessageBox,
                                QCheckBox, QSpinBox)
 from PySide6.QtCore import Qt, QTimer, Slot, Signal, QThread
+from .record_handling_thread import RecordingThread
 
 class RecordWidget(QGroupBox):
     """
     Widget to configure and control video recording.
     Encapsulates path selection, recording toggle, and encoding status display.
     """
-    def __init__(self, backend, parent=None):
+    def __init__(self, backend: Any, parent: Optional[QWidget] = None) -> None:
+        """
+        Initialize the recording widget.
+
+        :param backend: The backend system object providing recording APIs.
+        :param parent: Optional parent widget.
+        """
         super().__init__("Recording Controls", parent)
-        self.backend = backend
-        self.rotation_thread = None
+        self.backend: Any = backend
+        self.rotation_thread: Optional[RecordingThread] = None
+        self._base_path: str = ""
+        self._capture_active: bool = False
+        
         self._init_ui()
         
         # Status polling timer
-        self.status_timer = QTimer(self)
+        self.status_timer: QTimer = QTimer(self)
         self.status_timer.timeout.connect(self._update_status)
         self.status_timer.start(500)
 
-    def _init_ui(self):
+    def _init_ui(self) -> None:
+        """Initialize and layout the UI components."""
         layout = QVBoxLayout(self)
 
         # 1. Output Path Selection
@@ -74,47 +86,66 @@ class RecordWidget(QGroupBox):
         status_layout.addWidget(self.speed_label)
         layout.addLayout(status_layout)
 
-        # Connect path change to button state
+        # Connect path change to button state and base path tracking
+        self.path_edit.textChanged.connect(self._on_path_changed)
         self.path_edit.textChanged.connect(self._update_button_state)
 
-    def stop(self):
-        """Cleanup: stop recording if active and stop timer."""
+    def stop(self) -> None:
+        """
+        Cleanup and stop any active recording and timers.
+        Should be called when the application or parent window is closing.
+        """
         if self.btn_toggle.isChecked():
             self.btn_toggle.setChecked(False)
         self.status_timer.stop()
 
-    def set_capture_active(self, active: bool):
-        """External call to notify if capture is active, affecting recording availability."""
+    def set_capture_active(self, active: bool) -> None:
+        """
+        Notify the widget whether the camera capture is currently active.
+        This affects the availability of the recording controls.
+
+        :param active: True if camera capture is active, False otherwise.
+        """
         self._capture_active = active
         self._update_button_state()
         # Auto stop recording if capture is deactivated
         if not active and self.btn_toggle.isChecked():
             self.btn_toggle.setChecked(False)
 
-    def _update_button_state(self):
+    def _update_button_state(self) -> None:
+        """Update the enabled/disabled state of the recording toggle button."""
+        # Enable recording only if camera capture is active and an output path is selected
         can_record = getattr(self, '_capture_active', False) and bool(self.path_edit.text())
         self.btn_toggle.setEnabled(can_record)
 
-    def _select_output_path(self):
+    @Slot(str)
+    def _on_path_changed(self, text: str) -> None:
+        """Handle manual changes to the output path text."""
+        self._base_path = text
+
+    def _select_output_path(self) -> None:
+        """Open a file dialog to select the recording output path."""
         path, _ = QFileDialog.getSaveFileName(self, "Save Video", "", "MP4 Files (*.mp4)")
         if path:
             self.path_edit.setText(path)
 
-    def _toggle_recording(self, checked):
+    def _toggle_recording(self, checked: bool) -> None:
+        """Handle the recording start/stop toggle action."""
         if checked:
-            output_path = self.path_edit.text()
+            # Prepare interval and timestamp settings
+            interval = self.spin_rotate_interval.value() * 60 if self.cb_auto_rotate.isChecked() else None
+            file_ts = self.cb_auto_rotate.isChecked()
+            
             try:
-                self.backend.start_recording(output_path)
+                # Update UI to recording state
                 self.btn_toggle.setText("Stop Recording")
                 self.btn_toggle.setStyleSheet("background-color: #f44336; color: white;")
                 
-                # Setup rotation thread if enabled or manual rotate is desired
-                # Even if auto-rotate is off, the thread only handle manual rotate button
-                interval = self.spin_rotate_interval.value() * 60 if self.cb_auto_rotate.isChecked() else None
-                self.rotation_thread = RotationThread(self.backend, output_path, interval)
+                # Start the background thread which manages the actual recording lifecycle
+                self.rotation_thread = RecordingThread(self.backend, self._base_path, interval, file_ts)
                 self.rotation_thread.disable_ui.connect(self._disable_ui)
                 self.rotation_thread.enable_ui.connect(self._enable_ui)
-                self.rotation_thread.error.connect(self._on_rotation_error)
+                self.rotation_thread.error.connect(self._on_rotation_thread_error)
                 self.rotation_thread.path_updated.connect(self.path_edit.setText)
                 self.rotation_thread.start()
                 
@@ -122,42 +153,47 @@ class RecordWidget(QGroupBox):
                 self.spin_rotate_interval.setEnabled(False)
                 self.btn_rotate_now.setEnabled(True)
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to start recording:\n{e}")
-                self.btn_toggle.blockSignals(True)
+                QMessageBox.critical(self, "Error", f"Failed to initialize recording:\n{e}")
                 self.btn_toggle.setChecked(False)
-                self.btn_toggle.blockSignals(False)
         else:
+            # Stop the thread and wait for it to finish (this will trigger backend.stop_recording)
             if self.rotation_thread:
                 self.rotation_thread.stop()
                 self.rotation_thread.wait()
                 self.rotation_thread = None
                 
-            self.backend.stop_recording()
+            # Reset UI to idle state
             self.btn_toggle.setText("Start Recording")
             self.btn_toggle.setStyleSheet("")
             self.cb_auto_rotate.setEnabled(True)
             self.spin_rotate_interval.setEnabled(True)
             self.btn_rotate_now.setEnabled(False)
 
-    def _trigger_manual_rotation(self):
+    def _trigger_manual_rotation(self) -> None:
+        """Trigger an immediate file rotation through the background thread."""
         if self.rotation_thread:
             self.rotation_thread.trigger_rotation()
 
     @Slot()
-    def _disable_ui(self):
+    def _disable_ui(self) -> None:
+        """Disable recording controls during rotation transition."""
         self.btn_toggle.setEnabled(False)
         self.btn_rotate_now.setEnabled(False)
 
     @Slot()
-    def _enable_ui(self):
+    def _enable_ui(self) -> None:
+        """Enable recording controls after rotation transition is complete."""
         self.btn_toggle.setEnabled(True)
         self.btn_rotate_now.setEnabled(True)
 
-    def _on_rotation_error(self, err_msg):
-        QMessageBox.warning(self, "Rotation Failed", err_msg)
+    def _on_rotation_thread_error(self, err_msg: str) -> None:
+        """Handle errors reported by the rotation thread."""
+        QMessageBox.warning(self, "Recording Failed", err_msg)
+        if self.btn_toggle.isChecked():
+            self.btn_toggle.setChecked(False)
 
-    def _update_status(self):
-        """Poll encoder status from backend."""
+    def _update_status(self) -> None:
+        """Poll and update the recording status display from the backend."""
         encoder = getattr(self.backend, 'encoder', None)
         if encoder:
             status = encoder.status
@@ -170,58 +206,3 @@ class RecordWidget(QGroupBox):
             self.encoded_label.setText("Encoded: 0 frames")
             self.speed_label.setText("Encoding Speed: 0.0 FPS")
 
-class RotationThread(QThread):
-    """
-    Background thread to handle rotation timing and execution.
-    Name it 'handle_rotation' conceptually.
-    """
-    disable_ui = Signal()
-    enable_ui = Signal()
-    path_updated = Signal(str)
-    error = Signal(str)
-
-    def __init__(self, backend, base_path, interval_sec=None):
-        super().__init__()
-        self.backend = backend
-        self.base_path = base_path
-        self.interval_sec = interval_sec
-        self._stop_event = threading.Event()
-        self._manual_trigger = threading.Event()
-
-    def stop(self):
-        self._stop_event.set()
-        self._manual_trigger.set() # wake up
-
-    def trigger_rotation(self):
-        self._manual_trigger.set()
-
-    def run(self):
-        last_rotate_time = time.time()
-        while not self._stop_event.is_set():
-            if self.interval_sec is not None:
-                wait_time = max(0, self.interval_sec - (time.time() - last_rotate_time))
-                triggered = self._manual_trigger.wait(timeout=wait_time)
-            else:
-                # Only manual trigger
-                triggered = self._manual_trigger.wait()
-            
-            if self._stop_event.is_set():
-                break
-            
-            # Reset event and perform rotation
-            self._manual_trigger.clear()
-            self.disable_ui.emit()
-            
-            # Generate next path using POSIX timestamp
-            base, ext = os.path.splitext(self.base_path)
-            new_path = f"{base}_{int(time.time())}{ext}"
-            
-            try:
-                self.backend.rotate_recording(new_path)
-                self.path_updated.emit(new_path)
-            except Exception as e:
-                cur_time = time.strftime("%H:%M:%S", time.localtime())
-                self.error.emit(f"[{cur_time}] Rotation failed: {e}")
-            
-            self.enable_ui.emit()
-            last_rotate_time = time.time()
