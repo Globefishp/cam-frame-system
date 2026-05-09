@@ -159,6 +159,7 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
 
     def _handle_command(self, cmd_name: str, payload: Any):
         """Handle async commands from main process concurrently."""
+        # TODO: Not used and not useful.
         if cmd_name == "reset_tracker":
             with self._history_lock:
                 self._prev_centers.clear()
@@ -227,40 +228,40 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
                 timecode = time.time_ns()
 
             frame_results = {"timestamp": timecode}
-            
-            # Use lock to safely update history state
-            with self._history_lock:
-                current_frame_id = self._frame_counter
-                self._frame_counter += 1
-                
-                # 2. Reconstruct tiles and process each independently
-                for i in range(num_tiles):
-                    tile_idx = b * num_tiles + i
-                    tile_result = results[tile_idx]
-                    
-                    best_conf = -1.0
-                    tile_best_bbox = None
-                    if len(tile_result.boxes) > 0:
-                        # Find the max confidence box in this tile
-                        max_idx = torch.argmax(tile_result.boxes.conf).item()
-                        best_conf = tile_result.boxes.conf[max_idx].item()
-                        tile_best_bbox = tile_result.boxes.xyxy[max_idx]  # Tensor [x1, y1, x2, y2]
-                    
-                    global_bbox = None
-                    displacement = float('nan')
-                    gray_value = float('nan')
 
-                    if tile_best_bbox is not None:
-                        # Calculate global offsets
-                        x_offset, y_offset = self._tile_grids[i]
-                        x1 = max(0,      tile_best_bbox[0].item() + x_offset)
-                        y1 = max(0,      tile_best_bbox[1].item() + y_offset)
-                        x2 = min(orig_w, tile_best_bbox[2].item() + x_offset)
-                        y2 = min(orig_h, tile_best_bbox[3].item() + y_offset)
-                        global_bbox = (x1, y1, x2, y2)
-                        
-                        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-                        
+            current_frame_id = self._frame_counter
+            self._frame_counter += 1
+            
+            # 2. Reconstruct tiles and process each independently
+            for i in range(num_tiles):
+                tile_idx = b * num_tiles + i
+                tile_result = results[tile_idx]
+                
+                best_conf = -1.0
+                tile_best_bbox = None
+                if len(tile_result.boxes) > 0:
+                    # Find the max confidence box in this tile
+                    max_idx = torch.argmax(tile_result.boxes.conf).item()
+                    best_conf = tile_result.boxes.conf[max_idx].item()
+                    tile_best_bbox = tile_result.boxes.xyxy[max_idx]  # Tensor [x1, y1, x2, y2]
+                
+                global_bbox = None
+                displacement = float('nan')
+                gray_value = float('nan')
+
+                if tile_best_bbox is not None:
+                    # Calculate global offsets
+                    x_offset, y_offset = self._tile_grids[i]
+                    x1 = max(0,      tile_best_bbox[0].item() + x_offset)
+                    y1 = max(0,      tile_best_bbox[1].item() + y_offset)
+                    x2 = min(orig_w, tile_best_bbox[2].item() + x_offset)
+                    y2 = min(orig_h, tile_best_bbox[3].item() + y_offset)
+                    global_bbox = (x1, y1, x2, y2)
+                    
+                    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                    
+                    # Use lock to safely update history state
+                    with self._history_lock: # Avoid corruptted data, in GIL, can be removed.
                         # Displacement calculation per tile
                         prev_c = self._prev_centers.get(i)
                         if prev_c is not None:
@@ -269,14 +270,14 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
                             displacement = 0.0 # First occurrence has no displacement
                         self._prev_centers[i] = (cx, cy)
 
-                        # Grayscale Calculation (Pure GPU Matrix operation)
-                        # original_frame shape is (B, H, W, C). Slice ROI.
-                        roi = original_frames[b, int(y1+0.5):int(y2+0.5), int(x1+0.5):int(x2+0.5), :]
-                        if roi.numel() > 0:
-                            # Matrix Mult: (h, w, 3) @ (3, 1) -> (h, w, 1)
-                            roi_gray = torch.matmul(roi.float(), self._color_matrix)
-                            # Squeeze to (h, w) and mean
-                            gray_value = roi_gray.mean().item()
+                    # Grayscale Calculation (Pure GPU Matrix operation)
+                    # original_frame shape is (B, H, W, C). Slice ROI.
+                    roi = original_frames[b, int(y1+0.5):int(y2+0.5), int(x1+0.5):int(x2+0.5), :]
+                    if roi.numel() > 0:
+                        # Matrix Mult: (h, w, 3) @ (3, 1) -> (h, w, 1)
+                        roi_gray = torch.matmul(roi.float(), self._color_matrix)
+                        # Squeeze to (h, w) and mean
+                        gray_value = roi_gray.mean().item()
                     
                     # 3. Store tile result
                     frame_results[i] = {
