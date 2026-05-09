@@ -1,3 +1,4 @@
+from analyzers import ConsumerMode
 import sys
 import multiprocessing as mp
 from PySide6.QtWidgets import QApplication
@@ -11,6 +12,7 @@ from frontend.main_window import MainWindow
 from cameras import BitDepth
 from cameras.huatengcam.huateng_camera_v4 import HuatengCamera
 from encoders.x264_encoder_x264 import X264Encoder
+from analyzers.yolo_poscolor_analyzer import YOLOPosColorAnalyzer
 
 from loguru import logger
 from loguru._logger import Logger # for type hint only.
@@ -34,14 +36,16 @@ def main():
     # 2. Configure PySide6 and OpenGL globally
     # Critical: This allows sharing contexts globally
     QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
-    app = QApplication(sys.argv)
-    
+
     # Request Core Profile context (ModernGL friendly)
     fmt = QSurfaceFormat()
     fmt.setVersion(3, 3)
     fmt.setProfile(QSurfaceFormat.CoreProfile)
     fmt.setSwapInterval(1) # Enable VSync
     QSurfaceFormat.setDefaultFormat(fmt)
+
+    app = QApplication(sys.argv)
+    
 
     # 3. Setup Camera and Encoder configs
     # Emulate Camera Enum
@@ -60,10 +64,11 @@ def main():
 
     camera_kwargs = {
         'dev_info': dev_info,
-        'fps': 10,
-        'bitdepth': BitDepth._12,
-        'exposure_time_ms': 20,
-        'gain': 2.0,
+        'fps': 30,
+        'bitdepth': BitDepth._8,
+        'exposure_time_ms': 10,
+        'gain': 1.0,
+        'timecode_en': True,
         'inject_logger': logger
     }
     
@@ -71,8 +76,15 @@ def main():
         # output_path is injected dynamically in start_recording
         'preset': 'fast',
         'crf': 23,
-        'threads': 2,
-        'batch_size': 30
+        'threads': 0,
+        'input-depth': 8 # 16 for 12bit, 8 for 8bit.
+    }
+
+    analyzer_kwargs = {
+        'batch_size': 1, # adjust here to balance analyze latency and throughput
+        'tile_grids': [(0, 0), (640, 0)], # default single tile for init
+        'tile_shape': (640, 640),
+        'consumer_mode': ConsumerMode.SYNC
     }
 
     # 4. Initialize HeadlessBackend
@@ -82,6 +94,8 @@ def main():
         camera_kwargs=camera_kwargs,
         encoder_class=X264Encoder,
         encoder_kwargs=encoder_kwargs,
+        analyzer_class=YOLOPosColorAnalyzer,
+        analyzer_kwargs=analyzer_kwargs,
         buffer_capacity=120,
         inject_logger=logger
     )

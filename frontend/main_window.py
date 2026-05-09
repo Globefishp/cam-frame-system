@@ -5,7 +5,8 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 from PySide6.QtCore import Qt, QTimer
 
 from frontend.gl_widget import CameraDisplayWidget
-from frontend.upload_thread import GLTextureUploadThread
+from frontend.gl_upload_thread import GLTextureUploadThread
+from frontend.analyzer_widget import AnalyzerWidget
 
 class MainWindow(QMainWindow):
     """
@@ -61,9 +62,15 @@ class MainWindow(QMainWindow):
         path_layout.addWidget(self.browse_button)
         controls_layout.addLayout(path_layout)
         
+        # 4. Analyzer Controls
+        self.analyzer_widget = AnalyzerWidget(self.backend)
+        controls_layout.addWidget(self.analyzer_widget)
+        # Connect bboxes to draw signal
+        self.analyzer_widget.bboxes_to_draw.connect(self.display_widget.update_overlay_lines)
+
         controls_layout.addStretch(1)
 
-        # 4. Status Display
+        # 5. Status Display
         status_group = QGroupBox("Statistics")
         status_vbox = QVBoxLayout(status_group)
         
@@ -195,6 +202,10 @@ class MainWindow(QMainWindow):
         """Handle cleanup on exit."""
         if self.record_button.isChecked():
             self.backend.stop_recording()
+            
+        # Notify analyzer widget to cleanup its own resources (worker thread, plot window)
+        if hasattr(self, 'analyzer_widget'):
+            self.analyzer_widget.stop()
         
         if getattr(self, 'render_thread', None):
             # self.render_thread.frame_ready.disconnect()
