@@ -2,13 +2,14 @@ from cameras import CamException
 import multiprocessing as mp
 import time
 import numpy as np
-from typing import Optional, Tuple, List, Type
+from typing import Optional, Tuple, List, Type, Any
 
 from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
 from frameserver.v3 import FrameServer, FrameTicket, TicketExpireException
 from utils.mp_obj_proxy import MpObjProxy
 from cameras.abstractcamera import AbstractCamera, CamException
-from encoders.videoencoder import BaseVideoEncoder
+from encoders.videoencoder_v3 import BaseVideoEncoder
+from analyzers.analyzer import BaseAnalyzer
 
 from loguru import logger as file_logger
 from loguru._logger import Logger # for type hint only
@@ -71,7 +72,7 @@ class CameraProcess(mp.Process):
                 # Main capture loop
                 if logger: logger.info("Camera starts capturing.")
                 while not self.stop_event.is_set():
-                    frame = camera.grab()
+                    frame = camera.grab_extended_info()
                     if frame is not None:
                         # Note: ring_buffer.put expects shape (batch, H, W, C)
                         # Use a short timeout so we can periodically check stop_event
@@ -100,6 +101,7 @@ class HeadlessBackend: # TODO: Rename as Backend????
     """
     def __init__(self, camera_class: Type[AbstractCamera], camera_kwargs: dict, 
                  encoder_class: Type[BaseVideoEncoder], encoder_kwargs: dict, 
+                 analyzer_class: Optional[Type[BaseAnalyzer]] = None, analyzer_kwargs: Optional[dict] = None,
                  buffer_capacity: int=120, inject_logger: Optional[Logger] = None):
         if inject_logger is not None:
             if isinstance(inject_logger, Logger):
@@ -115,12 +117,16 @@ class HeadlessBackend: # TODO: Rename as Backend????
         self.encoder_class   = encoder_class
         self.encoder_kwargs  = encoder_kwargs # Encoder specific kwargs
         
+        self.analyzer_class  = analyzer_class
+        self.analyzer_kwargs = analyzer_kwargs or {}
+        
         self.ring_buffer: Optional[ProcessSafeSharedRingBuffer] = None
         self.frame_server: Optional[FrameServer] = None
         self.camera_dimension: Tuple[int, int, int] = None
         self.camera_proxy: Optional[MpObjProxy] = None
         self.camera_process: Optional[CameraProcess] = None
         self.encoder: Optional[BaseVideoEncoder] = None
+        self.analyzer: Optional[BaseAnalyzer] = None
         
         self.gui_cid: Optional[int] = None
         
@@ -133,17 +139,18 @@ class HeadlessBackend: # TODO: Rename as Backend????
 
         camera = self.camera_class(**self.camera_kwargs)
         camera.open()
-        width, height, channels, dtype = camera.width, camera.height, camera.channels, camera.dtype
+        fw, fh, w, h, c, t = camera.full_width, camera.full_height, camera.width, camera.height, camera.channels, camera.dtype
         camera.close()
-        self.camera_dimension = (height, width, channels)
-        logger.info(f"Got camera dimension  {width} x {height}, {channels} channels, {dtype}")
+        self.buffer_dimension = (fh, fw, c)
+        self.camera_dimension = (h, w, c)
+        logger.info(f"Got camera dimension  {w} x {h}, {c} channels, {t}")
 
         # Create the unified RingBuffer and FrameServer
         self.ring_buffer = ProcessSafeSharedRingBuffer(
             create=True,
             buffer_capacity=self.buffer_capacity,
-            frame_shape=self.camera_dimension,
-            dtype=dtype
+            frame_shape=self.buffer_dimension,
+            dtype=t
         )
         self.frame_server = FrameServer(create=True, ring_buffer=self.ring_buffer)
         self.ring_buffer.trigger_release = self.frame_server._gc
@@ -160,8 +167,6 @@ class HeadlessBackend: # TODO: Rename as Backend????
     def shutdown(self, join_timeout=3.0):
         """Cleanly stops all background workers and releases shared memory."""
         logger = self._logger
-        self.stop_recording()
-        
         self.stop_capture()
         if self.camera_process:
             self.camera_process.exit_event.set()
@@ -170,7 +175,10 @@ class HeadlessBackend: # TODO: Rename as Backend????
             if self.camera_process.is_alive():
                 if logger: logger.warning(f"Timeout ({join_timeout}s) waiting camera to stop, force terminating...")
                 self.camera_process.terminate()
-                
+
+        self.stop_recording()
+        self.stop_analyzer()
+
         if self.frame_server:
             self.frame_server.close()
             self.frame_server.unlink()
@@ -208,7 +216,11 @@ class HeadlessBackend: # TODO: Rename as Backend????
             fps = self.camera_proxy.actual_fps
         except AttributeError:
             fps = self.camera_proxy.target_fps
-            
+        
+        extinfo_extractor = self.camera_proxy.get_extended_info_extractor()
+        extinfo_extractor.timebase = self.camera_proxy.hw_timecode_timebase
+        extinfo_extractor.timecode_key = "hw_timecode"
+
         encoder_config = {
             **self.encoder_kwargs,
             'frame_server': self.frame_server,
@@ -217,7 +229,8 @@ class HeadlessBackend: # TODO: Rename as Backend????
             'target_fps': fps,
             'stat_interval': max(0.5, 10/fps),
             'inject_logger': self._logger,
-            'frame_size': self.camera_dimension
+            'frame_size': self.camera_dimension,
+            'extinfo_extractor': extinfo_extractor,
         }
         self.encoder = self.encoder_class(**encoder_config)
         self.encoder.start()
@@ -230,6 +243,53 @@ class HeadlessBackend: # TODO: Rename as Backend????
             self.camera_process.start_event.set()
             self.encoder = None
 
+    def start_analyzer(self, model_path: Optional[str] = None, save_path: Optional[str] = None):
+        """Starts the analyzer background process."""
+        if self.analyzer:
+            self.stop_analyzer()
+            
+        if not self.analyzer_class:
+            if self._logger: self._logger.error("No analyzer_class injected.")
+            return
+        
+        extinfo_extractor = self.camera_proxy.get_extended_info_extractor()
+        extinfo_extractor.timebase = self.camera_proxy.hw_timecode_timebase
+        extinfo_extractor.timecode_key = "hw_timecode"
+
+        config = {
+            **self.analyzer_kwargs,
+            'frame_server': self.frame_server,
+            'extinfo_extractor': extinfo_extractor,
+        }
+        if model_path: config['model_path'] = model_path
+        if save_path: config['save_path'] = save_path
+
+        self.analyzer = self.analyzer_class(**config)
+        self.analyzer.start()
+        if self._logger: self._logger.info("Analyzer started.")
+
+    def stop_analyzer(self):
+        """Stops the analyzer."""
+        if self.analyzer:
+            self.analyzer.stop()
+            self.analyzer = None
+            if self._logger: self._logger.info("Analyzer stopped.")
+
+    def get_analyzer_results(self) -> dict:
+        """Returns a snapshot of the latest accumulated results from the analyzer."""
+        if self.analyzer:
+            return self.analyzer.get_results()
+        return {}
+    def get_analyzer_result(self, key: Any, timeout: Optional[float]=None) -> Any:
+        """
+        Query the key in analyzer's result dict with timeout. 
+        Return None if query timeout or no active analyzer.
+        """
+        if self.analyzer:
+            return self.analyzer.get_result(key, timeout)
+        return None
+
+    # For preview thread
     def get(self, size: int=1, timeout: Optional[float]=None) -> Tuple[Optional[FrameTicket], Optional[List[np.ndarray]]]:
         """Provides Zero-copy async access to the latest frames."""
         if self.frame_server is None:
