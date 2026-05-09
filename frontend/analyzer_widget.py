@@ -3,7 +3,7 @@ import numpy as np
 from PySide6.QtWidgets import (QGroupBox, QVBoxLayout, QHBoxLayout,
                                QPushButton, QLabel, QLineEdit, QFileDialog, QMessageBox)
 from PySide6.QtCore import Qt, Signal, Slot
-from .analyzer_worker import AnalyzerWorker
+from .analyzer_listening_thread import AnalyzerListeningThread
 from .analyzer_plot_window import AnalyzerPlotWindow
 
 class AnalyzerWidget(QGroupBox):
@@ -63,7 +63,7 @@ class AnalyzerWidget(QGroupBox):
         self.btn_show_plot.clicked.connect(self.plot_window.show)
 
         # 4. Start Worker Thread and Connect Signals
-        self.analyzer_worker = AnalyzerWorker(self.backend)
+        self.analyzer_worker = AnalyzerListeningThread(self.backend)
         self.analyzer_worker.result_ready.connect(self.plot_window.update_plot, Qt.QueuedConnection)
         self.analyzer_worker.result_ready.connect(self._on_analyzer_result_ready, Qt.QueuedConnection)
 

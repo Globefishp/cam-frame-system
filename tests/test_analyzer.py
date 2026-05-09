@@ -617,3 +617,5 @@ def test_batch_wraparound_torch_cuda(frame_server):
     assert res['is_contiguous'] is True
     
     analyzer.stop()
+
+# TODO: 测试注入Extractor时的行为是否如文档所记载: 能够得到一个batch的数据, 并且仅处理原始数据.

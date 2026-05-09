@@ -2,7 +2,7 @@ import time
 from PySide6.QtCore import QThread, Signal
 from backend.system_backend import HeadlessBackend
 
-class AnalyzerWorker(QThread):
+class AnalyzerListeningThread(QThread):
     """
     Background worker that polls Analyzer results using blocking get_result().
     Emits data to be consumed by the UI (Plotting and GL overlay).

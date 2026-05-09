@@ -105,6 +105,8 @@ def main():
     logger.success("Backend Initialized.")
 
     # 5. Create UI
+    # TODO: The main window now use serveral reference to internal object of backend:
+    # including analyzer, frame_server. maybe someday refactor it to have better structure...
     window = MainWindow(backend)
     
     # 6. Show GUI and enter event loop
