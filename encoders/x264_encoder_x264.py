@@ -336,15 +336,14 @@ class X264Encoder(BaseVideoEncoder):
         """
         Encodes a list of frame chunks using the initialized x264 encoder.
         Each chunk in the list is an np.ndarray of frames.
-        This method processes each chunk: extracts timecodes (if applicable),
-        writes timecodes to a log, and writes image data frame-by-frame to the
-        x264 process's stdin.
 
         Args:
             frames_list (List[np.ndarray]): A list of np.ndarray objects.
-                Each np.ndarray has a shape like (num_frames_in_chunk, H_buffer, W, C),
-                where H_buffer is the height of frames from the shared buffer
-                (potentially including appended timecode data).
+                Each np.ndarray has a shape like (num_frames_in_chunk, H, W, C),
+                or (num_frames_in_chunk, h, w, c) if ExtInfoExtractor is loaded,
+                where HWC is the dimension of buffer data and hwc is the 
+                dimension of ExtInfoExtractor output.
+
         Returns:
             bool: True if encoding was successful, False otherwise.
 

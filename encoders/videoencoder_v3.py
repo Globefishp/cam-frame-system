@@ -253,7 +253,7 @@ class BaseVideoEncoder(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def _encode_frames(self, frames: List[np.ndarray], ext_info: Optional[List[dict]] = None, **kwargs):
+    def _encode_frames(self, frames: List[np.ndarray], ext_info: Optional[List[dict]] = None, **kwargs) -> bool:
         """
         Encode a batch of frames using the specific video encoder.
         This method MUST be implemented by subclasses.
@@ -371,8 +371,11 @@ class BaseVideoEncoder(ABC):
                                 continue # Skip if no frames were actually processed
     
                             # Blocking method, Pass the list of frame views
-                            self._encode_frames(frames_list, ext_info=ext_info_list)
-                            self._frame_count.value += num_frames_processed
+                            ret = self._encode_frames(frames_list, ext_info=ext_info_list)
+                            if ret:
+                                self._frame_count.value += num_frames_processed
+                            else:
+                                logger.warning(f"Failed to encode #{num_frames_processed} frames.")
     
                             # Update Speed Calculation 
                             frame_count_since_last_check += num_frames_processed
