@@ -445,6 +445,7 @@ class BaseVideoEncoder(ABC):
                 return
         try:
             # Set running state and start worker process
+            self._not_eager_stop.set()
             self._worker_enable.set()
             self._frame_count.value = 0 # Reset counter.
             
@@ -516,6 +517,9 @@ class BaseVideoEncoder(ABC):
             logger.info(f"Stopping VideoEncoder worker (PID {wp.pid})...")
             # Signal worker to stop
             self._worker_enable.clear()
+            if resumable: 
+                # stop immediately without waiting remaining frames being encoded.
+                self._not_eager_stop.clear() 
 
             # Wait for worker process to finish
             if wp.is_alive():
