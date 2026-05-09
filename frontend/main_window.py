@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt, QTimer
 from frontend.gl_widget import CameraDisplayWidget
 from frontend.gl_upload_thread import GLTextureUploadThread
 from frontend.analyzer_widget import AnalyzerWidget
+from frontend.record_widget import RecordWidget
 
 class MainWindow(QMainWindow):
     """
@@ -51,16 +52,9 @@ class MainWindow(QMainWindow):
         self.fps_label = QLabel(f"{self.fps_slider.value()} FPS")
         controls_layout.addWidget(self.fps_label)
 
-        # 3. Recording Path Selection
-        path_layout = QHBoxLayout()
-        path_layout.addWidget(QLabel("Output:"))
-        self.path_edit = QLineEdit()
-        self.path_edit.setReadOnly(True)
-        path_layout.addWidget(self.path_edit)
-        self.browse_button = QPushButton("...")
-        self.browse_button.setFixedWidth(30)
-        path_layout.addWidget(self.browse_button)
-        controls_layout.addLayout(path_layout)
+        # 3. Recording Controls
+        self.record_widget = RecordWidget(self.backend)
+        controls_layout.addWidget(self.record_widget)
         
         # 4. Analyzer Controls
         self.analyzer_widget = AnalyzerWidget(self.backend)
@@ -75,12 +69,7 @@ class MainWindow(QMainWindow):
         status_vbox = QVBoxLayout(status_group)
         
         self.buffer_label = QLabel(f"Buffer load: 0 / {backend.frame_server.buffer.buffer_capacity} frames (0.0 %)")
-        self.encoded_frames_label = QLabel("Encoded: 0 frames")
-        self.encoding_fps_label = QLabel("Encoding Speed: 0.0 FPS")
-        
         status_vbox.addWidget(self.buffer_label)
-        status_vbox.addWidget(self.encoded_frames_label)
-        status_vbox.addWidget(self.encoding_fps_label)
         
         controls_layout.addWidget(status_group)
 
@@ -93,21 +82,13 @@ class MainWindow(QMainWindow):
         self.capture_button = QPushButton("Start Capture")
         self.capture_button.setCheckable(True)
         controls_layout.addWidget(self.capture_button)
-
-        self.record_button = QPushButton("Start Recording")
-        self.record_button.setCheckable(True)
-        self.record_button.setEnabled(False)
-        controls_layout.addWidget(self.record_button)
         
         main_layout.addWidget(controls_widget, 1)
 
         # --- Connect Signals ---
         self.exposure_slider.valueChanged.connect(self._on_exposure_changed)
         self.fps_slider.valueChanged.connect(self._on_fps_changed)
-        self.browse_button.clicked.connect(self.select_output_path)
-        self.path_edit.textChanged.connect(self._update_record_button_state)
         self.capture_button.toggled.connect(self.toggle_capture)
-        self.record_button.toggled.connect(self.toggle_recording)
 
         # --- Render Thread & VSync Setup ---
         # Force context creation for the main widget so we can share it
@@ -134,17 +115,6 @@ class MainWindow(QMainWindow):
         buffer_capacity = self.backend.frame_server.buffer.buffer_capacity
         self.buffer_label.setText(f"Buffer load: {buffer_count} / {buffer_capacity} frames "
                                   f"({buffer_count / buffer_capacity * 100:.1f}%)")
-
-        # encoder status
-        encoder = getattr(self.backend, 'encoder', None)
-        status = getattr(encoder, 'status', {}) if encoder else {}
-
-        # encoder frame count
-        frame_count = status.get('frame_count', 0)
-        fps = status.get('fps', 0.0)
-
-        self.encoded_frames_label.setText(f"Encoded: {frame_count} frames")
-        self.encoding_fps_label.setText(f"Encoding Speed: {fps:.1f} FPS")
         
         # TODO: can add color warning based on buffer load
 
@@ -163,45 +133,22 @@ class MainWindow(QMainWindow):
         self.fps_label.setText(f"{value} FPS")
         self.backend.set_fps(float(value))
 
-    def select_output_path(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Video", "", "MP4 Files (*.mp4)")
-        if path:
-            self.path_edit.setText(path)
-
-    def _update_record_button_state(self):
-        can_record = self.capture_button.isChecked() and bool(self.path_edit.text())
-        self.record_button.setEnabled(can_record)
-
     def toggle_capture(self, checked):
         if checked:
             self.capture_button.setText("Stop Capture")
             self.backend.start_capture()
-            self._update_record_button_state()
         else:
             self.capture_button.setText("Start Capture")
             self.backend.stop_capture()
-            if self.record_button.isChecked():
-                self.record_button.setChecked(False)
-            self.record_button.setEnabled(False)
-
-    def toggle_recording(self, checked):
-        if checked:
-            output_path = self.path_edit.text()
-            if not output_path:
-                self.record_button.setChecked(False)
-                return
-            self.record_button.setText("Stop Recording")
-            self.backend.start_recording(output_path)
-            self.fps_slider.setEnabled(False)
-        else:
-            self.record_button.setText("Start Recording")
-            self.backend.stop_recording()
-            self.fps_slider.setEnabled(True)
+        
+        # Update record widget state
+        self.record_widget.set_capture_active(checked)
 
     def closeEvent(self, event):
         """Handle cleanup on exit."""
-        if self.record_button.isChecked():
-            self.backend.stop_recording()
+        # Notify widgets to cleanup their own resources
+        if hasattr(self, 'record_widget'):
+            self.record_widget.stop()
             
         # Notify analyzer widget to cleanup its own resources (worker thread, plot window)
         if hasattr(self, 'analyzer_widget'):
