@@ -1,7 +1,8 @@
 # analyzers/yolo_poscolor_analyzer.py
 # Gemini 3.1 pro, reviewed by Haiyun Huang (260507)
 
-import torch
+from __future__ import annotations
+
 import numpy as np
 from numpy.typing import NDArray
 import threading as t
@@ -9,7 +10,11 @@ import time
 import os
 from io import TextIOWrapper
 from pathlib import Path
-from typing import Optional, Any, Tuple, Union, Dict, List, Callable, Protocol
+from typing import Optional, Any, Tuple, Union, Dict, List, Callable, Protocol, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
+
 from .yolo_analyzer import YOLOBaseAnalyzer
 from .analyzer_types import DeviceType
 
@@ -95,7 +100,7 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
         
         # State Management
         self._frame_counter: int = 0
-        self._prev_center: Optional[Tuple[float, float]] = None
+        self._prev_centers: Dict[int, Tuple[float, float]] = {}
         # pickle problem, defer init to _initialize_analyzer which is run in subprocess
         self._history_lock: Optional[t.Lock] = None 
         
@@ -119,9 +124,10 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
         self._save_path = Path(path)
 
     def _initialize_analyzer(self):
+        import torch
         super()._initialize_analyzer()
         self._history_lock = t.Lock()
-
+        
         logger = self._logger
         device_str = 'cuda' if self._device == DeviceType.CUDA else 'cpu'
         # Shape (3, 1) for matrix multiplication with (H, W, 3)
@@ -142,7 +148,7 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
             file_exists = self._save_path.exists()
             self._csv_file_handle = open(self._save_path, "a", encoding="utf-8")
             if not file_exists or self._save_path.stat().st_size == 0:
-                self._csv_file_handle.write("FrameIndex,Timestamp,Displacement,Grayscale,BBox\n")
+                self._csv_file_handle.write("FrameIndex,TileID,Timestamp,Displacement,Grayscale,BBox\n")
             self._csv_file_handle.flush()
 
     def _uninitialize_analyzer(self):
@@ -155,7 +161,7 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
         """Handle async commands from main process concurrently."""
         if cmd_name == "reset_tracker":
             with self._history_lock:
-                self._prev_center = None
+                self._prev_centers.clear()
                 self._frame_counter = 0  # Optional: Reset counter or keep it going
             # Update status dict via IPC to notify main process
             self._status_update({"tracker_status": "reset_completed"})
@@ -166,6 +172,7 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
         """
         Handle arbitrary Tiling (List of (x,y) and (h,w)), Type Casting, and NHWC to NCHW rearrangement.
         """
+        import torch
         # frame shape: (B, H, W, C)
         B, H, W, C = frames.shape
         N = len(self._tile_grids)
@@ -202,6 +209,7 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
         Map bounding boxes back to global coordinates, calculate displacement,
         compute grayscale via pure GPU Matrix Ops, and update results via IPC.
         """
+        import torch
         B = metadata["batch_size"]
         num_tiles = len(self._tile_grids)
         H_t, W_t = self._tile_shape
@@ -210,96 +218,81 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
         batch_results_dict = {}
 
         for b in range(B):
-            best_conf = -1.0
-            best_bbox = None
-            
-            # 1. Reconstruct tiles and find highest confidence globally for this frame
-            for i in range(num_tiles):
-                tile_idx = b * num_tiles + i
-                tile_result = results[tile_idx]
-                
-                if len(tile_result.boxes) > 0:
-                    # Find the max confidence box in this tile
-                    max_idx = torch.argmax(tile_result.boxes.conf).item()
-                    conf = tile_result.boxes.conf[max_idx].item()
-                    
-                    if conf > best_conf:
-                        best_conf = conf
-                        box = tile_result.boxes.xyxy[max_idx]  # Tensor [x1, y1, x2, y2]
-                        
-                        # Calculate global offsets
-                        x_offset, y_offset = self._tile_grids[i]
-                        
-                        x1 = box[0].item() + x_offset
-                        y1 = box[1].item() + y_offset
-                        x2 = box[2].item() + x_offset
-                        y2 = box[3].item() + y_offset
-                        
-                        # Clamp to image boundaries just in case
-                        x1, y1 = max(0, int(x1)), max(0, int(y1))
-                        x2, y2 = min(orig_w, int(x2)), min(orig_h, int(y2))
-                        
-                        best_bbox = (x1, y1, x2, y2)
-            
-            # 2. Logic Extraction (Displacement and Grayscale)
-            displacement = float('nan')
-            gray_value = float('nan')
+            # 1. Get Timecode from extended info (parsed in BaseAnalyzer)
+            timecode = None
+            if ext_info:
+                timecode = int(ext_info[b][self._timecode_extractor.timecode_key] *
+                               1_000_000_000 / self._timecode_extractor.timebase)
+            if timecode is None:
+                timecode = time.time_ns()
+
+            frame_results = {"timestamp": timecode}
             
             # Use lock to safely update history state
             with self._history_lock:
                 current_frame_id = self._frame_counter
                 self._frame_counter += 1
                 
-                if best_bbox is not None:
-                    x1, y1, x2, y2 = best_bbox
-                    cx = (x1 + x2) / 2.0
-                    cy = (y1 + y2) / 2.0
+                # 2. Reconstruct tiles and process each independently
+                for i in range(num_tiles):
+                    tile_idx = b * num_tiles + i
+                    tile_result = results[tile_idx]
                     
-                    # Displacement calculation
-                    if self._prev_center is not None:
-                        displacement = np.hypot(cx - self._prev_center[0], cy - self._prev_center[1])
-                    else:
-                        displacement = 0.0 # First occurrence has no displacement
+                    best_conf = -1.0
+                    tile_best_bbox = None
+                    if len(tile_result.boxes) > 0:
+                        # Find the max confidence box in this tile
+                        max_idx = torch.argmax(tile_result.boxes.conf).item()
+                        best_conf = tile_result.boxes.conf[max_idx].item()
+                        tile_best_bbox = tile_result.boxes.xyxy[max_idx]  # Tensor [x1, y1, x2, y2]
                     
-                    self._prev_center = (cx, cy)
-            
-            if best_bbox is not None:
-                x1, y1, x2, y2 = best_bbox
-                # Grayscale Calculation (Pure GPU Matrix operation)
-                # original_frame shape is (B, H, W, C). Slice ROI.
-                roi = original_frames[b, y1:y2, x1:x2, :]
-                
-                if roi.numel() > 0:
-                    # Convert ROI to float (if not already) for matrix multiplication
-                    roi_float = roi.float()
-                    # Matrix Mult: (h, w, 3) @ (3, 1) -> (h, w, 1)
-                    roi_gray = torch.matmul(roi_float, self._color_matrix)
-                    # Squeeze to (h, w) and mean
-                    gray_value = roi_gray.mean().item()
-            
-            # 3. Get Timecode from extended info (parsed in BaseAnalyzer)
-            timecode = None
-            if ext_info:
-                timecode = int(ext_info[b][self._timecode_extractor.timecode_key] *
-                               1_000_000_000 / self._timecode_extractor.timebase)
+                    global_bbox = None
+                    displacement = float('nan')
+                    gray_value = float('nan')
 
-            if timecode is None:
-                timecode = time.time_ns()
+                    if tile_best_bbox is not None:
+                        # Calculate global offsets
+                        x_offset, y_offset = self._tile_grids[i]
+                        x1 = max(0,      tile_best_bbox[0].item() + x_offset)
+                        y1 = max(0,      tile_best_bbox[1].item() + y_offset)
+                        x2 = min(orig_w, tile_best_bbox[2].item() + x_offset)
+                        y2 = min(orig_h, tile_best_bbox[3].item() + y_offset)
+                        global_bbox = (x1, y1, x2, y2)
+                        
+                        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                        
+                        # Displacement calculation per tile
+                        prev_c = self._prev_centers.get(i)
+                        if prev_c is not None:
+                            displacement = np.hypot(cx - prev_c[0], cy - prev_c[1])
+                        else:
+                            displacement = 0.0 # First occurrence has no displacement
+                        self._prev_centers[i] = (cx, cy)
 
-            bbox_str = f"{best_bbox[0]},{best_bbox[1]},{best_bbox[2]},{best_bbox[3]}" if best_bbox else "None"
+                        # Grayscale Calculation (Pure GPU Matrix operation)
+                        # original_frame shape is (B, H, W, C). Slice ROI.
+                        roi = original_frames[b, int(y1+0.5):int(y2+0.5), int(x1+0.5):int(x2+0.5), :]
+                        if roi.numel() > 0:
+                            # Matrix Mult: (h, w, 3) @ (3, 1) -> (h, w, 1)
+                            roi_gray = torch.matmul(roi.float(), self._color_matrix)
+                            # Squeeze to (h, w) and mean
+                            gray_value = roi_gray.mean().item()
+                    
+                    # 3. Store tile result
+                    frame_results[i] = {
+                        "status": "detected" if global_bbox else "lost",
+                        "bbox": global_bbox,
+                        "displacement": displacement,
+                        "grayscale": gray_value
+                    }
+                    
+                    # 4. Stream to CSV
+                    if self._csv_file_handle is not None:
+                        bbox_str = f"{global_bbox[0]},{global_bbox[1]},{global_bbox[2]},{global_bbox[3]}" if global_bbox else "None"
+                        self._csv_file_handle.write(f"{current_frame_id},{i},{timecode},{displacement},{gray_value},\"{bbox_str}\"\n")
             
-            # 4. Format payload using frame_id as Key
-            batch_results_dict[current_frame_id] = {
-                "timestamp": timecode,
-                "status": "detected" if best_bbox else "lost",
-                "bbox": best_bbox,          # Format: Tuple(x1, y1, x2, y2)
-                "displacement": displacement,
-                "grayscale": gray_value
-            }
-            
-            # 5. Stream to CSV
-            if self._csv_file_handle is not None:
-                self._csv_file_handle.write(f"{current_frame_id},{timecode},{displacement},{gray_value},\"{bbox_str}\"\n")
+            # Format payload using frame_id as Key
+            batch_results_dict[current_frame_id] = frame_results
         
         if self._csv_file_handle is not None:
             self._csv_file_handle.flush()

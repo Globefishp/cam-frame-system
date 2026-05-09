@@ -1,13 +1,17 @@
 # analyzers/yolo_analyzer.py
 # Gemini 3.1 pro, reviewed by Haiyun Huang (260507)
 
+from __future__ import annotations
+
 from frameserver import FrameServer
 from abc import abstractmethod
-import torch
 import threading as t
-from typing import Optional, Any, Tuple, Union, Dict, List
+from typing import Optional, Any, Tuple, Union, Dict, List, TYPE_CHECKING
 from pathlib import Path
-from ultralytics import YOLO
+
+if TYPE_CHECKING:
+    import torch
+    from ultralytics import YOLO
 
 from .analyzer import BaseAnalyzer
 from .analyzer_types import TensorType, DeviceType, AnalyzerException
@@ -54,6 +58,9 @@ class YOLOBaseAnalyzer(BaseAnalyzer):
         """
         # Enforce PyTorch Tensor config and GPU
         kwargs['tensor_type'] = TensorType.TORCH
+        
+        # Lazy import torch.
+        import torch
         kwargs['device'] = DeviceType.CUDA if torch.cuda.is_available() else DeviceType.CPU
         super().__init__(frame_server=frame_server, **kwargs)
         
@@ -64,6 +71,9 @@ class YOLOBaseAnalyzer(BaseAnalyzer):
 
     def _initialize_analyzer(self):
         """Worker Process: Load YOLO model to target device."""
+        import torch
+        from ultralytics import YOLO
+        
         device_str = 'cuda' if self._device == DeviceType.CUDA else 'cpu'
         self._model = YOLO(self._model_path)
         self._model.to(device_str)
@@ -73,6 +83,7 @@ class YOLOBaseAnalyzer(BaseAnalyzer):
 
     def _uninitialize_analyzer(self):
         """Worker Process: Cleanup model and release VRAM."""
+        import torch
         del self._model
         self._model = None
         if self._device == DeviceType.CUDA:
@@ -82,6 +93,7 @@ class YOLOBaseAnalyzer(BaseAnalyzer):
         """
         Worker Process: Core execution skeleton.
         """
+        import torch
         if not isinstance(frames, torch.Tensor):
             raise AnalyzerException("YOLOBaseAnalyzer expects a torch.Tensor. Check tensor_type config.")
 
