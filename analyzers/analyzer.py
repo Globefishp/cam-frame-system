@@ -139,6 +139,9 @@ class BaseAnalyzer(ABC):
 
         self._init_ipc()
 
+        # Statistics
+        self._analyzed_count: mp.Value = mp.Value('i', 0, lock=False) # Only accessed by _worker
+
     def __getstate__(self):
         state = self.__dict__.copy()
         # Remove resources belonging to main process or unpicklable
@@ -454,7 +457,7 @@ class BaseAnalyzer(ABC):
         cmd_thread.start()
 
         # Frame counting for statistics (status)
-        frame_count = 0
+        frame_count_since_last_check = 0
         time_last_check = time.monotonic()
 
         # Event loop local variables
@@ -544,15 +547,16 @@ class BaseAnalyzer(ABC):
                     # Execute Analysis
                     try:
                         self._analyze(data, ext_info=extinfo_list, **kwargs)
-                        frame_count += self._batch_size
+                        frame_count_since_last_check += self._batch_size
+                        self._analyzed_count.value += self._batch_size
                         
                         # Statistics Interval Update
                         current_time = time.monotonic()
                         elapsed = current_time - time_last_check
                         if elapsed >= self._stat_interval:
-                            fps = frame_count / elapsed
-                            self._status_update({"frame_count": frame_count, "fps": fps})
-                            frame_count = 0
+                            fps = frame_count_since_last_check / elapsed
+                            self._status_update({"frame_count": self._analyzed_count.value, "fps": fps})
+                            frame_count_since_last_check = 0
                             time_last_check = current_time
                         
                         if not self._continuous_mode:
