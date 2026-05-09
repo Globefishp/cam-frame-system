@@ -82,7 +82,12 @@ def main():
 
     analyzer_kwargs = {
         'batch_size': 1, # adjust here to balance analyze latency and throughput
-        'tile_grids': [(0, 0), (640, 0)], # default single tile for init
+        'tile_grids': [
+            (0, 0), (640, 0), (1280, 0), 
+            (0, 640), (640, 640), (1280, 640), 
+            (0, 1280), (640, 1280), (1280, 1280)
+        ], # YOLOPosColorAnalyzer perf test: 5060Ti @ 100W 2.7G, ~50fps.
+        # Tiling is somewhat waste since YOLO can output multiple detection box at a time.
         'tile_shape': (640, 640),
         'consumer_mode': ConsumerMode.SYNC
     }

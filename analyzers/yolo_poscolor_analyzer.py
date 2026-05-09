@@ -1,6 +1,9 @@
 # analyzers/yolo_poscolor_analyzer.py
 # Gemini 3.1 pro, reviewed by Haiyun Huang (260507)
 
+# perf test: 5060Ti @ 100W 2.7G, ~50fps for 9 tiles of (640x640).
+# Tiling is somewhat waste since YOLO can output multiple detection box at a time.
+
 from __future__ import annotations
 
 import numpy as np
