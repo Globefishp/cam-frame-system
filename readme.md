@@ -1,12 +1,22 @@
-﻿mvsdk.py:	相机SDK接口库（参考文档 WindowsSDK安装目录\Document\MVSDK_API_CHS.chm）
+﻿# Camera System For Real-time Detection and more
 
-grab.py: 使用SDK采集图片，并保存到硬盘文件
-cv_grab.py: 使用SDK采集图片，转换为opencv的图像格式
+V2.0-pre1: 依赖倒置结构, 所有组件构建在数据总线ring_buffer_v4和多消费者分发器frameserver_v3上.
+亮点:
+- 完全多进程设计. 核心总线和分发支持全局单例的各线程/进程注入. 分发器支持可配置的锁读/脏读模式. 最多支持32个消费者同时读写各自32个帧区域.
+- 最大限度地零拷贝设计. 数据进数据总线拷贝一次, 从总线读取分发永远返回视图而非拷贝. Analyzer基类支持数据从数据总线直接DMA上传显存(需要CUDA驱动).
+- 规范化的日志和错误抛出. 遵循合适的Let it crash原则. 遵循分级raise原则, raise后就不记录error原则, 分层错误缓解原则.
 
-CameraSystem.py: 主模块，包含示例逻辑。包含初始化子类和Shared ring buffer管理。
-videoencoder.py: 视频编码器基类，管理IPC资源。
-nnanalyzer.py: 神经网络分析器基类，管理IPC资源。
-x264_encoder_x264.py: 使用x264.exe实现x264编码器，带时间码记录，使用mp4fpsmod来mux时间码。
-sleap_analyzer.py: 使用一个SLEAP(TopDown)策略训练的Centroid模型进行目标识别和中心点分析，底层应该是UNet。
+- 相机模块现已完全抽象成规范接口, 支持时间码融合到帧内容中传递, 支持传出可跨进程序列化的元数据提取器, 以从一批融合数据中提取出多帧和一组元数据. 
+- 包含参考相机`HuatengCamera`, 现在支持 8/12bit 软件ISP流水线, 包含可配置的颜色校正. 软件ISP由C实现, 需要SSE4.1, AVX2指令集.
 
-架构图：![Architecture](Architecture(v1.3beta).png)
+- 可扩展的基类. Analyzer和VideoEncoder基类现在处理了时间码提取和所有IPC细节, 子类只需继承接口关注具体实现.
+- Aanlyzer支持数据DMA上传显存, 目前支持Numpy和PyTorch两个接口. 含有丰富可配置的运行时选项, 支持连续运行和触发运行, 支持非同步读(适用于分析速度小于生产速度)和同步读(分析速度远大于生产速度). CPU密集部分完全在子进程中完成, 暴露给主进程可控的IPC接口: 支持可超时等待的,主进程状态查询和结果返回接口. 包含参考实现的`YOLOBaseAnalyzer`和`YOLOPosColorAnalyzer`.
+- VideoEncoder与Analyzer类似, 但是完全自主运行, 同样可以处理时间码. 包含参考实现的`X264Encoder`.
+
+- 前后端分离, 后端支持无头运行. 
+- 前端采用PySide6 + ModernGL (OpenGL) 技术栈, 支持垂直同步和完全与生产解耦的渲染. 
+- GL渲染部分, 分离数据上传和实际渲染, 使用双缓冲避免撕裂. 支持叠加时间码显示和渲染叠加几何(线/点, 在渲染检测框时很有用)
+- 分析器部分, 支持`YOLOPosColorAnalyzer`中实时数据显示.(可能还需要打磨)
+- 尽管前端组件仍需打磨, 但现在基本上采用插件式注入(TODO: AnalyzerWidget 需要注入Analyzer而非整个Backend)
+
+就这样吧, 我还有更多事情要做. 有缘再更新.

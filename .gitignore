@@ -10,3 +10,5 @@ tests/__pycache__/
 *.mkv
 *.h264
 *.txt
+?*tests/
+*test/
