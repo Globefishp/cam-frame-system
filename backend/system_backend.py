@@ -243,6 +243,16 @@ class HeadlessBackend: # TODO: Rename as Backend????
             self.camera_process.start_event.set()
             self.encoder = None
 
+    def rotate_recording(self, new_path: str):
+        """Seamlessly rotate the recording to a new file."""
+        if not self.encoder:
+            if self._logger: self._logger.error("No active recording to rotate.")
+            return
+        
+        self.encoder.stop(resumable=True)
+        self.encoder.output_path = new_path
+        self.encoder.start()
+
     def start_analyzer(self, model_path: Optional[str] = None, save_path: Optional[str] = None):
         """Starts the analyzer background process."""
         if self.analyzer:
