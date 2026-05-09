@@ -52,15 +52,7 @@ class AnalyzerWidget(QGroupBox):
         save_layout.addWidget(self.btn_browse_save)
         layout.addLayout(save_layout)
 
-        # 3. Status Display
-        status_layout = QVBoxLayout()
-        self.analyzed_label = QLabel("Analyzed: 0 frames")
-        self.speed_label = QLabel("Analysis Speed: 0.0 FPS")
-        status_layout.addWidget(self.analyzed_label)
-        status_layout.addWidget(self.speed_label)
-        layout.addLayout(status_layout)
-
-        # 4. Start/Stop Button & Show Plot
+        # 3. Start/Stop Button & Show Plot
         action_layout = QHBoxLayout()
         self.btn_toggle_analyzer = QPushButton("Start Analyzer")
         self.btn_toggle_analyzer.setCheckable(True)
@@ -70,6 +62,14 @@ class AnalyzerWidget(QGroupBox):
         self.btn_show_plot = QPushButton("Show Plot")
         action_layout.addWidget(self.btn_show_plot)
         layout.addLayout(action_layout)
+
+        # 4. Status Display
+        status_layout = QVBoxLayout()
+        self.analyzed_label = QLabel("Analyzed: 0 frames")
+        self.speed_label = QLabel("Analysis Speed: 0.0 FPS")
+        status_layout.addWidget(self.analyzed_label)
+        status_layout.addWidget(self.speed_label)
+        layout.addLayout(status_layout)
 
         # 5. Plot Window & Worker
         self.plot_window = AnalyzerPlotWindow(self)
