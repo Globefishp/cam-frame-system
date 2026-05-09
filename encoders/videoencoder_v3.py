@@ -273,10 +273,9 @@ class BaseVideoEncoder(ABC):
                 not possible.
         
         Notes:
-            np.concat(List[np.ndarray], axis=0) will results in a full batch
-            of frames with shape (batch_size(ideally), height, width, channel), 
-            but will also introduce memory copy. It's recommended to handle the
-            list of frames carefully.
+            The shape of frame is decided by the FrameServer. If `extinfo_extractor`
+            is provided, it will also affect the shape of frame. Be compatible 
+            with both case.
         """
         raise NotImplementedError
 

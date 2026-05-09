@@ -367,6 +367,12 @@ class X264Encoder(BaseVideoEncoder):
             if frame_chunk_arr is None or frame_chunk_arr.size == 0:
                 logger.warning(f"Received empty or None frame_chunk_arr in list. Skip encoding.")
                 continue # Skip this chunk
+
+            if frame_chunk_arr.shape[-3] < height or frame_chunk_arr.shape[-2] < width or \
+              frame_chunk_arr.shape[-1] != channels:
+                raise EncoderException(f"Frame data mismatch (smaller) than expected. "
+                    f"shape: {frame_chunk_arr.shape[1:]}, expected: ({height}, {width}, {channels})")
+            frame_chunk_arr = frame_chunk_arr[:, :height, :width, :] # crop upper-left
             
             if ext_info:
                 timecodes_list = [item[self._timecode_extractor.timecode_key] for item in ext_info]
@@ -375,8 +381,8 @@ class X264Encoder(BaseVideoEncoder):
             # --- Write Image Data for this chunk to x264 stdin (frame by frame) ---
             try:
                 for idx, frame_view in enumerate(frame_chunk_arr):
-
-                    self._x264_process.stdin.write(frame_view.tobytes())
+                    # TODO: Batch write is accepted by x264.
+                    self._x264_process.stdin.write(frame_view.tobytes()) 
                     self._processed_frames += 1
 
                     if self._timecode_file and timecodes_list:
