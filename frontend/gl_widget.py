@@ -49,6 +49,12 @@ class CameraDisplayWidget(QOpenGLWidget):
         
         self.interpolation = moderngl.LINEAR
 
+        # Zoom and pan for mouse control
+        self.zoom_factor = 1.0    # [1.0, 16.0]
+        self.pan_x = 0.0          # in NDC coordinates [-1, 1]
+        self.pan_y = 0.0          # in NDC coordinates [-1, 1]
+        self.last_mouse_pos = None # Used for recording drag state.
+
     def initializeGL(self):
         # PySide6 has already created the context and made it current
         self.ctx = moderngl.create_context()
@@ -178,7 +184,8 @@ class CameraDisplayWidget(QOpenGLWidget):
         self._update_transform_mtx(self.tex_w, self.tex_h)
     
     def _update_transform_mtx(self, tex_w, tex_h):
-        frame_mtx = self._frame_transform_mtx(self.width(), self.height(), tex_w, tex_h)
+        frame_mtx = self._frame_transform_mtx(self.width(), self.height(), tex_w, tex_h, 
+                                              self.zoom_factor, self.pan_x, self.pan_y)
         ts_extra_mtx = self._timestamp_transform_mtx(200, 30)
         # modernGL.context.write() require C-continuous memory, but GLSL interprete as F-continuous.
         self._transform_mtx = frame_mtx.T.copy()
@@ -259,7 +266,8 @@ class CameraDisplayWidget(QOpenGLWidget):
         self.points_vao.render(moderngl.POINTS, vertices=self.points_v_n)
 
     @staticmethod
-    def _frame_transform_mtx(w: int, h: int, tex_w: int, tex_h: int) -> NDArray:
+    def _frame_transform_mtx(w: int, h: int, tex_w: int, tex_h: int,
+                             zoom: float = 1.0, pan_x: float = 0.0, pan_y: float = 0.0) -> NDArray:
         """Calculate aspect ratio preserving matrix"""
         if tex_w == 0 or tex_h == 0 or w == 0 or h == 0:
             return np.eye(4, dtype='f4')
@@ -274,8 +282,12 @@ class CameraDisplayWidget(QOpenGLWidget):
             scale_y = widget_aspect / image_aspect
             
         mat = np.eye(4, dtype='f4')
-        mat[0, 0] = scale_x
-        mat[1, 1] = scale_y
+        # Zoom (z_x, z_y) * Scale_fit
+        mat[0, 0] = scale_x * zoom
+        mat[1, 1] = scale_y * zoom
+        # Pan (t_x, t_y)
+        mat[0, 3] = pan_x
+        mat[1, 3] = pan_y
         return mat
 
     @staticmethod
@@ -290,4 +302,83 @@ class CameraDisplayWidget(QOpenGLWidget):
         mat_ts[1, 1] = target_h / 2
         mat_ts[0, 3] = -1.0 + target_w / 2 
         mat_ts[1, 3] =  1.0 - target_h / 2
-        return mat_ts#
+        return mat_ts
+
+    def _clamp_pan(self):
+        """Clamp pan to prevent unnecessary black borders when zoomed in."""
+        if self.tex_w == 0 or self.tex_h == 0 or self.width() == 0 or self.height() == 0:
+            return
+
+        widget_aspect = self.width() / self.height()
+        image_aspect = self.tex_w / self.tex_h
+        
+        scale_x = image_aspect / widget_aspect if widget_aspect > image_aspect else 1.0
+        scale_y = widget_aspect / image_aspect if widget_aspect <= image_aspect else 1.0
+        
+        # z*s_x = half width, max pan < content exceeds the window.
+        # if half width < 1 (in NDC), no pan.
+        # |t_x| <= max(0, z * s_x - 1.0)
+        max_pan_x = max(0.0, self.zoom_factor * scale_x - 1.0)
+        max_pan_y = max(0.0, self.zoom_factor * scale_y - 1.0)
+
+        # Apply clamping
+        self.pan_x = max(-max_pan_x, min(max_pan_x, self.pan_x))
+        self.pan_y = max(-max_pan_y, min(max_pan_y, self.pan_y))
+
+    def wheelEvent(self, event):
+        """Zoom the image using the mouse position as the center of zoom."""
+        if self.tex_w == 0 or self.tex_h == 0:
+            return
+
+        # Calculate mouse position in NDC [-1, 1]
+        mx = (event.position().x() / self.width()) * 2.0 - 1.0
+        my = 1.0 - (event.position().y() / self.height()) * 2.0 # Y-axis need flip in NDC
+
+        # Calculate new zoom factor (step 1.2x)
+        zoom_step = 1.2
+        old_zoom = self.zoom_factor
+        if event.angleDelta().y() > 0:
+            self.zoom_factor *= zoom_step
+        else:
+            self.zoom_factor /= zoom_step
+            
+        # Limit the zoom factor [1.0 (Fit window), 16.0 (Max 1600%)]
+        self.zoom_factor = max(1.0, min(16.0, self.zoom_factor))
+
+        # Compensate pan to keep the pixel under the mouse (s_x * x_pixel) unchange
+        # z * s * x + t = NDC, (NDC-t)/z is invariant before and after zoom.
+        ratio = self.zoom_factor / old_zoom
+        self.pan_x = mx - ratio * (mx - self.pan_x)
+        self.pan_y = my - ratio * (my - self.pan_y)
+
+        # Apply clamping and update
+        self._clamp_pan()
+        self._update_transform_mtx(self.tex_w, self.tex_h)
+        self.update()
+
+    def mousePressEvent(self, event):
+        """Start dragging"""
+        if event.button() == Qt.LeftButton:
+            self.last_mouse_pos = event.position()
+
+    def mouseMoveEvent(self, event):
+        """Dragging the image"""
+        if self.last_mouse_pos is not None:
+            # Convert mouse movement to NDC offset
+            dx = (event.position().x() - self.last_mouse_pos.x()) / self.width() * 2.0
+            dy = -(event.position().y() - self.last_mouse_pos.y()) / self.height() * 2.0 # Qt Y downwards is positive, NDC Y upwards is positive
+
+            self.pan_x += dx
+            self.pan_y += dy
+            
+            self.last_mouse_pos = event.position()
+
+            # Apply clamping and update
+            self._clamp_pan()
+            self._update_transform_mtx(self.tex_w, self.tex_h)
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        """End dragging"""
+        if event.button() == Qt.LeftButton:
+            self.last_mouse_pos = None
