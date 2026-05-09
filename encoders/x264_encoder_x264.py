@@ -15,7 +15,7 @@ from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
 from frameserver.v3.frameserver_v3 import FrameServer
 from encoders.videoencoder_v3 import BaseVideoEncoder
 from encoders.videoencoder_types import EncoderException
-from cameras.abstractcamera.camera import ExtInfoExtractor # Type hinting for timecode extraction
+from utils.digits_overlay import FastDigitsOverlay
 
 import subprocess
 import threading
@@ -52,9 +52,10 @@ class X264Encoder(BaseVideoEncoder):
                  batch_size: int = 5,
                  target_fps: Optional[float] = None,
                  stat_interval: float = 1.0,
-                 inject_logger: Logger = None,
                  extinfo_extractor: Optional[TimecodeExtractor] = None,
+                 inject_logger: Logger = None,
                  mux_timecode: bool = False,
+                 burn_timestamp: bool = False,
                  **kwargs
         ):
         """
@@ -65,18 +66,17 @@ class X264Encoder(BaseVideoEncoder):
                 Defaults to 5.
             stat_interval: (float), the interval for reporting statistics. 
                 Defaults to 1.0 second. 
+            extinfo_extractor: (Optional[TimecodeExtractor]), the timecode extractor 
+                instance for extracting timecodes from frames. if None, timecodes will
+                not be extracted. Default to None. 
             inject_logger: (Optional[Logger]), the loguru logger instance for logging.
                 enqueue=True is required. if None, a default logger acquired 
                 from current process will be used and could differ from the 
                 logger instance from `main` if current processs is not `main`.
-            timecode_extractor: (Optional[TimecodeExtractor]), the timecode extractor 
-                instance for extracting timecodes from frames. if None, timecodes will
-                not be extracted. Default to None. 
             mux_timecode: (bool), whether to mux the timecodes into the output video. 
                 Defaults to False. If True, uninit will blocking for long time. 
-            extinfo_extractor: (Optional[TimecodeExtractor]), 
-                the extended info extractor instance for extracting timecodes from 
-                frames. if None, timecodes will not be extracted. Default to None. 
+            burn_timestamp: (bool), whether to burn the timecodes into the output video. 
+                Defaults to False. The timecodes will be burned at the upper left corner.
             kwargs: 
                 frame_size: (Tuple[int, int, int]), the frame size of the input frames.
                 crf: (int), the constant rate factor for x264 encoding.
@@ -124,6 +124,8 @@ class X264Encoder(BaseVideoEncoder):
         self._stderr_thread: Optional[threading.Thread] = None
         # x264 finished signal 
         self._x264_finished: Optional[threading.Event] = None
+
+        self._encoder_intermediates: Optional[str] = None # Intermediate file path for x264 encoder.
         
         # Timecode related attributes
         self._timecode_extractor: TimecodeExtractor = extinfo_extractor
@@ -133,8 +135,12 @@ class X264Encoder(BaseVideoEncoder):
         self._timecode_file: Optional[Any] = None # File object for writing timecodes
         self._processed_frames: Optional[int] = None
 
-        self._encoder_intermediates: Optional[str] = None # Intermediate file path for x264 encoder.
-
+        # Timecode burn-in
+        if burn_timestamp:
+            factor = min(3, max(1, min(self._frame_size[0], self._frame_size[1]) // 720))
+            self._ts_burner: Optional[FastDigitsOverlay] = FastDigitsOverlay(x=8*factor, y=8*factor, scale=factor)
+        else:
+            self._ts_burner: Optional[FastDigitsOverlay] = None 
 
     def _read_stdout(self):
         """Reads stdout from the x264 process in a separate thread."""
@@ -373,18 +379,24 @@ class X264Encoder(BaseVideoEncoder):
                     f"shape: {frame_chunk_arr.shape[1:]}, expected: ({height}, {width}, {channels})")
             frame_chunk_arr = frame_chunk_arr[:, :height, :width, :] # crop upper-left
             
-            if ext_info:
+            if ext_info: # have ext_info = have _timecode_extractor
                 timecodes_list = [item[self._timecode_extractor.timecode_key] for item in ext_info]
             else: timecodes_list = []
             
             # --- Write Image Data for this chunk to x264 stdin (frame by frame) ---
             try:
                 for idx, frame_view in enumerate(frame_chunk_arr):
-                    # TODO: Batch write is accepted by x264.
+                    # TODO: Batch write can be accepted by x264.
+                    if self._ts_burner:
+                        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                        if timecodes_list:
+                            timestamp += f" - {int(timecodes_list[idx] // self._timecode_extractor.timebase):05d}"
+                        self._ts_burner(frame_view, timestamp)
                     self._x264_process.stdin.write(frame_view.tobytes()) 
                     self._processed_frames += 1
 
-                    if self._timecode_file and timecodes_list:
+                    if self._timecode_file and timecodes_list: 
+                        # actually, have _timecode_file = have _timecode_extractor = timecodes_list
                         current_tc = timecodes_list[idx]
                         # Rescale tc in timebase to ms(float) for timecode format v2
                         current_tc_ms = current_tc * 1000.0 / self._timecode_extractor.timebase

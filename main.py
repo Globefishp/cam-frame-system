@@ -77,7 +77,8 @@ def main():
         'preset': 'fast',
         'crf': 23,
         'threads': 0,
-        'input-depth': 8 # 16 for 12bit, 8 for 8bit.
+        'input-depth': 8, # 16 for 12bit, 8 for 8bit.
+        'burn_timestamp': True,
     }
 
     analyzer_kwargs = {
