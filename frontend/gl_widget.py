@@ -6,6 +6,8 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtGui import QOpenGLContext
 import moderngl
+from . import gl_shaders
+
 
 class CameraDisplayWidget(QOpenGLWidget):
     """
@@ -51,39 +53,15 @@ class CameraDisplayWidget(QOpenGLWidget):
         # PySide6 has already created the context and made it current
         self.ctx = moderngl.create_context()
         
-        # Shader for displaying standard texture
-        vertex_shader = """
-        #version 330
-        uniform mat4 transform;
-        in vec2 in_vert;
-        in vec2 in_uv;
-        out vec2 v_uv;
-        void main() {
-            gl_Position = transform * vec4(in_vert, 0.0, 1.0);
-            v_uv = in_uv;
-        }
-        """
-        fragment_shader = """
-        #version 330
-        uniform sampler2D Texture;
-        uniform int channels;
-        in vec2 v_uv;
-        out vec4 f_color;
-        void main() {
-            vec4 col = texture(Texture, v_uv);
-            if (channels == 1) {
-                // Grayscale
-                f_color = vec4(col.r, col.r, col.r, 1.0);
-            } else {
-                // RGB/BGR (assume RGB for now, or shader can handle swizzling if needed)
-                f_color = vec4(col.bgr, 1.0);
-            }
-        }
-        """
-        self.prog = self.ctx.program(vertex_shader=vertex_shader, fragment_shader=fragment_shader)
+        # === Displaying main texture ===
+        self.prog = self.ctx.program(
+            vertex_shader=gl_shaders.UV_2D_VERTEX_SHADER, 
+            fragment_shader=gl_shaders.FRAME_FRAGMENT_SHADER
+        )
         
         # Full screen quad (ModernGL textures are 0,0 at bottom left usually, but images are top left. 
         # We might need to flip V coordinate. Camera frames are top-left origin)
+        # Let input 2D x y be in [-1, 1] (similar to NDC)
         vertices = np.array([
             # x, y, u, v
             -1.0, -1.0,  0.0, 1.0, # Bottom left
@@ -95,19 +73,13 @@ class CameraDisplayWidget(QOpenGLWidget):
         self.vao = self.ctx.vertex_array(self.prog, [(self.vbo, '2f 2f', 'in_vert', 'in_uv')])
         
         
-        # --- Timestamp overlay quad ---
-        ts_fragment_shader = """
-        #version 330
-        uniform sampler2D Texture;
-        in vec2 v_uv;
-        out vec4 f_color;
-        void main() {
-            f_color = texture(Texture, v_uv); // RGBA direct
-        }
-        """
-        self.ts_prog = self.ctx.program(vertex_shader=vertex_shader, fragment_shader=ts_fragment_shader)
+        # === Timestamp overlay quad ===
+        self.ts_prog = self.ctx.program(
+            vertex_shader=gl_shaders.UV_2D_VERTEX_SHADER, 
+            fragment_shader=gl_shaders.OVERLAY_2D_FRAGMENT_SHADER
+        )
         
-        # Position: Top right, small size
+        # Texture space [-1,1] -> ts_transform_mtx -> upper-left
         ts_vertices = np.array([
             -1.0, -1.0,  0.0, 1.0,
              1.0, -1.0,  1.0, 1.0,
@@ -117,7 +89,76 @@ class CameraDisplayWidget(QOpenGLWidget):
         self.ts_vbo = self.ctx.buffer(ts_vertices)
         self.ts_vao = self.ctx.vertex_array(self.ts_prog, [(self.ts_vbo, '2f 2f', 'in_vert', 'in_uv')])
 
+        # === Geometry Primitive Overlay ===
+        self.geo_prog = self.ctx.program(
+            vertex_shader=gl_shaders.COLOR_2D_VERTEX_SHADER, 
+            fragment_shader=gl_shaders.COLOR_FRAGMENT_SHADER
+        )
+        # --- Line type object ---
+        # Dynamic VBO for max 2000 vertices * 6 floats (x, y, r, g, b, a) = 48000 bytes
+        self.lines_vbo = self.ctx.buffer(reserve=48000, dynamic=True)
+        self.lines_vao = self.ctx.vertex_array(self.geo_prog, [(self.lines_vbo, '2f 4f', 'in_vert', 'in_color')])
+
+        self.lines_v_n = 0 # record for the vertex number in lines_vbo.
+
+        # --- Point type object ---
+        self.points_vbo = self.ctx.buffer(reserve=48000, dynamic=True)
+        self.points_vao = self.ctx.vertex_array(self.geo_prog, [(self.points_vbo, '2f 4f', 'in_vert', 'in_color')])
+        self.ctx.point_size = 5.0
+        self.points_v_n = 0
+
+        # === GL FBO ===
         self.fbo = self.ctx.detect_framebuffer(self.defaultFramebufferObject())
+
+    @Slot(object)
+    def update_overlay_lines(self, lines_data: Optional[NDArray]):
+        """
+        Receive lines data for overlay for arbitary threads.
+
+        :param lines_data: numpy array of shape (N, 6) containing (x, y, r, g, b, a).
+            x and y should be in original image pixel coordinates (origin top-left).
+            lines will be connect in points order.
+        """
+        if lines_data is None or len(lines_data) == 0:
+            self.lines_v_n = 0
+            self.update()
+            return
+
+        # Normalize coordinates to frame [-1, 1] (apply global transform_mtx)
+        if self.tex_w > 0 and self.tex_h > 0:
+            lines_data = lines_data.copy()
+            lines_data[:, 0] = (lines_data[:, 0] / self.tex_w) * 2.0 - 1.0
+            lines_data[:, 1] = 1.0 - (lines_data[:, 1] / self.tex_h) * 2.0
+            
+        byte_data = lines_data.astype('f4').tobytes()
+        if len(byte_data) <= self.lines_vbo.size:
+            self.lines_vbo.write(byte_data)
+            self.lines_v_n = len(lines_data)
+            self.update()
+
+    @Slot(object)
+    def update_overlay_points(self, points_data: Optional[NDArray]):
+        """
+        Receive points data for overlay for arbitary threads.
+
+        :param points_data: numpy array of shape (N, 6) containing (x, y, r, g, b, a).
+        """
+        if points_data is None or len(points_data) == 0:
+            self.points_v_n = 0
+            self.update()
+            return
+
+        # Normalize coordinates to frame [-1, 1]
+        if self.tex_w > 0 and self.tex_h > 0:
+            points_data = points_data.copy()
+            points_data[:, 0] = (points_data[:, 0] / self.tex_w) * 2.0 - 1.0
+            points_data[:, 1] = 1.0 - (points_data[:, 1] / self.tex_h) * 2.0
+            
+        byte_data = points_data.astype('f4').tobytes()
+        if len(byte_data) <= self.points_vbo.size:
+            self.points_vbo.write(byte_data)
+            self.points_v_n = len(points_data)
+            self.update()
 
     @Slot(int, int, int, int, int)
     def on_frame_ready(self, tex_glo, ts_glo, w, h, channels):
@@ -200,6 +241,23 @@ class CameraDisplayWidget(QOpenGLWidget):
             self.ts_prog['Texture'].value = 0
             self.ts_vao.render(moderngl.TRIANGLE_STRIP)
 
+        # Draw line type overlay
+        if self.lines_v_n > 0:
+            self._paint_lines_overlay()
+        # Draw point type overlay
+        if self.points_v_n > 0:
+            self._paint_points_overlay()
+
+    def _paint_lines_overlay(self):
+        """Paint dynamic color primitives overlaid on the frame."""
+        self.geo_prog['transform'].write(self._transform_mtx)
+        self.lines_vao.render(moderngl.LINES, vertices=self.lines_v_n)
+
+    def _paint_points_overlay(self):
+        """Paint dynamic color primitives overlaid on the frame."""
+        self.geo_prog['transform'].write(self._transform_mtx)
+        self.points_vao.render(moderngl.POINTS, vertices=self.points_v_n)
+
     @staticmethod
     def _frame_transform_mtx(w: int, h: int, tex_w: int, tex_h: int) -> NDArray:
         """Calculate aspect ratio preserving matrix"""
@@ -232,4 +290,4 @@ class CameraDisplayWidget(QOpenGLWidget):
         mat_ts[1, 1] = target_h / 2
         mat_ts[0, 3] = -1.0 + target_w / 2 
         mat_ts[1, 3] =  1.0 - target_h / 2
-        return mat_ts
+        return mat_ts#
