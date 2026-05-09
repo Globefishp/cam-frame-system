@@ -289,8 +289,8 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
                     
                     # 4. Stream to CSV
                     if self._csv_file_handle is not None:
-                        bbox_str = f"{global_bbox[0]},{global_bbox[1]},{global_bbox[2]},{global_bbox[3]}" if global_bbox else "None"
-                        self._csv_file_handle.write(f"{current_frame_id},{i},{timecode},{displacement},{gray_value},\"{bbox_str}\"\n")
+                        bbox_str = f"{global_bbox[0]:.2f},{global_bbox[1]:.2f},{global_bbox[2]:.2f},{global_bbox[3]:.2f}" if global_bbox else "None"
+                        self._csv_file_handle.write(f"{current_frame_id},{i},{timecode},{displacement:.2f},{gray_value:.2f},\"{bbox_str}\"\n")
             
             # Format payload using frame_id as Key
             batch_results_dict[current_frame_id] = frame_results
