@@ -5,13 +5,9 @@
 #                 Using loguru to do logging;
 #                 Cleanup codes, docs and comments.
 #                 Improve stream control logic when stopped. 
-#  v3   (260414): Adapt v2 to inject a FrameServer class rather than a ring 
+#  v3   (260510): Adapt v2 to inject a FrameServer class rather than a ring 
 #                 buffer. We intended to use FrameServer to handle 1 producer
-#                 multiple consumers scenario. In this structure, the encoder 
-#                 `worker` function should be in the same process as the 
-#                 frameserver and loop to get frames. The acquired frame view should be release as soon as possible The `worker` should transport the frames from 
-#                 `frameserver` to the encoder (usually a c-extension or 
-#                 external process)
+#                 multiple consumers scenario. 
 
 # Fails early is good.
 
