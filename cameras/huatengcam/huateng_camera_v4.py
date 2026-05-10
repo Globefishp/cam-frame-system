@@ -531,11 +531,11 @@ class HuatengCamera(AC):
         frame = self.strip_extended_info(frame)
         return frame, {'hw_timecode': tc_val}
 
-    def grab_extended_info(self) -> Optional[np.ndarray]:
+    def grab_extended_info(self) -> Tuple[Optional[NDArray], Any]:
         if not self.is_feature_enabled(CameraFeatures.TIMECODE):
             raise CamException("TIMECODE is not enabled during initialization.", src_func="HuatengCamera.grab_extended_info")
         frame, tc_val = self._grab_extendedbuf_metadata()
-        if frame is None: return None
+        if frame is None: return None, None
         frame = self._processor.process(frame) # Return uint16
 
         if self._bit_depth == BitDepth._8: 
@@ -545,7 +545,7 @@ class HuatengCamera(AC):
         metadata = HuatengCamera.HuatengCamMetadata(hw_timecode=tc_val)
         frame = self._append_metadata_to_image(frame, metadata)
 
-        return frame
+        return frame, {'hw_timecode': tc_val}
     
     # === Metadata related ===
 
@@ -725,7 +725,7 @@ if __name__ == '__main__':
         print("grab_metadata", timecode)
         cv2.imshow("frame", frame[1024:, :]*16)
         cv2.waitKey(0)
-        frame = cam.grab_extended_info()
+        frame, _ = cam.grab_extended_info()
         print(frame.shape)
         cv2.imshow("frame", frame[1024:, :]*16)
         cv2.waitKey(0)

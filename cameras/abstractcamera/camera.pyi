@@ -127,7 +127,7 @@ class AbstractCamera(ABC, metaclass=abc.ABCMeta):
                  First element is the NDArray of image data. `None` if failed. 
                  Second element is the metadata. Usually `dict`. 
         """
-    def grab_extended_info(self, **kwargs) -> NDArray | None:
+    def grab_extended_info(self, **kwargs) -> tuple[NDArray | None, Any]:
         """
         Grab processed image frame with extended info line (e.g. pickled metadata).
         Default is to append a software timecode with a full frame copy action.
@@ -139,7 +139,10 @@ class AbstractCamera(ABC, metaclass=abc.ABCMeta):
             `grab_raw` to add extended info from the beginning, and **keep it** in 
             following steps.
 
-        :return: NDArray of image data. None if failed. 
+        :return: (NDArray, Any)
+                 First element is the NDArray of image with extended info line. 
+                    `None` if failed. 
+                 Second element is the metadata, usually `dict`. `None` if failed.
         """
     def extract_extended_info(self, image: NDArray, **kwargs) -> Any:
         """
