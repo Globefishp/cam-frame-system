@@ -19,7 +19,9 @@ conda install numba tqdm
 ```
 其中numba负责PCOEdge4.2黑平衡加速, tqdm负责与Piezo设备通信的进度条显示.
 
-## V2.0-pre2
+## 版本日志
+
+### V2.0-pre2
 - 改进了录制部分的逻辑, 支持自动分卷和手动触发分卷
 - 改进了预览窗口, 现已支持鼠标拖拽和缩放,
 - 增加了烧录时间戳功能(编码时时间(不准确, 但容易实现)和硬件秒级时间戳(准确的采集时间, 但为相对值)), 以及相应的UI选项.
@@ -31,7 +33,7 @@ conda install numba tqdm
 已知问题:
 - 烧录时间戳勾选后, 由于底层零拷贝, 内存数据共享, UI也会预览到烧录的简易时间戳. 会与GPU渲染的时间戳重叠. Probably won't fix.
 
-## V2.0-pre1
+### V2.0-pre1
 依赖倒置结构, 所有组件构建在数据总线ring_buffer_v4和多消费者分发器frameserver_v3上.
 亮点:
 - 完全多进程设计. 核心总线和分发支持全局单例的各线程/进程注入. 分发器支持可配置的锁读/脏读模式. 最多支持32个消费者同时读写各自32个帧区域.
@@ -50,3 +52,15 @@ conda install numba tqdm
 - GL渲染部分, 分离数据上传和实际渲染, 使用双缓冲避免撕裂. 支持叠加时间码显示和渲染叠加几何(线/点, 在渲染检测框时很有用)
 - 分析器部分, 支持`YOLOPosColorAnalyzer`中实时数据显示.(可能还需要打磨)
 - 尽管前端组件仍需打磨, 但现在基本上采用插件式注入(TODO: AnalyzerWidget 需要注入Analyzer而非整个Backend)
+
+## LLM使用情况/代码质量披露
+
+对于底层核心组件, LLM (FrameServer: Gemini 3.1 Pro, RingBuffer: Gemini 2.5 Pro) 仅用于检查代码逻辑错误, 以及起草初版代码. 所有并发和分支逻辑均经人工推算和单元测试. 几乎全部注释和文档由人类完成.
+
+对于各功能组件(Analyzer, VideoEncoder, Camera), LLM (Gemini 3.1 Pro) 用于起草初版代码, 一部分错误检查和修正由非Agent工具在人工检查后仔细合入. 约90%的注释和文档由人类编写, 但可能出现接口文档更新略有滞后的情况.
+
+对于各实现类(YOLOBaseAnalyzer, YOLOPosColorAnalyzer, X264Encoder, HuatengCamera), 在接口文档约束下, LLM (Gemini 3 Flash with Antigravity) 实现公开程度较高的代码 (YOLO) 具有可接受的代码质量; 对于公开领域可靠文档较少, 网页信息混乱 (x264), 或者需要根据硬件开发 (HuatengCamera) 的具体实现类, LLM 只完成样板代码的编写. 细节部分仍完全由人类填充.
+
+对于DI注入的顶层框架, LLM (Gemini 3.1 Pro) 用于全局文件结构构建和初版起草. LLM (Gemini 3 Flash) 用于局部功能的不断添加和修正. 此部分Agent利用率较高, 人工检查覆盖了核心逻辑和架构设计(状态机/资源管理/并发检查). 注释大部分由 LLM 编写, 人工仅作修正.
+
+对于UI框架, LLM (Gemini 3.1 Pro) 起草了GL部分的渲染器初版代码, 质量较好, 性能优化由人类在独立测试脚本下逐点优化后逐点合入. LLM (Gemini 3 Flash) 负责了部分代码整理, 起草了 PySide6 部分的大部分代码(除GL部分), 人工负责约束文件结构/依赖结构/设计架构, 检查了状态机逻辑和线程并发逻辑. 注释大部分由 LLM 编写, 人工仅作修正.
