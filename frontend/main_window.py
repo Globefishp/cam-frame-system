@@ -6,8 +6,9 @@ from PySide6.QtCore import Qt, QTimer
 
 from frontend.gl_widget import CameraDisplayWidget
 from frontend.gl_upload_thread import GLTextureUploadThread
-from frontend.analyzer_widget import AnalyzerWidget
+from frontend.capture_widget import CaptureWidget
 from frontend.record_widget import RecordWidget
+from frontend.analyzer_widget import AnalyzerWidget
 
 class MainWindow(QMainWindow):
     """
@@ -16,6 +17,7 @@ class MainWindow(QMainWindow):
     def __init__(self, backend):
         super().__init__()
         self.backend = backend
+        self._is_capturing = False # For deciding if vsync should be sent to render thread
         self.setWindowTitle("Camera System - PySide6 + ModernGL")
         self.setGeometry(100, 100, 1000, 700)
 
@@ -34,29 +36,15 @@ class MainWindow(QMainWindow):
         controls_widget.setMinimumWidth(280)
         controls_layout = QVBoxLayout(controls_widget)
 
-        # 1. Exposure Control
-        controls_layout.addWidget(QLabel("Exposure (ms)"))
-        self.exposure_slider = QSlider(Qt.Horizontal)
-        self.exposure_slider.setRange(1, 100)
-        self.exposure_slider.setValue(10)
-        controls_layout.addWidget(self.exposure_slider)
-        self.exposure_label = QLabel(f"{self.exposure_slider.value()} ms")
-        controls_layout.addWidget(self.exposure_label)
+        # 1. Capture Controls (Top)
+        self.capture_widget = CaptureWidget(self.backend)
+        controls_layout.addWidget(self.capture_widget)
 
-        # 2. FPS Control
-        controls_layout.addWidget(QLabel("FPS"))
-        self.fps_slider = QSlider(Qt.Horizontal)
-        self.fps_slider.setRange(1, 100)
-        self.fps_slider.setValue(30) # Default
-        controls_layout.addWidget(self.fps_slider)
-        self.fps_label = QLabel(f"{self.fps_slider.value()} FPS")
-        controls_layout.addWidget(self.fps_label)
-
-        # 3. Recording Controls
+        # 2. Recording Controls
         self.record_widget = RecordWidget(self.backend)
         controls_layout.addWidget(self.record_widget)
         
-        # 4. Analyzer Controls
+        # 3. Analyzer Controls
         self.analyzer_widget = AnalyzerWidget(self.backend)
         controls_layout.addWidget(self.analyzer_widget)
         # Connect bboxes to draw signal
@@ -64,7 +52,7 @@ class MainWindow(QMainWindow):
 
         controls_layout.addStretch(1)
 
-        # 5. Status Display
+        # 4. Status Display (Bottom)
         status_group = QGroupBox("Statistics")
         status_vbox = QVBoxLayout(status_group)
         
@@ -78,17 +66,10 @@ class MainWindow(QMainWindow):
         self.status_timer.timeout.connect(self._update_status)
         self.status_timer.start(500)
 
-        # 5. Main Action Buttons
-        self.capture_button = QPushButton("Start Capture")
-        self.capture_button.setCheckable(True)
-        controls_layout.addWidget(self.capture_button)
-        
         main_layout.addWidget(controls_widget, 1)
 
         # --- Connect Signals ---
-        self.exposure_slider.valueChanged.connect(self._on_exposure_changed)
-        self.fps_slider.valueChanged.connect(self._on_fps_changed)
-        self.capture_button.toggled.connect(self.toggle_capture)
+        self.capture_widget.capture_toggled.connect(self._on_capture_toggled)
 
         # --- Render Thread & VSync Setup ---
         # Force context creation for the main widget so we can share it
@@ -120,33 +101,23 @@ class MainWindow(QMainWindow):
 
     def _on_frame_swapped(self):
         """Triggered on VSync. Wakes up render thread and requests next frame draw."""
-        if self.capture_button.isChecked():
+        if self._is_capturing:
             # Do not send vsync signal to save CPU.
             self.render_thread.vsync_event.set()
             self.display_widget.update()
 
-    def _on_exposure_changed(self, value):
-        self.exposure_label.setText(f"{value} ms")
-        self.backend.set_exposure_time(float(value))
-
-    def _on_fps_changed(self, value):
-        self.fps_label.setText(f"{value} FPS")
-        self.backend.set_fps(float(value))
-
-    def toggle_capture(self, checked):
-        if checked:
-            self.capture_button.setText("Stop Capture")
-            self.backend.start_capture()
-        else:
-            self.capture_button.setText("Start Capture")
-            self.backend.stop_capture()
-        
+    def _on_capture_toggled(self, checked):
+        """Handle capture state changes from CaptureWidget."""
+        self._is_capturing = checked
         # Update record widget state
         self.record_widget.set_capture_active(checked)
 
     def closeEvent(self, event):
         """Handle cleanup on exit."""
         # Notify widgets to cleanup their own resources
+        if hasattr(self, 'capture_widget'):
+            self.capture_widget.stop()
+
         if hasattr(self, 'record_widget'):
             self.record_widget.stop()
             

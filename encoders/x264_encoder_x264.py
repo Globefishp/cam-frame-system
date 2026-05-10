@@ -55,7 +55,6 @@ class X264Encoder(BaseVideoEncoder):
                  extinfo_extractor: Optional[TimecodeExtractor] = None,
                  inject_logger: Logger = None,
                  mux_timecode: bool = False,
-                 burn_timestamp: bool = False,
                  **kwargs
         ):
         """
@@ -75,8 +74,6 @@ class X264Encoder(BaseVideoEncoder):
                 logger instance from `main` if current processs is not `main`.
             mux_timecode: (bool), whether to mux the timecodes into the output video. 
                 Defaults to False. If True, uninit will blocking for long time. 
-            burn_timestamp: (bool), whether to burn the timecodes into the output video. 
-                Defaults to False. The timecodes will be burned at the upper left corner.
             kwargs: 
                 frame_size: (Tuple[int, int, int]), the frame size of the input frames.
                 crf: (int), the constant rate factor for x264 encoding.
@@ -134,13 +131,6 @@ class X264Encoder(BaseVideoEncoder):
         self._timecode_log_path: Optional[str] = None # File path for timecode logging.
         self._timecode_file: Optional[Any] = None # File object for writing timecodes
         self._processed_frames: Optional[int] = None
-
-        # Timecode burn-in
-        if burn_timestamp:
-            factor = min(3, max(1, min(self._frame_size[0], self._frame_size[1]) // 720))
-            self._ts_burner: Optional[FastDigitsOverlay] = FastDigitsOverlay(x=8*factor, y=8*factor, scale=factor)
-        else:
-            self._ts_burner: Optional[FastDigitsOverlay] = None 
 
     def _read_stdout(self):
         """Reads stdout from the x264 process in a separate thread."""
@@ -387,11 +377,6 @@ class X264Encoder(BaseVideoEncoder):
             try:
                 for idx, frame_view in enumerate(frame_chunk_arr):
                     # TODO: Batch write can be accepted by x264.
-                    if self._ts_burner:
-                        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                        if timecodes_list:
-                            timestamp += f" - {int(timecodes_list[idx] // self._timecode_extractor.timebase):05d}"
-                        self._ts_burner(frame_view, timestamp)
                     self._x264_process.stdin.write(frame_view.tobytes()) 
                     self._processed_frames += 1
 

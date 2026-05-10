@@ -63,11 +63,6 @@ class RecordWidget(QGroupBox):
         rotate_layout.addWidget(self.spin_rotate_interval)
         layout.addLayout(rotate_layout)
 
-        # 2. Burn Timestamp Option
-        burn_layout = QHBoxLayout()
-        self.cb_burn_ts = QCheckBox("Burn Timestamp")
-        burn_layout.addWidget(self.cb_burn_ts)
-        layout.addLayout(burn_layout)
 
         # 3. Recording Controls (Start/Stop and Rotate)
         btns_layout = QHBoxLayout()
@@ -149,7 +144,6 @@ class RecordWidget(QGroupBox):
         can_config = not is_recording
         self.cb_auto_rotate.setEnabled(can_config)
         self.spin_rotate_interval.setEnabled(can_config)
-        self.cb_burn_ts.setEnabled(can_config)
 
     @Slot(str)
     def _on_path_changed(self, text: str) -> None:
@@ -169,11 +163,9 @@ class RecordWidget(QGroupBox):
             # Prepare interval and timestamp settings
             interval = self.spin_rotate_interval.value() * 60 if self.cb_auto_rotate.isChecked() else None
             file_ts = self.cb_auto_rotate.isChecked()
-            burn_ts = self.cb_burn_ts.isChecked()
-            
             try:
                 # Start the background thread which manages the actual recording lifecycle
-                self.rotation_thread = RecordingThread(self.backend, self._base_path, interval, file_ts, burn_ts)
+                self.rotation_thread = RecordingThread(self.backend, self._base_path, interval, file_ts)
                 self.rotation_thread.rotation_state_changed.connect(self._on_rotation_state_changed)
                 self.rotation_thread.error.connect(self._on_rotation_thread_error)
                 self.rotation_thread.start()

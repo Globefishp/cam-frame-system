@@ -10,6 +10,7 @@ from utils.mp_obj_proxy import MpObjProxy
 from cameras.abstractcamera import AbstractCamera, CamException
 from encoders.videoencoder_v3 import BaseVideoEncoder
 from analyzers.analyzer import BaseAnalyzer
+from utils.digits_overlay import FastDigitsOverlay
 
 from loguru import logger as file_logger
 from loguru._logger import Logger # for type hint only
@@ -17,7 +18,6 @@ from loguru._logger import Logger # for type hint only
 class CameraProcess(mp.Process):
     """
     Subprocess running the camera capture loop. 
-    It receives the proxy and blocks for the ring buffer configuration.
     """
     def __init__(self, camera_proxy: MpObjProxy, ring_buffer: ProcessSafeSharedRingBuffer, 
                  inject_logger: Optional[Logger]):
@@ -27,19 +27,25 @@ class CameraProcess(mp.Process):
 
         if inject_logger is not None:
             if isinstance(inject_logger, Logger):
-                self._logger = inject_logger.bind(friendly_name="CameraCaptureProcess")
+                self._logger: Optional[Logger] = inject_logger.bind(friendly_name="CameraCaptureProcess")
             else:
                 raise TypeError("inject_logger must be a loguru.Logger instance.")
         else:
-            self._logger = None
+            self._logger: Optional[Logger] = None
         
         self.grabbed_frames: int = 0
 
         self.start_event = mp.Event()
         self.stop_event = mp.Event()
         self.exit_event = mp.Event()
+        # Public controller for enabling timestamp burning
+        self.burn_timestamp = mp.Value('b', False, lock=False)
+        
+        # --- Subprocess-specific properties ---
+        self._ts_burner: Optional[FastDigitsOverlay] = None
 
     def run(self):
+        from utils.digits_overlay import FastDigitsOverlay
         logger = self._logger
         # Instantiate the target object and start RPC inside subprocess
         bare_camera, rpc_lock = self.camera_proxy()
@@ -54,6 +60,12 @@ class CameraProcess(mp.Process):
             if logger: logger.opt(exception=e).error("Fail to open camera, exiting.")
             camera.close()
             return 
+
+        try:
+            timebase = camera.hw_timecode_timebase
+        except AttributeError:
+            if logger: logger.warning("Cannot get hw_timecode_timebase, assuming 1.")
+            timebase = 1
         try:
             while not self.exit_event.is_set():
                 # Wait for start signal
@@ -72,8 +84,23 @@ class CameraProcess(mp.Process):
                 # Main capture loop
                 if logger: logger.info("Camera starts capturing.")
                 while not self.stop_event.is_set():
-                    frame = camera.grab_extended_info()
+                    frame, metadata = camera.grab_extended_info()
                     if frame is not None:
+                        if self.burn_timestamp.value:
+                            # Lazy init burner
+                            if self._ts_burner is None:
+                                factor = min(3, max(1, min(frame.shape[0], frame.shape[1]) // 720))
+                                self._ts_burner = FastDigitsOverlay(x=8*factor, y=8*factor, scale=factor)
+
+                            # Prepare timestamp string
+                            ts_str = time.strftime("%Y-%m-%d %H:%M:%S")
+                            if 'hw_timecode' in metadata:
+                                hw_tc = metadata['hw_timecode']
+                                ts_str += f" - {int(hw_tc // timebase):05d}"
+
+                            # Inplace overlay
+                            self._ts_burner(frame, ts_str)
+
                         # Note: ring_buffer.put expects shape (batch, H, W, C)
                         # Use a short timeout so we can periodically check stop_event
                         if not self.ring_buffer.put(np.expand_dims(frame, axis=0), timeout=0.1):
@@ -98,6 +125,11 @@ class HeadlessBackend: # TODO: Rename as Backend????
     """
     Dependency Injection container and controller for the camera system.
     Manages resources and exposes simple get/release APIs for the GUI consumer.
+
+    Thread Safety:
+    - Methods are generally thread-safe for GUI consumption as they don't have shared
+      resources and the inner modules can handle their own concurrency.
+    - Future changes should consider not sharing resources between methods, or use lock.
     """
     def __init__(self, camera_class: Type[AbstractCamera], camera_kwargs: dict, 
                  encoder_class: Type[BaseVideoEncoder], encoder_kwargs: dict, 
@@ -197,6 +229,18 @@ class HeadlessBackend: # TODO: Rename as Backend????
         self.camera_process.start_event.set()
         if logger: logger.debug("Signalled starting camera capture.")
 
+    def set_burn_ts_enabled(self, enabled: bool):
+        """Enable or disable timestamp burning in the camera process."""
+        if self.camera_process:
+            self.camera_process.burn_timestamp.value = enabled
+            if self._logger: self._logger.debug(f"Set burn_timestamp to {enabled}")
+
+    def get_burn_ts_enabled(self) -> bool:
+        """Get current burn_timestamp state."""
+        if self.camera_process:
+            return bool(self.camera_process.burn_timestamp.value)
+        return False
+
     def stop_capture(self):
         """Stops the capture loop."""
         logger = self._logger
@@ -216,7 +260,7 @@ class HeadlessBackend: # TODO: Rename as Backend????
             fps = self.camera_proxy.actual_fps
         except AttributeError:
             fps = self.camera_proxy.target_fps
-        
+
         extinfo_extractor = self.camera_proxy.get_extended_info_extractor()
         extinfo_extractor.timebase = self.camera_proxy.hw_timecode_timebase
         extinfo_extractor.timecode_key = "hw_timecode"
@@ -232,13 +276,21 @@ class HeadlessBackend: # TODO: Rename as Backend????
             'frame_size': self.camera_dimension,
             'extinfo_extractor': extinfo_extractor,
         }
-        self.encoder = self.encoder_class(**encoder_config)
-        self.encoder.start()
+        try:
+            self.encoder = self.encoder_class(**encoder_config)
+            self.encoder.start()
+        except Exception as e:
+            if self._logger:
+                self._logger.opt(exception=e).error(f"Failed to start recording to {path}")
 
     def stop_recording(self):
         if self.encoder:
             self.camera_process.stop_event.set() # suspend new frame producing
-            self.encoder.stop()
+            try:
+                self.encoder.stop()
+            except Exception as e:
+                if self._logger:
+                    self._logger.opt(exception=e).error("Error occurred while stopping encoder.")
             self.camera_process.stop_event.clear()
             self.camera_process.start_event.set()
             self.encoder = None
@@ -274,14 +326,22 @@ class HeadlessBackend: # TODO: Rename as Backend????
         if model_path: config['model_path'] = model_path
         if save_path: config['save_path'] = save_path
 
-        self.analyzer = self.analyzer_class(**config)
-        self.analyzer.start()
-        if self._logger: self._logger.info("Analyzer started.")
+        try:
+            self.analyzer = self.analyzer_class(**config)
+            self.analyzer.start()
+            if self._logger: self._logger.info("Analyzer started.")
+        except Exception as e:
+            if self._logger:
+                self._logger.opt(exception=e).error("Failed to start analyzer.")
 
     def stop_analyzer(self):
         """Stops the analyzer."""
         if self.analyzer:
-            self.analyzer.stop()
+            try:
+                self.analyzer.stop()
+            except Exception as e:
+                if self._logger:
+                    self._logger.opt(exception=e).error("Error occurred while stopping analyzer.")
             self.analyzer = None
             if self._logger: self._logger.info("Analyzer stopped.")
 
@@ -311,6 +371,14 @@ class HeadlessBackend: # TODO: Rename as Backend????
         data = self.frame_server.get_from_ticket(ticket, timeout)
         
         return ticket, data
+
+    def get_exposure_time(self) -> float:
+        """Returns current exposure time in ms."""
+        return getattr(self.camera_proxy, 'exposure_time_ms', 0.0)
+
+    def get_fps(self) -> float:
+        """Returns current target FPS."""
+        return getattr(self.camera_proxy, 'target_fps', 0.0)
 
     def set_exposure_time(self, ms: float):
         if self.camera_proxy:

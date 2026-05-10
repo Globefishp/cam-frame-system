@@ -13,8 +13,7 @@ class RecordingThread(QThread):
 
     def __init__(self, backend: Any, base_path: str, 
                 interval_sec: Optional[float] = None, 
-                file_timestamp: bool = False,
-                burn_timestamp: bool = False) -> None:
+                file_timestamp: bool = False) -> None:
         """
         Initialize the rotation/recording thread.
 
@@ -28,7 +27,6 @@ class RecordingThread(QThread):
         self.base_path: str = base_path
         self.interval_sec: Optional[float] = interval_sec
         self.file_timestamp: bool = file_timestamp
-        self.burn_timestamp: bool = burn_timestamp
         self._stop_event: threading.Event = threading.Event()
         self._manual_trigger: threading.Event = threading.Event()
 
@@ -62,7 +60,7 @@ class RecordingThread(QThread):
                 self.rotation_state_changed.emit(True)
                 try:
                     if first_loop:
-                        self.backend.start_recording(new_path, burn_timestamp=self.burn_timestamp)
+                        self.backend.start_recording(new_path)
                         first_loop = False
                     else:
                         self.backend.rotate_recording(new_path)
