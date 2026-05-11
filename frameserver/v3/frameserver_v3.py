@@ -17,6 +17,7 @@ import hashlib
 from contextlib import ExitStack
 import multiprocessing as mp
 import multiprocessing.shared_memory as mp_shm
+import multiprocessing.synchronize as mp_sync
 import numpy as np
 from numpy.typing import NDArray
 from typing import Optional, List
@@ -149,13 +150,13 @@ class FrameServer:
 
         # === Syncronization objects ===
         # Lock for register/unregister consumer (`c_enable_mask`)
-        self._reg_lock: mp.Lock        =  mp.Lock()
+        self._reg_lock: mp_sync.Lock        =  mp.Lock()
         # Consumer lock for get/release (`tickets`)
-        self._cid_locks: List[mp.Lock] = [mp.Lock() for _ in range(MAX_CONSUMERS)] 
+        self._cid_locks: List[mp_sync.Lock] = [mp.Lock() for _ in range(MAX_CONSUMERS)] 
         # Independent GC locks per buffer (`buffer.occupied_count_` & `tickets[:, :MAX_TICKETS]`)
-        self._gc_locks: List[mp.Lock]  = [mp.Lock() for _ in range(MAX_LINKED_BUFFERS)]
+        self._gc_locks: List[mp_sync.Lock]  = [mp.Lock() for _ in range(MAX_LINKED_BUFFERS)]
         # lock for linking buffers and ref counting (`rb_*`)
-        self._link_lock: mp.Lock       =  mp.Lock() 
+        self._link_lock: mp_sync.Lock       =  mp.Lock() 
 
         # === Buffer ===
         self.buffer: Optional[ProcessSafeSharedRingBuffer] = None # committed later.
@@ -296,16 +297,16 @@ class FrameServer:
     def shm_name(self) -> str:
         return self._shm.name
     @property
-    def reg_lock(self) -> mp.Lock:
+    def reg_lock(self) -> mp_sync.Lock:
         return self._reg_lock
     @property
-    def cid_locks(self) -> List[mp.Lock]:
+    def cid_locks(self) -> List[mp_sync.Lock]:
         return self._cid_locks
     @property
-    def gc_locks(self) -> List[mp.Lock]:
+    def gc_locks(self) -> List[mp_sync.Lock]:
         return self._gc_locks
     @property
-    def link_lock(self) -> mp.Lock:
+    def link_lock(self) -> mp_sync.Lock:
         return self._link_lock
     
 
@@ -576,7 +577,8 @@ class FrameServer:
             
         self._gc() # avoid unnecessary lock nesting
 
-    def _gc(self, request_num: int = _UINT64_MAX) -> int:
+    def _gc(self, request_num: int = _UINT64_MAX, 
+            timeout: Optional[float] = 0.005) -> int:
         """
         GC function scans the FrameServer metadata and release the expired data 
         from the RingBuffer.
@@ -585,7 +587,11 @@ class FrameServer:
 
         Args:
             request_num (int): number of frames request to release, default is
-                _UINT64_MAX which will release as much frames as possible.
+                `_UINT64_MAX` which will release as much frames as possible.
+                If `request_num` is not `_UINT64_MAX`, will block to acquire the 
+                gc lock, which may cause performance fluctuation.
+            timeout (Optional[float]): seconds to wait for the gc lock when
+                `request_num` is not `_UINT64_MAX`. Default is 0.005s.
 
         Returns:
             released_num (int): number of the oldest frames actually released.
@@ -602,10 +608,16 @@ class FrameServer:
         # GC can run concurrently with other get_sync/release_sync. 
         # in 64 bit system, uint64 is atomic, the data inconsistency will only make 
         # global_occupied_from_id lag behind the actual value. (release less, safe)
-
+        
+        if request_num != _UINT64_MAX:
+            # Blocking if the `_gc()` call is triggered with `request_num`.
+            # (indicates a immediate gc intent). 
+            if not self._gc_locks[self.buf_id].acquire(block=True, timeout=timeout):
+                return 0
+        else: # The internal `_gc()` call should keep non-blocking.
+            if not self._gc_locks[self.buf_id].acquire(block=False): 
+                return 0 # Let next gc to do works.
         # === Critical zone (protect fs_oldest_frame_id, no concurrent _gc()) ===
-        if not self._gc_locks[self.buf_id].acquire(block=False):
-            return 0 # Let next gc to do works.
 
         try:
             # Has something to release.

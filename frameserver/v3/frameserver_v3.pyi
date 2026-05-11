@@ -1,10 +1,10 @@
-import multiprocessing as mp
+import multiprocessing.synchronize as mp_sync
 import numpy as np
+from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
 from .frameserver_v3_types import FSMetadata as FSMetadata, FrameTicket as FrameTicket, MAX_CONSUMERS as MAX_CONSUMERS, MAX_LINKED_BUFFERS as MAX_LINKED_BUFFERS, MAX_TICKETS as MAX_TICKETS, TicketExpireException as TicketExpireException
 from _typeshed import Incomplete
 from loguru._logger import Logger
 from numpy.typing import NDArray as NDArray
-from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
 from typing import Literal, overload
 
 class FrameServer:
@@ -97,13 +97,13 @@ class FrameServer:
     @property
     def shm_name(self) -> str: ...
     @property
-    def reg_lock(self) -> mp.Lock: ...
+    def reg_lock(self) -> mp_sync.Lock: ...
     @property
-    def cid_locks(self) -> list[mp.Lock]: ...
+    def cid_locks(self) -> list[mp_sync.Lock]: ...
     @property
-    def gc_locks(self) -> list[mp.Lock]: ...
+    def gc_locks(self) -> list[mp_sync.Lock]: ...
     @property
-    def link_lock(self) -> mp.Lock: ...
+    def link_lock(self) -> mp_sync.Lock: ...
     def register_consumer(self, historical_data: bool = False) -> int:
         """
         Register a new consumer and return the assigned ID for further access.

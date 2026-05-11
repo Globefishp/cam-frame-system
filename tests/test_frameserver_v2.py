@@ -613,3 +613,59 @@ def test_fs_rw_during_registration(small_buffer, fs_module_name):
 
     server.close()
     server.unlink()
+
+def __async_contention_producer(fs_module_name, fs_obj, rb_obj, stop_event, result_queue):
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=False, frameserver=fs_obj)
+    buffer = ProcessSafeSharedRingBuffer(create=False, source_buffer=rb_obj)
+    buffer.trigger_release = server._gc
+    
+    put_count = 0
+    timeout_count = 0
+    while not stop_event.is_set():
+        f = np.zeros((1, 2, 2, 3), dtype=np.uint32)
+        # 0.1s 超时，如果因为 gc_lock 被 async_consumer 卡住，put 返回 False
+        if buffer.put(f, timeout=0.1):
+            put_count += 1
+        else:
+            timeout_count += 1
+            
+    result_queue.put({"put_count": put_count, "timeout_count": timeout_count})
+    buffer.close(); server.close()
+
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
+def test_fs_async_gc_lock_contention(small_buffer, fs_module_name):
+    """Stress test to ensure put() does not timeout when gc_lock is heavily contested by async consumers."""
+    fs_mod = importlib.import_module(fs_module_name)
+    server = fs_mod.FrameServer(create=True, ring_buffer=small_buffer)
+    small_buffer.trigger_release = server._gc
+    
+    stop_event = ctx.Event()
+    prod_queue = ctx.Queue()
+    cons_queues = [ctx.Queue() for _ in range(4)]
+    
+    # Do not register any sync consumer (full async mode)
+    # Start 1 Producer and 4 Async Consumers
+    p_prod = ctx.Process(target=__async_contention_producer, args=(fs_module_name, server, small_buffer, stop_event, prod_queue))
+    p_cons_list = [ctx.Process(target=__barrier_stalker, args=(fs_module_name, server, stop_event, q)) for q in cons_queues]
+    
+    p_prod.start()
+    for p in p_cons_list:
+        p.start()
+        
+    time.sleep(2.5) # Run contention for 2.5 seconds
+    stop_event.set()
+    
+    prod_stats = prod_queue.get()
+    p_prod.join()
+    
+    for q, p in zip(cons_queues, p_cons_list):
+        q.get() # Just empty the queue
+        p.join()
+        
+    print(f"Producer stats: {prod_stats}")
+    # Assert that put never timed out
+    assert prod_stats["timeout_count"] == 0, f"put() timed out {prod_stats['timeout_count']} times due to gc_lock contention"
+    assert prod_stats["put_count"] > 0, "Producer failed to put any frames"
+    
+    server.close(); server.unlink()
