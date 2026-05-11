@@ -380,7 +380,9 @@ class ProcessSafeSharedRingBuffer:
         slots will be filled.
 
         Args:
-            frames: (np.ndarray), (frame_num, frame_h, frame_w, frame_c), the frames to put.
+            frames: (np.ndarray), (num_frames, H, W, C), the frames to put.
+                if ndim==2, will expand to (1, H, W, 1).
+                if ndim==3, will expand to (1, H, W, C).
             timeout: (Optional[float]), seconds to wait for space.
 
         Returns:
@@ -390,8 +392,8 @@ class ProcessSafeSharedRingBuffer:
             RuntimeError: If the shared buffer has been uninitialized.
             ValueError: If the frame count exceeds buffer capacity or frame size/dtype mismatch.
         """
-        # If a single frame: add frame_num dimension.
-        if frames.ndim == 3: frames = np.expand_dims(axis=0)
+        if frames.ndim == 2: frames = np.expand_dims(frames, axis=(0, -1)) # missing batch and channel dim
+        if frames.ndim == 3: frames = np.expand_dims(frames, axis=0) # missing batch dim
 
         # Validate frame counts to put
         if len(frames) > self._buffer_capacity:
@@ -489,7 +491,7 @@ class ProcessSafeSharedRingBuffer:
 
         Returns:
             The frames as a tuple: (frames_list, got_frame_num), or None if timeout occured.
-            The shape of a single array is (frame_num, frame_h, frame_w, frame_c).
+            The shape of a single NDArray is (num_frames, H, W, C).
         
         Raises:
             RuntimeError: If the shared buffer has been uninitialized.

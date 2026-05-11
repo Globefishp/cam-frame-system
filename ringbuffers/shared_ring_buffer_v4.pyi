@@ -57,9 +57,13 @@ class ProcessSafeSharedRingBuffer:
         """
         Puts frames into the shared ring buffer. Blocks if the buffer is full.
         Multiple `put` must only be called sequentially, or it will corrupt the buffer.
+        If putting frames is smaller the declared size, only the head of buffer 
+        slots will be filled.
 
         Args:
-            frames: (np.ndarray), (frame_num, frame_h, frame_w, frame_c), the frames to put.
+            frames: (np.ndarray), (num_frames, H, W, C), the frames to put.
+                if ndim==2, will expand to (1, H, W, 1).
+                if ndim==3, will expand to (1, H, W, C).
             timeout: (Optional[float]), seconds to wait for space.
 
         Returns:
@@ -73,7 +77,10 @@ class ProcessSafeSharedRingBuffer:
         """
         Get unread data for given number of frames. Since V4, the gotten data 
         will no longer be release automatically. Call `release()` to manually 
-        release the frames after use.
+        release the frames after use. 
+        If the frames being put is smaller than the declared size, the consumer
+        should slice **the head of EACH frame** and reshape to restore the correct
+        data layout.
 
         Args:
             get_frame_num: (int), the number of frames to get.
@@ -81,7 +88,7 @@ class ProcessSafeSharedRingBuffer:
 
         Returns:
             The frames as a tuple: (frames_list, got_frame_num), or None if timeout occured.
-            The shape of a single array is (frame_num, frame_h, frame_w, frame_c).
+            The shape of a single NDArray is (num_frames, H, W, C).
         
         Raises:
             RuntimeError: If the shared buffer has been uninitialized.
