@@ -143,6 +143,7 @@ class ProcessSafeSharedRingBuffer:
         # Initialize attributes to None or default values, will be set properly later
         self._buffer_capacity: int = 0
         self._frame_shape: Tuple[int, int, int] = (0, 0, 0)
+        self._frame_pixels: int = 0
         self._dtype: np.dtype = np.dtype(np.uint8) # Default, will be overwritten
         self._frame_bytes: int = 0
         self._data_buffer_size: int = 0
@@ -170,8 +171,9 @@ class ProcessSafeSharedRingBuffer:
             # Assign attributes based on input parameters
             self._buffer_capacity = buffer_capacity
             self._frame_shape = frame_shape
+            self._frame_pixels = int(np.prod(frame_shape))
             self._dtype = np.dtype(effective_dtype) # Ensure it's a numpy dtype
-            self._frame_bytes = int(np.prod(self._frame_shape) * self._dtype.itemsize)
+            self._frame_bytes = int(self._frame_pixels * self._dtype.itemsize)
             self._data_buffer_size = self._buffer_capacity * self._frame_bytes
 
             # Create shared memory blocks and synchronization objects
@@ -243,8 +245,9 @@ class ProcessSafeSharedRingBuffer:
         # Set instance attributes based on read metadata
         self._buffer_capacity = capacity
         self._frame_shape = frame_shape
+        self._frame_pixels = int(np.prod(frame_shape))
         self._dtype = frame_dtype
-        self._frame_bytes = int(np.prod(self._frame_shape) * self._dtype.itemsize)
+        self._frame_bytes = int(self._frame_pixels * self._dtype.itemsize)
         self._data_buffer_size = self._buffer_capacity * self._frame_bytes
 
         # 3. Attach to Data Shared Memory
@@ -373,6 +376,8 @@ class ProcessSafeSharedRingBuffer:
         """
         Puts frames into the shared ring buffer. Blocks if the buffer is full.
         Multiple `put` must only be called sequentially, or it will corrupt the buffer.
+        If putting frames is smaller the declared size, only the head of buffer 
+        slots will be filled.
 
         Args:
             frames: (np.ndarray), (frame_num, frame_h, frame_w, frame_c), the frames to put.
@@ -393,8 +398,9 @@ class ProcessSafeSharedRingBuffer:
             raise ValueError(f"Frame count {len(frames)} exceeds buffer capacity {self._buffer_capacity}.")
 
         # Validate frame size and dtype using cached attributes
-        if frames.shape[-3:] != self._frame_shape:
-            raise ValueError(f"Frame size mismatch. Expected {self._frame_shape}, got {frames.shape[-3:]}")
+        if frames[0].size > self._frame_pixels:
+            raise ValueError(f"Frame size ({frames.shape[1:]} -> {frames[0].size} pixels) exceeds "
+                             f"slot capacity ({self._frame_shape} -> {self._frame_pixels} pixels).")
             
         if frames.dtype != self._dtype:
             raise ValueError(f"Frame dtype mismatch. Expected {self._dtype}, got {frames.dtype}")
@@ -429,14 +435,13 @@ class ProcessSafeSharedRingBuffer:
                                      self._buffer_capacity * self._frame_bytes)
             second_seg_offset = slice(0, (write_ptr + put_frame_num) % 
                                          self._buffer_capacity * self._frame_bytes)
+            # Map as 2D array of (frames, self._frame_pixels), slice the used part, then reshape to match incoming frames
+            first_dest = np.ndarray((first_seg_slots, self._frame_pixels), dtype=self._dtype, buffer=data_buffer[first_seg_offset])
+            first_dest = first_dest[:, :frames[0].size].reshape((first_seg_slots,) + frames.shape[1:])
+            
+            second_dest = np.ndarray((second_seg_slots, self._frame_pixels), dtype=self._dtype, buffer=data_buffer[second_seg_offset])
+            second_dest = second_dest[:, :frames[0].size].reshape((second_seg_slots,) + frames.shape[1:])
             # Execute copy
-            first_dest = np.ndarray((first_seg_slots,) + self._frame_shape, # Calculate frame count of each segment
-                                    dtype=self._dtype, 
-                                    buffer=data_buffer[first_seg_offset])
-            second_dest = np.ndarray((second_seg_slots,) + self._frame_shape, 
-                                     dtype=self._dtype, 
-                                     buffer=data_buffer[second_seg_offset])
-
             np.copyto(first_dest, frames[:self._buffer_capacity - write_ptr]) # Copy the first segment
             np.copyto(second_dest, frames[self._buffer_capacity - write_ptr:]) # Copy the second segment
         else: # No wrap around
@@ -445,9 +450,8 @@ class ProcessSafeSharedRingBuffer:
                                  (write_ptr + put_frame_num) * self._frame_bytes)
             # print(f'At put tail: frame_offset: {frame_offset}') # Debugging print
             # print(f'At put tail: data_buffer_size: {self._data_buffer_size}') # Debugging print
-            dest = np.ndarray((put_frame_num,) + self._frame_shape, 
-                              dtype=self._dtype, 
-                              buffer=data_buffer[frame_offset])
+            dest = np.ndarray((put_frame_num, self._frame_pixels), dtype=self._dtype, buffer=data_buffer[frame_offset])
+            dest = dest[:, :frames[0].size].reshape((put_frame_num,) + frames.shape[1:])
             np.copyto(dest, frames) # Data copy without the pointer lock
 
         with self._pointer_lock: # Acquire lock after data copy
@@ -474,7 +478,10 @@ class ProcessSafeSharedRingBuffer:
         """
         Get unread data for given number of frames. Since V4, the gotten data 
         will no longer be release automatically. Call `release()` to manually 
-        release the frames after use.
+        release the frames after use. 
+        If the frames being put is smaller than the declared size, the consumer
+        should slice **the head of EACH frame** and reshape to restore the correct
+        data layout.
 
         Args:
             get_frame_num: (int), the number of frames to get.

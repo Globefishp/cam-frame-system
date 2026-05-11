@@ -134,6 +134,55 @@ def test_v4_overwrite_prevention(shm_buffer):
     # Now putting 2 items should successfully pass
     assert shm_buffer.put(np.full((2, 2, 2, 3), 66, dtype=np.uint8), timeout=0.1) is True
 
+def test_v4_put_smaller_shape(shm_buffer):
+    """
+    Test that put() correctly handles frames smaller than the slot size,
+    including scenarios where data wraps around the ring buffer.
+    """
+    # Buffer capacity=5, frame_shape=(2, 2, 3) -> 12 pixels/frame
+    # Smaller shape (1, 2, 3) -> 6 pixels/frame
+    
+    # --- 1. Linear Put (No wrap-around) ---
+    smaller_frames_1 = np.full((3, 1, 2, 3), 73, dtype=np.uint8)
+    assert shm_buffer.put(smaller_frames_1) is True
+    assert shm_buffer.occupied_count_ == 3
+    
+    data_list, _ = shm_buffer.get(3)
+    full_slots = data_list[0]
+    for i in range(3):
+        assert np.array_equal(full_slots[i].flatten()[:6], smaller_frames_1[i].flatten())
+    
+    shm_buffer.release(3)
+    assert shm_buffer.occupied_count_ == 0
+    # Pointer is now at 3 (3 frames put, 3 released)
+    assert shm_buffer.write_ptr == 3
+    
+    # --- 2. Wrap-around Put ---
+    # Put 4 frames: will use slots 3, 4 (segment 1) and 0, 1 (segment 2)
+    smaller_frames_2 = np.arange(4 * 6, dtype=np.uint8).reshape((4, 1, 2, 3)) + 10
+    assert shm_buffer.put(smaller_frames_2) is True
+    assert shm_buffer.occupied_count_ == 4
+    assert shm_buffer.write_ptr == 2 # (3 + 4) % 5 = 2
+    
+    # Get all 4 frames (should return 2 segments due to wrap-around)
+    data_list, _ = shm_buffer.get(4)
+    assert len(data_list) == 2
+    
+    # Segment 1 (slots 3, 4)
+    assert data_list[0].shape[0] == 2
+    for i in range(2):
+        assert np.array_equal(data_list[0][i].flatten()[:6], smaller_frames_2[i].flatten())
+        
+    # Segment 2 (slots 0, 1)
+    assert data_list[1].shape[0] == 2
+    for i in range(2):
+        assert np.array_equal(data_list[1][i].flatten()[:6], smaller_frames_2[i+2].flatten())
+
+    # --- 3. Error Case (Exceeds capacity) ---
+    larger_frames = np.full((1, 3, 2, 3), 80, dtype=np.uint8)
+    with pytest.raises(ValueError, match="exceeds slot capacity"):
+        shm_buffer.put(larger_frames)
+
 
 # ====================================================================================
 # 多进程参数化测试：覆盖对象直接传递与 create=False 挂载模式
@@ -218,10 +267,10 @@ def test_rb_overflow_and_timeout(shm_buffer):
     
     # Let's test gc_func triggering
     gc_triggered = []
-    def fake_gc():
+    def fake_gc(num):
         gc_triggered.append(True)
         # GC frees 1 element
-        shm_buffer.release(1)
+        shm_buffer.release(num)
         
     shm_buffer.trigger_release = fake_gc
     
