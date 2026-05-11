@@ -28,6 +28,7 @@ class YOLOBaseAnalyzer(BaseAnalyzer):
                  model_path: str | Path,
                  imgsz: int = 640,
                  conf: float = 0.5,
+                 frame_size: Optional[Tuple[int, int, int]] = None,
                  **kwargs):
         """
         Initialize YOLO Base config.
@@ -37,6 +38,9 @@ class YOLOBaseAnalyzer(BaseAnalyzer):
             model_path (str | Path): Path to the .pt YOLO model file.
             imgsz (int): Inference image size.
             conf (float): Confidence threshold for YOLO inference.
+            frame_size (Tuple[int, int, int]): The size of the frame (H, W, C). 
+                if the effective frame is smaller than FrameServer distributed,
+                it is necessary to declare here, otherwise leave it to None.
             kwargs:
                 batch_size (int): The number of frames to process in a batch. 
                 tensor_type (TensorType): TensorType.TORCH is used.
@@ -67,12 +71,15 @@ class YOLOBaseAnalyzer(BaseAnalyzer):
         self._model_path = model_path
         self._imgsz = imgsz
         self._conf = conf
+        self._frame_size = frame_size
+        self._frame_size_lock: Optional[t.Lock] = None # for subprocess cmd handler concurrent access
         self._model: Optional[YOLO] = None
 
     def _initialize_analyzer(self):
         """Worker Process: Load YOLO model to target device."""
         import torch
         from ultralytics import YOLO
+        self._frame_size_lock = t.Lock()
         
         device_str = 'cuda' if self._device == DeviceType.CUDA else 'cpu'
         self._model = YOLO(self._model_path)
@@ -92,10 +99,22 @@ class YOLOBaseAnalyzer(BaseAnalyzer):
     def _analyze(self, frames: torch.Tensor, ext_info: Optional[List[dict]] = None, **kwargs) -> Any:
         """
         Worker Process: Core execution skeleton.
+        Handles packed frame data if self._frame_size is specified.
         """
         import torch
         if not isinstance(frames, torch.Tensor):
             raise AnalyzerException("YOLOBaseAnalyzer expects a torch.Tensor. Check tensor_type config.")
+
+        # 0. Unpack if frame_size is specified
+        with self._frame_size_lock:
+            frame_size = self._frame_size
+
+        if frame_size is not None:
+            B = frames.shape[0]
+            h, w, c = frame_size
+            expected_pixels = h * w * c
+            # Unpack: flatten, slice to actual pixels, and reshape to actual frame dimensions
+            frames = frames.view(B, -1)[:, :expected_pixels].view(B, h, w, c)
 
         # 1. Preprocess hook (e.g., format matching, tiling)
         # expected formatted_input shape: (B', C, H, W) normalized to 0.0-1.0
@@ -113,6 +132,15 @@ class YOLOBaseAnalyzer(BaseAnalyzer):
 
         # 3. Postprocess hook (e.g., remapping coordinates, logic extraction)
         return self._postprocess(results, frames, metadata, ext_info=ext_info, **kwargs)
+
+    def _handle_command(self, cmd_name: str, payload: Any):
+        """Handle commands, currently supports dynamic adjustment of the effective frame size. Useful for ROIed Image."""
+        if cmd_name == "set_frame_size":
+            # payload: Optional[Tuple[int, int, int]]
+            with self._frame_size_lock:
+                self._frame_size = payload
+            self._logger.info(f"Dynamic frame_size updated to: {payload}")
+        # Subclasses should handle their own commands
 
     # --- Abstract Hooks for Leaf Classes ---
     @abstractmethod

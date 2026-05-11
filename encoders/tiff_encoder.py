@@ -151,11 +151,25 @@ class TiffEncoder(BaseVideoEncoder):
             raise EncoderException("TiffWriter is not initialized.", pid=pid, name=friendly_name)
 
         try:
+            # dimensions for unpacking
+            height, width = self._frame_size[0], self._frame_size[1]
+            channels = self._samples_per_pixel
+            expected_pixels = height * width * channels
+
             for frame_chunk in frames_list:
                 if frame_chunk is None or frame_chunk.size == 0:
                     continue
                 
                 # frame_chunk shape is typically (N, H, W) or (N, H, W, C)
+                if expected_pixels > frame_chunk[0].size:
+                    raise EncoderException(f"Frame data mismatch (smaller) than expected. "
+                        f"slot pixels: {frame_chunk[0].size}, expected: {expected_pixels}")
+                frame_chunk = frame_chunk.reshape(frame_chunk.shape[0], -1)[:, :expected_pixels]
+                if channels > 1:
+                    frame_chunk = frame_chunk.reshape(-1, height, width, channels)
+                else:
+                    frame_chunk = frame_chunk.reshape(-1, height, width)
+
                 for i in range(frame_chunk.shape[0]):
                     frame = frame_chunk[i]
                     

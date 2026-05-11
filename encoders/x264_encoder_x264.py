@@ -356,18 +356,21 @@ class X264Encoder(BaseVideoEncoder):
         if not self._x264_process or not self._x264_process.stdin or self._x264_process.stdin.closed:
             raise EncoderException("x264 process or stdin not available/closed.")
 
+        # dimensions for unpacking
         height, width, channels = self._frame_size
+        expected_pixels = height * width * channels
 
         for frame_chunk_arr in frames_list: # Iterate over each ndarray in the list
             if frame_chunk_arr is None or frame_chunk_arr.size == 0:
                 logger.warning(f"Received empty or None frame_chunk_arr in list. Skip encoding.")
                 continue # Skip this chunk
 
-            if frame_chunk_arr.shape[-3] < height or frame_chunk_arr.shape[-2] < width or \
-              frame_chunk_arr.shape[-1] != channels:
+            if expected_pixels > frame_chunk_arr[0].size:
                 raise EncoderException(f"Frame data mismatch (smaller) than expected. "
-                    f"shape: {frame_chunk_arr.shape[1:]}, expected: ({height}, {width}, {channels})")
-            frame_chunk_arr = frame_chunk_arr[:, :height, :width, :] # crop upper-left
+                    f"slot pixels: {frame_chunk_arr[0].size}, expected: {expected_pixels}")
+            
+            # Unpack the data from the head of buffer slots.
+            frame_chunk_arr = frame_chunk_arr.reshape(frame_chunk_arr.shape[0], -1)[:, :expected_pixels].reshape(-1, height, width, channels)
             
             if ext_info: # have ext_info = have _timecode_extractor
                 timecodes_list = [item[self._timecode_extractor.timecode_key] for item in ext_info]

@@ -82,6 +82,9 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
                     after `step()`
                 stat_interval (float): interval for statistics update.
                 inject_logger (Optional[Logger]): loguru logger instance.
+                frame_size (Tuple[int, int, int]): The size of the frame (H, W, C). 
+                    if the effective frame is smaller than FrameServer distributed,
+                    it is necessary to declare here, otherwise leave it to None.
         """
         # Force continuous mode for self-managed frame counter streaming
         kwargs['continuous_mode'] = True 
@@ -170,7 +173,8 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
             # Update status dict via IPC to notify main process
             self._status_update({"tracker_status": "reset_completed"})
         else:
-            self._status_subdict_update("error", {"cmd": f"Unknown command {cmd_name}"})
+            # Check base class commands (e.g. set_frame_size)
+            super()._handle_command(cmd_name, payload)
 
     def _preprocess(self, frames: torch.Tensor, ext_info: Optional[List[dict]] = None, **kwargs) -> Tuple[torch.Tensor, Dict]:
         """
