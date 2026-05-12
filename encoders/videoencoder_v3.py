@@ -326,15 +326,16 @@ class BaseVideoEncoder(ABC):
 
         # 2. Main processing loop
         try:
-            # Signal readiness for the next frame BEFORE waiting
+            batch_size = self._batch_size
             last_ticket = None
+            # Signal readiness for the next frame BEFORE waiting
             self._worker_ready.set()
             while self._not_eager_stop.is_set():
                 # v2: Graded stop signal, still process remaining frames until eager_stop.
                 try:
                     # --- Get frames from the frame server (blocks if no enough data) ---
                     # Get a batch of frames from the frame server
-                    ticket = frame_server.get_sync(cid, self._batch_size, timeout=0.1)
+                    ticket = frame_server.get_sync(cid, batch_size, timeout=0.1)
                     # Release after next ticket is got.
                     if last_ticket is not None: frame_server.release_sync(last_ticket)
 
@@ -343,9 +344,12 @@ class BaseVideoEncoder(ABC):
                         if self._worker_enable.is_set():
                             continue # Continue waiting new frames to collect a batch_size
                         else: # Shutdown signalled, no more frames will come in.
-                            ticket = frame_server.get_sync(cid, 1, timeout=0.1)
-                            if ticket is None: # No more frame to get
-                                break # Exit loop
+                            if batch_size == 1: 
+                                break # No more frame to get, Exit loop
+                            # Reduce effective batch_size and retry for stream end.
+                            # This design avoid to touch buffer in frameserver
+                            batch_size = max(1, batch_size // 2) # directly set to 1 is ok for most case.
+                            continue
 
                     if ticket is not None:
                         frames_list = frame_server.get_from_ticket(ticket, timeout=0.1)
