@@ -1,9 +1,12 @@
+# gui/gl_widget.py
+# By Gemini 3.1 pro, Haiyun Huang.
+
 from OpenGL.GL.ARB import compressed_texture_pixel_storage
 import numpy as np
 from numpy.typing import NDArray
 from typing import Optional, Dict
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import Qt, Slot, Signal
 from PySide6.QtGui import QOpenGLContext
 import moderngl
 from . import gl_shaders
@@ -13,6 +16,8 @@ class CameraDisplayWidget(QOpenGLWidget):
     """
     Custom QOpenGLWidget that uses ModernGL to draw textures provided by a background thread.
     """
+    displayRangeChanged = Signal(float, float)
+    gammaChanged = Signal(float)
     def __init__(self, parent=None):
         super().__init__(parent)
         self.ctx: Optional[moderngl.Context] = None
@@ -38,22 +43,32 @@ class CameraDisplayWidget(QOpenGLWidget):
         self._tex_wrapper: Optional[moderngl.Texture] = None
         self._ts_tex_wrapper: Optional[moderngl.Texture] = None
 
+        # FBO and its cache
+        self.fbo: Optional[moderngl.Framebuffer] = None
+
         # Transform matrix
         self._transform_mtx: NDArray = np.eye(4, dtype='f4')
         self._ts_transform_mtx: NDArray = np.eye(4, dtype='f4')
-
-        # FBO and its cache
-        self.fbo: Optional[moderngl.Framebuffer] = None
-        self.last_fbo_id = None
-        self.last_size = None
         
-        self.interpolation = moderngl.LINEAR
+        self.interpolation = moderngl.NEAREST
 
         # Zoom and pan for mouse control
         self.zoom_factor = 1.0    # [1.0, 16.0]
         self.pan_x = 0.0          # in NDC coordinates [-1, 1]
         self.pan_y = 0.0          # in NDC coordinates [-1, 1]
         self.last_mouse_pos = None # Used for recording drag state.
+
+        # Display mapping parameters
+        self._val_min = 90/65535 # initial value for usual imaging
+        self._val_max = 1000/65535
+        self._gamma = 2.2
+
+    @property
+    def val_min(self) -> float: return self._val_min
+    @property
+    def val_max(self) -> float: return self._val_max
+    @property
+    def gamma(self) -> float: return self._gamma
 
     def initializeGL(self):
         # PySide6 has already created the context and made it current
@@ -115,6 +130,34 @@ class CameraDisplayWidget(QOpenGLWidget):
 
         # === GL FBO ===
         self.fbo = self.ctx.detect_framebuffer(self.defaultFramebufferObject())
+
+    @Slot(float, float)
+    def update_display_range(self, val_min: float, val_max: float):
+        """Update the intensity mapping range [0, 1]."""
+        # Clamping logic
+        val_min = max(0.0, min(1.0, val_min))
+        val_max = max(0.0, min(1.0, val_max))
+        if val_min > val_max:
+            val_min = val_max
+
+        if self._val_min == val_min and self._val_max == val_max:
+            return
+
+        self._val_min = val_min
+        self._val_max = val_max
+        self.displayRangeChanged.emit(self._val_min, self._val_max)
+        self.update()
+
+    @Slot(float)
+    def update_gamma(self, gamma: float):
+        """Update the gamma correction value."""
+        gamma = max(0.1, min(10.0, gamma))
+        if self._gamma == gamma:
+            return
+
+        self._gamma = gamma
+        self.gammaChanged.emit(self._gamma)
+        self.update()
 
     @Slot(object)
     def update_overlay_lines(self, lines_data: Optional[NDArray]):
@@ -181,6 +224,7 @@ class CameraDisplayWidget(QOpenGLWidget):
         self.update()
 
     def resizeGL(self, w: int, h: int):
+        self.fbo = None # reset fbo, trigger re-detect in paintGL
         self._update_transform_mtx(self.tex_w, self.tex_h)
     
     def _update_transform_mtx(self, tex_w, tex_h):
@@ -194,10 +238,8 @@ class CameraDisplayWidget(QOpenGLWidget):
     def paintGL(self):
         # 1. Ensure ModernGL renders to Qt's FBO, not the default window Framebuffer 0
         current_fbo_id = self.defaultFramebufferObject()
-        if self.last_fbo_id != current_fbo_id or self.last_size != (self.width(), self.height()):
+        if self.fbo is None or self.fbo.glo != current_fbo_id:
             self.fbo: moderngl.Framebuffer = self.ctx.detect_framebuffer(current_fbo_id)
-            self.last_fbo_id = current_fbo_id
-            self.last_size = (self.width(), self.height())
 
         self.fbo.use()
         self.fbo.clear(0.0, 0.0, 0.0, 1.0)
@@ -228,8 +270,12 @@ class CameraDisplayWidget(QOpenGLWidget):
             
             self.prog['Texture'].value = 0
             self.prog['channels'].value = self.tex_channels
+            # --- Not in use for regular camera ---
+            # self.prog['val_min'].value = self._val_min
+            # self.prog['val_max'].value = self._val_max
+            # self.prog['gamma'].value = self._gamma
             self.vao.render(moderngl.TRIANGLE_STRIP)
-            
+
         if self.current_ts_glo > 0:
             # Draw Timestamp
             ts_tex = self._ts_texture_cache.get(self.current_ts_glo)
