@@ -59,9 +59,9 @@ class CameraDisplayWidget(QOpenGLWidget):
         self.last_mouse_pos = None # Used for recording drag state.
 
         # Display mapping parameters
-        self._val_min = 90/65535 # initial value for usual imaging
-        self._val_max = 1000/65535
-        self._gamma = 2.2
+        self._val_min = 0.0
+        self._val_max = 1.0
+        self._gamma = 1.0
 
     @property
     def val_min(self) -> float: return self._val_min
@@ -92,6 +92,11 @@ class CameraDisplayWidget(QOpenGLWidget):
         ], dtype='f4')
         self.vbo = self.ctx.buffer(vertices)
         self.vao = self.ctx.vertex_array(self.prog, [(self.vbo, '2f 2f', 'in_vert', 'in_uv')])
+
+        # --- Not in use for regular camera ---
+        self.prog['val_min'].value = self._val_min
+        self.prog['val_max'].value = self._val_max
+        self.prog['gamma'].value = self._gamma
         
         
         # === Timestamp overlay quad ===
@@ -270,10 +275,7 @@ class CameraDisplayWidget(QOpenGLWidget):
             
             self.prog['Texture'].value = 0
             self.prog['channels'].value = self.tex_channels
-            # --- Not in use for regular camera ---
-            # self.prog['val_min'].value = self._val_min
-            # self.prog['val_max'].value = self._val_max
-            # self.prog['gamma'].value = self._gamma
+
             self.vao.render(moderngl.TRIANGLE_STRIP)
 
         if self.current_ts_glo > 0:

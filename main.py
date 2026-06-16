@@ -9,7 +9,7 @@ from backend.system_backend import HeadlessBackend
 from frontend.main_window import MainWindow
 
 # Important to use the specific classes requested by the user
-from cameras import BitDepth
+from cameras import BitDepth, BayerPattern
 from cameras.huatengcam.huateng_camera_v4 import HuatengCamera
 from encoders.x264_encoder_x264 import X264Encoder
 from analyzers.yolo_poscolor_analyzer import YOLOPosColorAnalyzer
@@ -65,7 +65,8 @@ def main():
     camera_kwargs = {
         'dev_info': dev_info,
         'fps': 30,
-        'bitdepth': BitDepth._8,
+        'bitdepth': BitDepth._12,
+        'bayer_pattern': BayerPattern.BGGR,
         'exposure_time_ms': 10,
         'gain': 1.0,
         'timecode_en': True,
@@ -77,7 +78,8 @@ def main():
         'preset': 'fast',
         'crf': 23,
         'threads': 0,
-        'input-depth': 8, # 16 for 12bit, 8 for 8bit.
+        'input-depth': 16, # 16 for 12bit, 8 for 8bit.
+        'output-depth': 8, # 16 for 12bit, 8 for 8bit.
     }
 
     analyzer_kwargs = {

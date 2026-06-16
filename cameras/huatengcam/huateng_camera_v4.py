@@ -15,7 +15,7 @@ import platform
 import ctypes
 import time
 import pickle
-from typing import Optional, Tuple, Union, Any, List
+from typing import Optional, Tuple, Union, Any, List, Dict
 
 from . import mvsdk_mod as mvsdk
 from .mvsdk_mod import CameraException as MvCamException
@@ -39,7 +39,7 @@ _FRAME_TIME = 10
 _GAIN = 1.0
 _BAYER_PATTERN = BayerPattern.RGGB
 _HUATENGCAM_CURR_DIR = Path(__file__).resolve().parent
-_DEFAULT_CORRECTION_PATH: Path = _HUATENGCAM_CURR_DIR / "corrections/correction_results_D50_250805.npy"
+_DEFAULT_CORRECTION_PATH: Path = _HUATENGCAM_CURR_DIR / "corrections/correction_results_D65_250731.npy"
 
 _EXTRA_ROWS_FOR_METADATA = 1
 
@@ -82,7 +82,7 @@ class HuatengCamera(AC):
         self._logger = self._logger.bind(friendly_name="HuatengCamera")
 
         self._features_enabled = CameraFeatures.GAIN
-        if timecode_en:
+        if timecode_en: # Used in processor init, cannot be changed during runtime.
             self._features_enabled |= CameraFeatures.TIMECODE
 
         self._DevInfo: mvsdk.tSdkCameraDevInfo = dev_info
@@ -506,40 +506,39 @@ class HuatengCamera(AC):
     
     def grab(self) -> Optional[np.ndarray]:
         # TODO: Impl. Fused ISP (ProcessorV12)
-        frame = self.grab_raw()
-        if frame is None: return None
-        frame = self._processor.process(frame) # output dimension defined when processor init.
-        if self.is_feature_enabled(CameraFeatures.TIMECODE):
-            frame = self.strip_extended_info(frame)
-
-        if self._bit_depth == BitDepth._12: 
-            return frame 
-        else: 
-            # not continuous, zero-copy.
-            return frame.view(np.uint8)[..., _UINT16_HIGHBYTE::2] 
-
+        frame, _ = self.grab_metadata()
+        return frame
 
     def grab_raw(self) -> Optional[np.ndarray]:
         frame, _ = self._grab_extendedbuf_metadata()
         if frame is None: return None
-        frame = self.strip_extended_info(frame)
+        if self.is_feature_enabled(CameraFeatures.TIMECODE):
+            frame = self.strip_extended_info(frame)
+        print(f".grab_raw(): {frame.shape}")
         return frame
 
-    def grab_metadata(self) -> Tuple[Optional[NDArray], Any]:
-        frame, tc_val = self._grab_extendedbuf_metadata()
+    def grab_metadata(self) -> Tuple[Optional[NDArray], Dict[str, Any]]:
+        # Core capture function for HuatengCamera
+        frame, ext_info = self.grab_extended_info()
         if frame is None: return None, {}
-        frame = self.strip_extended_info(frame)
-        return frame, {'hw_timecode': tc_val}
+        if self.is_feature_enabled(CameraFeatures.TIMECODE):
+            frame = self.strip_extended_info(frame)
+        
+        return frame, ext_info
 
-    def grab_extended_info(self) -> Tuple[Optional[NDArray], Any]:
+    def grab_extended_info(self) -> Tuple[Optional[NDArray], Dict[str, Any]]:
+        # Core capture function for HuatengCamera
         if not self.is_feature_enabled(CameraFeatures.TIMECODE):
             raise CamException("TIMECODE is not enabled during initialization.", src_func="HuatengCamera.grab_extended_info")
         frame, tc_val = self._grab_extendedbuf_metadata()
-        if frame is None: return None, None
-        frame = self._processor.process(frame) # Return uint16
+        if frame is None: return None, {}
+
+        # TODO: Update the processor with `out` option to: 1. reduce malloc; 
+        frame = self._processor.process(frame) # output dimension is defined when processor init (related with timecode enable or not)
 
         if self._bit_depth == BitDepth._8: 
-            frame = frame.view(np.uint8)[..., _UINT16_HIGHBYTE::2]
+            # not continuous, zero-copy.
+            frame = frame.view(np.uint8)[..., _UINT16_HIGHBYTE::2] 
         
         # Write metadata to extra_line, 
         metadata = HuatengCamera.HuatengCamMetadata(hw_timecode=tc_val)
@@ -682,7 +681,7 @@ if __name__ == '__main__':
     print(cam.exposure_time_ms_range)
     print(cam.gain_range)
     cam.exposure_time_ms = 10
-    cam.gain = 4
+    cam.gain = 1
     try:
         cam.start_capture()
         frame = cam.grab()
@@ -702,7 +701,7 @@ if __name__ == '__main__':
         cam.close()
         cam = HuatengCamera(cam_enum[0], fps=None, bitdepth=BitDepth._8)
         cam.open()
-        cam.exposure_time_ms = 10; cam.gain = 4
+        cam.exposure_time_ms = 10; cam.gain = 1
         cam.start_capture()
     
         frame = cam.grab_raw()
@@ -722,18 +721,18 @@ if __name__ == '__main__':
         cam.start_capture()
 
         frame, timecode = cam.grab_metadata()
-        print("grab_metadata", timecode)
-        cv2.imshow("frame", frame[1024:, :]*16)
+        print("grab_metadata", timecode, frame.dtype)
+        cv2.imshow("frame", frame[1024:, :])
         cv2.waitKey(0)
         frame, _ = cam.grab_extended_info()
-        print(frame.shape)
-        cv2.imshow("frame", frame[1024:, :]*16)
+        print(frame.shape, frame.dtype)
+        cv2.imshow("frame", frame[1024:, :])
         cv2.waitKey(0)
         ext_info_extractor = cam.get_extended_info_extractor()
         frame, ext_info = ext_info_extractor(frame)
         print("ext_info", ext_info)
-        print(frame.shape)
-        cv2.imshow("frame", frame[1024:, :]*16)
+        print(frame.shape, frame.dtype)
+        cv2.imshow("frame", frame[1024:, :])
         cv2.waitKey(0)
         
         cv2.destroyAllWindows()

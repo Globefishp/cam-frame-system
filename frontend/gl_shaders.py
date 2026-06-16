@@ -1,3 +1,6 @@
+# gui/gl_shaders.py
+# By Gemini 3.1 pro.
+
 """
 Centralized storage for OpenGL Shaders used in the gl_widget.
 """
@@ -20,18 +23,29 @@ FRAME_FRAGMENT_SHADER = """
 #version 330
 uniform sampler2D Texture;
 uniform int channels;
+uniform float val_min;
+uniform float val_max;
+uniform float gamma;
 in vec2 v_uv;
 out vec4 f_color;
 void main() {
     vec4 col = texture(Texture, v_uv);
+    vec3 mapped;
     if (channels == 1) {
-        // Grayscale
-        f_color = vec4(col.r, col.r, col.r, 1.0);
+        mapped = vec3(col.r);
     } else {
-        // RGB/BGR (assume BGR if input is from OpenCV/FFmpeg, 
-        // swizzling handled here if needed)
-        f_color = vec4(col.bgr, 1.0);
+        // Optional RGB-BGR swizzling
+        mapped = col.rgb;
     }
+
+    // Intensity Mapping
+    mapped = (mapped - val_min) / (val_max - val_min);
+    mapped = clamp(mapped, 0.0, 1.0);
+    
+    // Gamma Correction
+    mapped = pow(mapped, vec3(1.0 / gamma));
+
+    f_color = vec4(mapped, 1.0);
 }
 """
 

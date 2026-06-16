@@ -360,7 +360,7 @@ class HeadlessBackend: # TODO: Rename as Backend????
         return None
 
     # For preview thread
-    def get(self, size: int=1, timeout: Optional[float]=None) -> Tuple[Optional[FrameTicket], Optional[List[np.ndarray]]]:
+    def get_preview(self, size: int=1, timeout: Optional[float]=None) -> Tuple[Optional[FrameTicket], Optional[List[np.ndarray]]]:
         """Provides Zero-copy async access to the latest frames."""
         if self.frame_server is None:
             return None, None
