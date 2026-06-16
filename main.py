@@ -67,6 +67,7 @@ def main():
         'fps': 30,
         'bitdepth': BitDepth._12,
         'bayer_pattern': BayerPattern.BGGR,
+        'correction_file': 'cameras/huatengcam/corrections/correction_results_D65_250731.npy',
         'exposure_time_ms': 10,
         'gain': 1.0,
         'timecode_en': True,
@@ -78,6 +79,7 @@ def main():
         'preset': 'fast',
         'crf': 23,
         'threads': 0,
+        'input-csp': "rgb",
         'input-depth': 16, # 16 for 12bit, 8 for 8bit.
         'output-depth': 8, # 16 for 12bit, 8 for 8bit.
     }

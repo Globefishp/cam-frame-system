@@ -235,7 +235,7 @@ class CameraDisplayWidget(QOpenGLWidget):
     def _update_transform_mtx(self, tex_w, tex_h):
         frame_mtx = self._frame_transform_mtx(self.width(), self.height(), tex_w, tex_h, 
                                               self.zoom_factor, self.pan_x, self.pan_y)
-        ts_extra_mtx = self._timestamp_transform_mtx(200, 30)
+        ts_extra_mtx = self._timestamp_transform_mtx(200, 30, tex_w, tex_h)
         # modernGL.context.write() require C-continuous memory, but GLSL interprete as F-continuous.
         self._transform_mtx = frame_mtx.T.copy()
         self._ts_transform_mtx = (frame_mtx @ ts_extra_mtx).T.copy()
@@ -339,11 +339,13 @@ class CameraDisplayWidget(QOpenGLWidget):
         return mat
 
     @staticmethod
-    def _timestamp_transform_mtx(ts_w, ts_h):
+    def _timestamp_transform_mtx(ts_w, ts_h, frame_w, frame_h):
         """Calculate the timestamp transform matrix to snap it to upper-left 
         inside the frame, targeting **frame** normalized coordinate [-1,1]."""
         target_h = 0.04 * 2
-        target_w = target_h * (ts_w / ts_h)
+        if frame_w == 0 or frame_h == 0: image_aspect = 1 
+        else: image_aspect = frame_w / frame_h
+        target_w = target_h * (ts_w / ts_h) / image_aspect
 
         mat_ts = np.eye(4, dtype='f4')
         mat_ts[0, 0] = target_w / 2

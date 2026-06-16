@@ -60,7 +60,8 @@ class HuatengCamera(AC):
                  dev_info: mvsdk.tSdkCameraDevInfo,
                  fps: Optional[float] = None, # None=freerun
                  bitdepth: BitDepth = BitDepth._8,
-                 bayer_pattern: BayerPattern = _BAYER_PATTERN, # For Our ISP?
+                 bayer_pattern: BayerPattern = _BAYER_PATTERN,
+                 correction_file: Path = _DEFAULT_CORRECTION_PATH,
                  exposure_time_ms: float = _FRAME_TIME,
                  gain: float = _GAIN,
                  timecode_en: bool = True,
@@ -108,7 +109,7 @@ class HuatengCamera(AC):
         self._bit_depth: BitDepth = bitdepth # 在SDK中被称为media_type，详见open时枚举。
         self._bayer_pattern: BayerPattern = bayer_pattern
 
-        self._correction_path = _DEFAULT_CORRECTION_PATH
+        self._correction_path = Path(correction_file)
         self._XYZ_TO_SRGB: NDArray = np.array(
             [[ 3.2404542, -1.5371385, -0.4985314],
              [-0.9692660,  1.8760108,  0.0415560],
