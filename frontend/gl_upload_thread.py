@@ -10,7 +10,7 @@ from OpenGL.GL import glFlush
 import numpy as np
 import threading
 
-from utils.text_overlay import TextOverlayGen
+from .utils.text_overlay import TextOverlayGen
 
 class GLTextureUploadThread(QThread):
     """
@@ -68,7 +68,7 @@ class GLTextureUploadThread(QThread):
             self.vsync_event.wait(timeout=0.033) # 30fps if no vsync received.
             self.vsync_event.clear()
             
-            ticket, data = self.backend.get(size=1)
+            ticket, data = self.backend.get_preview(size=1)
             if ticket is not None and data is not None:
                 # Dirty read check: ignore if frame hasn't updated
                 if ticket.head_id == self.last_head_id:
