@@ -116,7 +116,7 @@ cdef class RawV11Processor:
         # Ensure input image is of the correct type and C-contiguous
         cdef np.ndarray[np.uint16_t, ndim=2, mode='c'] c_img = np.ascontiguousarray(img, dtype=np.uint16)
         
-        # Allocate the final output buffer for each frame
+        # Allocate the final output buffer for each frame (TODO: Add optional `out` to reduce buffer allocation?)
         cdef np.ndarray[np.uint16_t, ndim=3, mode='c'] final_img = np.empty((self.H_orig, self.W_orig, 3), dtype=np.uint16)
 
         # Create typed memoryviews as local variables before passing to C

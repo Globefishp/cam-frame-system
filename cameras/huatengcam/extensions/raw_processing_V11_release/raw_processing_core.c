@@ -59,7 +59,7 @@ static inline void prepare_line_buffer(
     // Fill the buffer and pad two ends by reflect 1 pixel.
     if (r_padded == 0) {
         r_ori_idx = 1;
-    } else if (r_padded > H_orig - 1) {
+    } else if (r_padded > H_orig) {
         r_ori_idx = H_orig - 2;
     } else {
         r_ori_idx = r_padded - 1;

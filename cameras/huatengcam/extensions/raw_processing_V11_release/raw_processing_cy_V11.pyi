@@ -70,6 +70,8 @@ class RawV11Processor:
         ----------
         img : np.ndarray
             The input 2D RAW image as a NumPy array (uint16).
+            User should ensure the image size is *always* readable within declared size
+            (`H_orig * W_orig`), or SegmentFault would occur.
 
         Returns
         -------
