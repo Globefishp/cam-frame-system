@@ -3,6 +3,7 @@
 
 import multiprocessing as mp
 import multiprocessing.synchronize as mp_sync
+from multiprocessing.sharedctypes import Synchronized 
 from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.connection import Connection
 import threading as t
@@ -140,7 +141,7 @@ class BaseAnalyzer(ABC):
         self._init_ipc()
 
         # Statistics
-        self._analyzed_count: mp.Value = mp.Value('i', 0, lock=False) # Only accessed by _worker
+        self._analyzed_count: Synchronized[int] = mp.Value('i', 0, lock=False) # Only accessed by _worker
 
     def __getstate__(self):
         state = self.__dict__.copy()
