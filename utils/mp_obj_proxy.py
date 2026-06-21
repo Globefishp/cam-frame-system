@@ -1,6 +1,8 @@
 # utils/mp_obj_proxy.py
 # Author: Google Gemini 3.1 pro, modified & cleanup by Haiyun Huang (260406)
 
+# TODO: Fix thread safety of host send/recv()
+
 from inspect import getattr_static
 import threading
 import multiprocessing as mp
@@ -19,7 +21,9 @@ class MpObjProxy:
 
     Limitations: 
         - Multi-processing must in spawn mode: mp.set_start_method('spawn', force=True)
-        - Only allow one to one RPC; 
+        - Only allow one to one RPC. Currently, multi-threading requests are 
+          sequentialized by lock. TODO: maybe ordered request/result ("reorder") 
+          mechanism can help in concurrent heavy task such as `mp_eval`. 
         - Properties/methods dynamically created after `__init__` will not be 
           proxied automatically. Use `mp_rescan` to update member cache (see below)
           Properties not in `dict` (i.e. `__getattr__` or `__getattribute__`) cannot
@@ -71,6 +75,8 @@ class MpObjProxy:
         # --- Dual Unidirectional Pipes for RPC ---
         self._pxy_owner_rx_, self._pxy_main_tx_ = mp.Pipe(duplex=False)
         self._pxy_main_rx_, self._pxy_owner_tx_ = mp.Pipe(duplex=False)
+        # Lock to ensure atomic _ipc_send_and_wait().
+        self._pxy_owner_lock_ = threading.Lock()
         # owner_: owner for the object.
 
         # --- Introspection Cache ---
@@ -83,8 +89,8 @@ class MpObjProxy:
         self._pxy_pickled_ = False
 
         # --- Server State (Available after __call__) ---
-        self.__dict__['_pxy_target_obj_'] = None
-        self.__dict__['_pxy_rpc_lock_'] = None
+        self._pxy_target_obj_ = None
+        self._pxy_rpc_lock_ = None
         self._pxy_service_thread_ = None
         self._pxy_shutdown_event_ = None
 
@@ -98,6 +104,7 @@ class MpObjProxy:
         state.pop('_pxy_init_rx_', None)
         state.pop('_pxy_main_rx_', None)
         state.pop('_pxy_main_tx_', None)
+        state.pop('_pxy_owner_lock_', None)
         # Mark as pickled
         state['_pxy_pickled_'] = True
         
@@ -138,9 +145,11 @@ class MpObjProxy:
             raise RuntimeError(f"MpObjProxy is not ready! Call wait_handshake() first. Attempted access: {name}")
 
         request = (action, name, args, kwargs or {})
-        self._pxy_main_tx_.send(request)
-        
-        success, payload = self._pxy_main_rx_.recv()
+
+        with self._pxy_owner_lock_:
+            # Avoid concurrent requests, in which the results may be out of order.
+            self._pxy_main_tx_.send(request)
+            success, payload = self._pxy_main_rx_.recv()
         
         if not success:
             raise payload
@@ -182,9 +191,9 @@ class MpObjProxy:
             raise RuntimeError("MpObjProxy has already been called before.")
 
         # Instantiate target object without __setattr__ interference
-        self.__dict__['_pxy_target_obj_'] = self._pxy_cls_(*self._pxy_init_args_, **self._pxy_init_kwargs_)
+        self._pxy_target_obj_ = self._pxy_cls_(*self._pxy_init_args_, **self._pxy_init_kwargs_)
         # Initialize RPC resources
-        self.__dict__['_pxy_rpc_lock_'] = threading.Lock()
+        self._pxy_rpc_lock_ = threading.Lock()
         self._pxy_shutdown_event_ = threading.Event()
 
         # Introspection and send categorized member names back to Main Process
