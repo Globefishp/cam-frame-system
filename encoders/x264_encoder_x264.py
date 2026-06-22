@@ -14,7 +14,7 @@ from typing import Tuple, Any, Optional, List, Dict, Callable, Protocol
 from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
 from frameserver.v3.frameserver_v3 import FrameServer
 from encoders.videoencoder_v3 import BaseVideoEncoder
-from encoders.videoencoder_types import EncoderException
+from encoders.videoencoder_types import EncoderException, TimecodeExtractor
 from utils.digits_overlay import FastDigitsOverlay
 
 import subprocess
@@ -29,18 +29,6 @@ from loguru._logger import Logger # For Type Hinting Only
 
 _ENCODER_CURR_DIR = Path(__file__).resolve().parent
 
-class TimecodeExtractor(Protocol):
-    def __call__(self, image: NDArray, **kwargs: Any) -> tuple[NDArray, List[Dict[str, Any]]]:
-        pass
-    @property
-    def timebase(self) -> int:
-        """1/timebase equals time per tick in second."""
-        pass
-    @property
-    def timecode_key(self) -> str:
-        """The key to extract timecode from the extended info dict."""
-        pass
-    # TODO: Wrapper for ExtInfoExtractor, done in Backend (top level that responsible for DI)
 
 class X264Encoder(BaseVideoEncoder):
     """
@@ -53,7 +41,7 @@ class X264Encoder(BaseVideoEncoder):
                  target_fps: Optional[float] = None,
                  stat_interval: float = 1.0,
                  extinfo_extractor: Optional[TimecodeExtractor] = None,
-                 inject_logger: Logger = None,
+                 inject_logger: Optional[Logger] = None,
                  mux_timecode: bool = False,
                  **kwargs
         ):
