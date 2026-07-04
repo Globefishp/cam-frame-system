@@ -42,7 +42,7 @@ class FSMetadata(ctypes.Structure):
 
     _fields_ = [
         ("fs_protocol_ver", ctypes.c_uint64),    # mark the Metadata version. See _METADATA_VER_HASH
-        ("fs_oldest_frame_id", ctypes.c_int64), # The newest frame id of the data that has got from ring buffer by FrameServer.
+        ("fs_oldest_frame_id", ctypes.c_int64), # The oldest frame id of the data got from ring buffer and still occupied by FrameServer.
         ("rb_offset", ctypes.c_int64), # The offset of the ring buffer read_ptr when initialize the FrameServer.
         # For each consumer:
         ("enable_mask", ctypes.c_bool * MAX_CONSUMERS), # If a consumer is enabled.
