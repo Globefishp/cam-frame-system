@@ -52,7 +52,9 @@ class FSMetadata(ctypes.Structure):
         # for each linked ring buffer:
         ("rb_metadata_name_hashes", ctypes.c_uint64 * MAX_LINKED_BUFFERS), # Hash of the linked ring buffer's metadata shm name to prevent duplicate binding.
         ("rb_linked_fs_count", ctypes.c_uint8 * MAX_LINKED_BUFFERS), # The reference count of each ring buffer linked by frameserver instances. 0 = free slot.
-        ("rb_oldest_frame_ids", (ctypes.c_uint64 * 8) * MAX_LINKED_BUFFERS), # The oldest frame id of the data got from ring buffer and still occupied by FrameServer. Padded to 64 bytes to prevent false sharing.
+        ("rb_oldest_frame_ids", (ctypes.c_uint64 * 8) * MAX_LINKED_BUFFERS), # The oldest frame id of the data got from ring buffer and still occupied by FrameServer. 
+            # Padded to 64 bytes to prevent false sharing. 
+            # In v4 impl., offset 1 is used as per ringbuffer `_rb_gc_view_mono_seqlock` counter, stepping when min(_gc_view) monotonicity (increasing) cannot be guaranteed.
         ("rb_offsets", ctypes.c_uint64 * MAX_LINKED_BUFFERS), # The offset of the ring buffer read_ptr when initialize the FrameServer.
         # For each consumer:
         ("c_enable_mask", ctypes.c_bool * MAX_CONSUMERS), # If a consumer is enabled.

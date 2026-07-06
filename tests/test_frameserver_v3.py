@@ -12,39 +12,54 @@ import time
 import multiprocessing as mp
 import random
 
-from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
-from frameserver.v3 import FrameServer
-from frameserver.v3 import TicketExpireException, MAX_LINKED_BUFFERS
+from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer as RB_v4
+from ringbuffers.shared_ring_buffer_v5 import ProcessSafeSharedRingBuffer as RB_v5
+
+def get_rb_class(fs_module_name):
+    return RB_v5 if fs_module_name == "frameserver.v4" else RB_v4
+
+import importlib
 
 ctx = mp.get_context("spawn")
 
 @pytest.fixture
-def empty_buffer():
-    rb = ProcessSafeSharedRingBuffer(create=True, buffer_capacity=60, frame_shape=(10, 10, 3), dtype=np.uint32)
+def ring_buffer_class(request):
+    try:
+        fs_mod = request.getfixturevalue("fs_module_name")
+    except Exception:
+        fs_mod = "frameserver.v4"
+    return get_rb_class(fs_mod)
+
+@pytest.fixture
+def empty_buffer(ring_buffer_class):
+    rb = ring_buffer_class(create=True, buffer_capacity=60, frame_shape=(10, 10, 3), dtype=np.uint32)
     yield rb
     rb.close()
     try: rb.unlink()
     except Exception: pass
 
 @pytest.fixture
-def small_buffer():
-    rb = ProcessSafeSharedRingBuffer(create=True, buffer_capacity=5, frame_shape=(2, 2, 3), dtype=np.uint32)
+def small_buffer(ring_buffer_class):
+    rb = ring_buffer_class(create=True, buffer_capacity=5, frame_shape=(2, 2, 3), dtype=np.uint32)
     yield rb
     rb.close()
     try: rb.unlink()
     except Exception: pass
 
 @pytest.fixture
-def multi_buffers():
-    rbs = [ProcessSafeSharedRingBuffer(create=True, buffer_capacity=60, frame_shape=(10, 10, 3), dtype=np.uint32) for _ in range(4)]
+def multi_buffers(ring_buffer_class):
+    rbs = [ring_buffer_class(create=True, buffer_capacity=60, frame_shape=(10, 10, 3), dtype=np.uint32) for _ in range(4)]
     yield rbs
     for rb in rbs:
         rb.close()
         try: rb.unlink()
         except Exception: pass
 
-def test_fs3_init(empty_buffer: ProcessSafeSharedRingBuffer):
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v3", "frameserver.v4"])
+def test_fs3_init(fs_module_name, empty_buffer):
     """Test initialize with a buffer with some data"""
+    fs_mod = importlib.import_module(fs_module_name)
+    FrameServer = fs_mod.FrameServer
     rb = empty_buffer
     for i in range(3):
         f=np.full((1,10,10,3), i, dtype=np.uint32)
@@ -85,8 +100,11 @@ def test_fs3_init(empty_buffer: ProcessSafeSharedRingBuffer):
     fs.close(); fs.unlink()
     rb.close()
 
-def test_fs3_init_sync(empty_buffer):
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v3", "frameserver.v4"])
+def test_fs3_init_sync(fs_module_name, empty_buffer, ring_buffer_class):
     """Test attaching an external buffer with some existing unread data properly aligns offsets."""
+    fs_mod = importlib.import_module(fs_module_name)
+    FrameServer = fs_mod.FrameServer
     rb_a = empty_buffer
     fs = FrameServer(create=True, ring_buffer=rb_a)
     cid = fs.register_consumer()
@@ -100,7 +118,7 @@ def test_fs3_init_sync(empty_buffer):
         t = fs.get_sync(cid, 1)
         fs.release_sync(t)
 
-    rb_b = ProcessSafeSharedRingBuffer(create=True, buffer_capacity=60, frame_shape=(10, 10, 3), dtype=np.uint32)
+    rb_b = ring_buffer_class(create=True, buffer_capacity=60, frame_shape=(10, 10, 3), dtype=np.uint32)
     for i in range(100, 105):
         f = np.full((1, 10, 10, 3), i, dtype=np.uint32)
         rb_b.put(f)
@@ -128,11 +146,15 @@ def test_fs3_init_sync(empty_buffer):
     rb_b.close(); rb_b.unlink()
 
 
-def test_fs3_bind_limits(empty_buffer):
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v3", "frameserver.v4"])
+def test_fs3_bind_limits(fs_module_name, empty_buffer, ring_buffer_class):
     """Test duplicate binding protection and slot limits."""
+    fs_mod = importlib.import_module(fs_module_name)
+    FrameServer = fs_mod.FrameServer
+    MAX_LINKED_BUFFERS = fs_mod.MAX_LINKED_BUFFERS
     fs = FrameServer(create=True, ring_buffer=empty_buffer)
     
-    rb_new = ProcessSafeSharedRingBuffer(create=True, buffer_capacity=60, frame_shape=(10, 10, 3), dtype=np.uint32)
+    rb_new = ring_buffer_class(create=True, buffer_capacity=60, frame_shape=(10, 10, 3), dtype=np.uint32)
     
     fs_child = FrameServer(create=False, ring_buffer=rb_new, frameserver=fs)
     
@@ -145,11 +167,11 @@ def test_fs3_bind_limits(empty_buffer):
     
     # We already have 1 (the original). Can attach MAX_LINKED_BUFFERS - 1 more.
     for i in range(MAX_LINKED_BUFFERS - 1):
-        r = ProcessSafeSharedRingBuffer(create=True, buffer_capacity=60, frame_shape=(10, 10, 3), dtype=np.uint32)
+        r = ring_buffer_class(create=True, buffer_capacity=60, frame_shape=(10, 10, 3), dtype=np.uint32)
         rbs.append(r)
         fs_children.append(FrameServer(create=False, ring_buffer=r, frameserver=fs))
         
-    r_overflow = ProcessSafeSharedRingBuffer(create=True, buffer_capacity=60, frame_shape=(10, 10, 3), dtype=np.uint32)
+    r_overflow = ring_buffer_class(create=True, buffer_capacity=60, frame_shape=(10, 10, 3), dtype=np.uint32)
     with pytest.raises(RuntimeError, match="Exceed the max number of linked buffers supported"):
         fs_overflow = FrameServer(create=False, ring_buffer=r_overflow, frameserver=fs)
         
@@ -165,8 +187,9 @@ def __spin_delay(delay_sec):
     while time.perf_counter() < end:
         pass
 
-def __unified_producer_worker(rb_obj, stream_id, stop_event, batch_size, result_queue, delay_mean=0.0, delay_std=0.0, timeout=0.05):
-    buffer = ProcessSafeSharedRingBuffer(create=False, source_buffer=rb_obj)
+def __unified_producer_worker(fs_module_name, rb_obj, stream_id, stop_event, batch_size, result_queue, delay_mean=0.0, delay_std=0.0, timeout=0.05):
+    RBClass = get_rb_class(fs_module_name)
+    buffer = RBClass(create=False, source_buffer=rb_obj)
     i = 0
     timeouts = 0
     while not stop_event.is_set():
@@ -187,7 +210,9 @@ def __unified_producer_worker(rb_obj, stream_id, stop_event, batch_size, result_
     buffer.close()
 
 
-def __multi_stream_consumer_worker(servers, cid, stop_event, fetch_size, result_queue, delay_mean=0.0, delay_std=0.0, lazy_release=False, slow_stream_idx=None):
+def __multi_stream_consumer_worker(fs_module_name, servers, cid, stop_event, fetch_size, result_queue, delay_mean=0.0, delay_std=0.0, lazy_release=False, slow_stream_idx=None):
+    fs_mod = importlib.import_module(fs_module_name)
+    TicketExpireException = fs_mod.TicketExpireException
     try:
         
         tickets = []
@@ -243,8 +268,12 @@ def __multi_stream_consumer_worker(servers, cid, stop_event, fetch_size, result_
     (3, 2),
     (4, 8)
 ])
-def test_fs3_multi_stream_concurrent_stress(multi_buffers, n_streams, k_consumers):
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v3", "frameserver.v4"])
+def test_fs3_multi_stream_concurrent_stress(fs_module_name, multi_buffers, n_streams, k_consumers):
     """Stress test with n streams and k consumers validating absolute alignment."""
+    fs_mod = importlib.import_module(fs_module_name)
+    FrameServer = fs_mod.FrameServer
+    TicketExpireException = fs_mod.TicketExpireException
     rbs = multi_buffers[:n_streams]
     server_master = FrameServer(create=True, ring_buffer=rbs[0])
     rbs[0].trigger_release = server_master._gc
@@ -264,14 +293,14 @@ def test_fs3_multi_stream_concurrent_stress(multi_buffers, n_streams, k_consumer
     tx_queues = [ctx.Queue() for _ in range(n_streams)]
     producers = []
     for i in range(n_streams):
-        p = ctx.Process(target=__unified_producer_worker, args=(rbs[i], i, tx_stop_event, 2, tx_queues[i], 0.001, 0.0))
+        p = ctx.Process(target=__unified_producer_worker, args=(fs_module_name, rbs[i], i, tx_stop_event, 2, tx_queues[i], 0.001, 0.0))
         producers.append(p)
         p.start()
         
     rx_queues = [ctx.Queue() for _ in range(k_consumers)]
     workers = []
     for cid, q in zip(cids, rx_queues):
-        w = ctx.Process(target=__multi_stream_consumer_worker, args=(servers, cid, rx_stop_event, 1, q, 0.002, 0.0))
+        w = ctx.Process(target=__multi_stream_consumer_worker, args=(fs_module_name, servers, cid, rx_stop_event, 1, q, 0.002, 0.0))
         workers.append(w)
         w.start()
         
@@ -310,8 +339,11 @@ def test_fs3_multi_stream_concurrent_stress(multi_buffers, n_streams, k_consumer
     server_master.unlink()
 
 
-def test_fs3_lazy_gc_backpressure(multi_buffers):
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v3", "frameserver.v4"])
+def test_fs3_lazy_gc_backpressure(fs_module_name, multi_buffers):
     """Test lazy GC backpressure. One stream is not released, causing its producer to block while others proceed."""
+    fs_mod = importlib.import_module(fs_module_name)
+    FrameServer = fs_mod.FrameServer
     rbs = multi_buffers[:2]
     server_master = FrameServer(create=True, ring_buffer=rbs[0])
     rbs[0].trigger_release = server_master._gc
@@ -326,12 +358,12 @@ def test_fs3_lazy_gc_backpressure(multi_buffers):
     
     tx_queues = [ctx.Queue() for _ in range(2)]
     
-    p_fast = ctx.Process(target=__unified_producer_worker, args=(rbs[0], 0, tx_stop_event, 1, tx_queues[0], 0.0, 0.0, 0.05))
-    p_slow = ctx.Process(target=__unified_producer_worker, args=(rbs[1], 1, tx_stop_event, 1, tx_queues[1], 0.0, 0.0, 0.05))
+    p_fast = ctx.Process(target=__unified_producer_worker, args=(fs_module_name, rbs[0], 0, tx_stop_event, 1, tx_queues[0], 0.0, 0.0, 0.05))
+    p_slow = ctx.Process(target=__unified_producer_worker, args=(fs_module_name, rbs[1], 1, tx_stop_event, 1, tx_queues[1], 0.0, 0.0, 0.05))
     
     rx_queue = ctx.Queue()
     # slow_stream_idx = 1
-    w = ctx.Process(target=__multi_stream_consumer_worker, args=([server_master, server_b], cid, rx_stop_event, 1, rx_queue, 0.001, 0.0, True, 1))
+    w = ctx.Process(target=__multi_stream_consumer_worker, args=(fs_module_name, [server_master, server_b], cid, rx_stop_event, 1, rx_queue, 0.001, 0.0, True, 1))
     
     p_fast.start()
     p_slow.start()
@@ -364,7 +396,9 @@ def test_fs3_lazy_gc_backpressure(multi_buffers):
     server_master.close()
     server_master.unlink()
 
-def __malicious_attacher(fs_obj, rb_obj, stop_event, result_queue):
+def __malicious_attacher(fs_module_name, fs_obj, rb_obj, stop_event, result_queue):
+    fs_mod = importlib.import_module(fs_module_name)
+    FrameServer = fs_mod.FrameServer
     """Constantly attaches and immediately drops to simulate crash/interruption."""
     success_count, rejected_count = 0, 0
     while not stop_event.is_set():
@@ -386,8 +420,11 @@ def __malicious_attacher(fs_obj, rb_obj, stop_event, result_queue):
     result_queue.put((success_count, rejected_count))
 
 
-def test_fs3_concurrent_lifecycle_interruption(empty_buffer, small_buffer):
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v3", "frameserver.v4"])
+def test_fs3_concurrent_lifecycle_interruption(fs_module_name, empty_buffer, small_buffer):
     """Test attaching/detaching streams concurrently does not lock up the main stream A."""
+    fs_mod = importlib.import_module(fs_module_name)
+    FrameServer = fs_mod.FrameServer
     server_master = FrameServer(create=True, ring_buffer=empty_buffer)
     empty_buffer.trigger_release = server_master._gc
     cid = server_master.register_consumer()
@@ -398,12 +435,12 @@ def test_fs3_concurrent_lifecycle_interruption(empty_buffer, small_buffer):
     rx_queue = ctx.Queue()
     
     # Normal operations on main buffer
-    p_prod = ctx.Process(target=__unified_producer_worker, args=(empty_buffer, 0, tx_stop_event, 1, tx_queue))
-    p_cons = ctx.Process(target=__multi_stream_consumer_worker, args=([server_master], cid, rx_stop_event, 1, rx_queue, 0.001))
+    p_prod = ctx.Process(target=__unified_producer_worker, args=(fs_module_name, empty_buffer, 0, tx_stop_event, 1, tx_queue))
+    p_cons = ctx.Process(target=__multi_stream_consumer_worker, args=(fs_module_name, [server_master], cid, rx_stop_event, 1, rx_queue, 0.001))
     
     # Malicious attachers on a second buffer
     ret_queue = [ctx.Queue() for _ in range(4)]
-    malicious_procs = [ctx.Process(target=__malicious_attacher, args=(server_master, small_buffer, tx_stop_event, ret_queue[i])) for i in range(4)]
+    malicious_procs = [ctx.Process(target=__malicious_attacher, args=(fs_module_name, server_master, small_buffer, tx_stop_event, ret_queue[i])) for i in range(4)]
     
     p_prod.start()
     p_cons.start()

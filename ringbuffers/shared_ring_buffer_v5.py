@@ -49,6 +49,7 @@ import numpy as np
 from numpy.typing import NDArray
 from typing import Tuple, Any, Optional, Union, List, Callable, overload, Literal # Import overload
 
+import platform
 import multiprocessing as mp
 import multiprocessing.shared_memory as mp_shm
 import multiprocessing.synchronize as mp_sync
@@ -57,6 +58,21 @@ from loguru import logger as file_logger
 from loguru._logger import Logger # for type hint only
 
 from .shared_ring_buffer_v4_types import BufferTicket, Metadata, METADATA_SIZE
+
+_MACHINE = platform.machine().lower()
+_IS_X86 = _MACHINE in ('amd64', 'x86_64', 'i386', 'i686', 'x86')
+if _IS_X86:
+    def _store_store_barrier(lock: None) -> None:
+        return
+else:
+    import threading
+    def _store_store_barrier(lock: threading.Lock) -> None:
+        # that actually is mocking a full memory barrier on ARM
+        lock.acquire()
+        lock.release()
+        lock.acquire()
+        lock.release()
+        return
 
 
 class ProcessSafeSharedRingBuffer:
@@ -155,6 +171,7 @@ class ProcessSafeSharedRingBuffer:
         self._pointer_lock: Optional[mp_sync.Lock] = None
         self._data_available: Optional[mp_sync.Condition] = None
         self._space_available: Optional[mp_sync.Condition] = None
+        self._store_store_barrier_lock: Optional[threading.Lock] = None if _IS_X86 else threading.Lock()
 
 
         if ctypes.sizeof(Metadata) > METADATA_SIZE:
@@ -547,15 +564,23 @@ class ProcessSafeSharedRingBuffer:
         return frames_list, ticket # Successfully got frame
 
     @overload
-    def release(self, release_num: int, /) -> int:
+    def release(self, release_num: int, /, callback: Optional[Callable[[int,], None]] = None) -> int:
         """
         Manually release the oldest `release_num` frames by marking them ready 
         to be overwritten. Unread frames can also be released, in which case the
         next `get()` call will read from the first valid frame. So release with
         care.
         
+        Pre-condition: `pointer_lock` is released. 
+        Post-condition: `callback` function will be called **before** actual buffer 
+            release. A memory barrier will be used to ensure the callback store 
+            is prior to buffer pointer store.
+        
         Args:
             release_num (int): The number of frames intended to release.
+            callback (Callable[[int], None]): callback(release_num) will be
+                called with the number of frames that **are guaranteed to** 
+                be released.
             
         Returns:
             int: The number of frames actually released.
@@ -566,15 +591,23 @@ class ProcessSafeSharedRingBuffer:
         ...
 
     @overload
-    def release(self, oldest_ticket: BufferTicket, /) -> int:
+    def release(self, oldest_ticket: BufferTicket, /, callback: Optional[Callable[[int,], None]] = None) -> int:
         """
         Manually release the **oldest** BufferTicket by marking them ready 
         to be overwritten. This API is a wrapper for `release(ticket.read_num)`.
         The buffer state will become unexpected if the passed ticket is not the 
         oldest one.
         
+        Pre-condition: `pointer_lock` is released. 
+        Post-condition: `callback` function will be called **before** actual buffer 
+            release. A memory barrier will be used to ensure the callback store 
+            is prior to buffer pointer store.
+        
         Args:
             oldest_ticket (BufferTicket): The oldest BufferTicket to release.
+            callback (Callable[[int], None]): callback(release_num) will be
+                called with the number of frames that **are guaranteed to** 
+                be released.
             
         Returns:
             int: The number of frames actually released.
@@ -585,7 +618,7 @@ class ProcessSafeSharedRingBuffer:
         """
         ...
 
-    def release(self, obj: Union[int, BufferTicket], /) -> int:
+    def release(self, obj: Union[int, BufferTicket], /, callback: Optional[Callable[[int,], None]] = None) -> int:
         if isinstance(obj, BufferTicket):
             release_num = obj.read_num
         else: # Assume int or np.integer
@@ -597,6 +630,13 @@ class ProcessSafeSharedRingBuffer:
         with self._pointer_lock: # Acquire lock for metadata access and synchronization
             unread_full, read_ptr, write_ptr, occupied_count = self._get_pointers_metadata()
             actual_release = min(release_num, occupied_count)
+
+            # Trigger callback before actual buffer release
+            if callback: 
+                callback(actual_release)
+                # Using a barrier to allow lock-free observation outside.
+                # on x86, just return since x86 is Total Store Order.
+                _store_store_barrier(self._store_store_barrier_lock) 
             
             # Reduce occupied count
             new_occupied_count = occupied_count - actual_release 

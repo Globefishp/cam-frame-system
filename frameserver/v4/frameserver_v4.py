@@ -8,7 +8,11 @@
 # Require 64bit system to safely read uint64 atomically.
 # gc_lock is a fine-grained lock, if lock nesting is needed, gc_lock must be acquired 
 #   AFTER holding cid_lock/reg_lock to prevent ABBA dead lock.
-# Lock order (inner -> outer): gc_lock -> cid_lock -> reg_lock -> link_lock.
+# Lock order (inner -> outer): 
+#   buffer.pointer_lock(implicit) -> gc_lock -> cid_lock -> reg_lock -> link_lock.
+# Some operation need x86 TSO. Additional mem barrier is needed on ARM. 
+#   Search `ARM` for more info.
+
 
 from typing import overload, Literal
 import time
@@ -23,7 +27,7 @@ import numpy as np
 from numpy.typing import NDArray
 from typing import Optional, List
 from loguru._logger import Logger # for type hint only
-from ...ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
+from ringbuffers.shared_ring_buffer_v5 import ProcessSafeSharedRingBuffer
 
 from .frameserver_v4_types import (FrameTicket, TicketExpireException, 
                                   FSMetadata, _METADATA_VER_HASH, 
@@ -166,10 +170,11 @@ class FrameServer:
         # === Metadata ===
         self._shm: Optional[mp_shm.SharedMemory] = None
         self._metadata:     Optional[FSMetadata] = None
-        self._rb_metadata_name_hashes:  Optional[NDArray] = None
-        self._rb_linked_fs_count:  Optional[NDArray] = None
-        self._rb_oldest_frame_ids: Optional[NDArray] = None # pad to 64 bytes, use [buf_id, 0].
-        self._rb_offsets:          Optional[NDArray] = None
+        self._rb_metadata_name_hashes: Optional[NDArray] = None
+        self._rb_linked_fs_count:      Optional[NDArray] = None
+        self._rb_oldest_frame_ids:     Optional[NDArray] = None # pad to 64 bytes, use [buf_id, 0].
+        self._rb_gc_view_mono_seqlock: Optional[NDArray] = None # same cache line as _rb_oldest_frame_ids but use [buf_id, 1].
+        self._rb_offsets:              Optional[NDArray] = None
         self._c_enable_mask:  Optional[NDArray] = None
         self._next_frame_ids: Optional[NDArray] = None
         self._tickets_arr:    Optional[NDArray] = None
@@ -342,6 +347,7 @@ class FrameServer:
         self._rb_metadata_name_hashes.fill(0)
         self._rb_linked_fs_count.fill(0)
         self._rb_oldest_frame_ids.fill(_UINT64_MAX) # _UINT64_MAX = uninit.
+        self._rb_gc_view_mono_seqlock.fill(0)
         self._rb_offsets.fill(_UINT64_MAX)
 
         self._rb_linked_fs_count[0] = 1 # reference count
@@ -361,9 +367,10 @@ class FrameServer:
         buf = self._shm.buf
         
         self._rb_metadata_name_hashes: NDArray[np.uint64] = np.ndarray((MAX_LINKED_BUFFERS,), dtype=np.uint64, buffer=buf, offset=FSMetadata.rb_metadata_name_hashes.offset)
-        self._rb_linked_fs_count: NDArray[np.uint8] = np.ndarray((MAX_LINKED_BUFFERS,), dtype=np.uint8, buffer=buf, offset=FSMetadata.rb_linked_fs_count.offset)
+        self._rb_linked_fs_count:  NDArray[np.uint8] = np.ndarray((MAX_LINKED_BUFFERS,), dtype=np.uint8, buffer=buf, offset=FSMetadata.rb_linked_fs_count.offset)
         self._rb_oldest_frame_ids: NDArray[np.uint64] = np.ndarray((MAX_LINKED_BUFFERS, 8), dtype=np.uint64, buffer=buf, offset=FSMetadata.rb_oldest_frame_ids.offset)[:, 0] # the first element is valid.
-        self._rb_offsets: NDArray[np.uint64] = np.ndarray((MAX_LINKED_BUFFERS,), dtype=np.uint64, buffer=buf, offset=FSMetadata.rb_offsets.offset)
+        self._rb_gc_view_mono_seqlock:   NDArray[np.uint64] = np.ndarray((MAX_LINKED_BUFFERS, 8), dtype=np.uint64, buffer=buf, offset=FSMetadata.rb_oldest_frame_ids.offset)[:, 1] # use 2nd element.
+        self._rb_offsets:          NDArray[np.uint64] = np.ndarray((MAX_LINKED_BUFFERS,), dtype=np.uint64, buffer=buf, offset=FSMetadata.rb_offsets.offset)
         
         self._c_enable_mask: NDArray[np.bool_] = np.ndarray((MAX_CONSUMERS,), dtype=np.bool_, buffer=buf, offset=FSMetadata.c_enable_mask.offset)
         self._gc_view:        NDArray[np.uint64] = np.ndarray((MAX_CONSUMERS, MAX_TICKETS + 1), dtype=np.uint64, buffer=buf, offset=FSMetadata.tickets.offset)
@@ -401,14 +408,28 @@ class FrameServer:
             cid = available_cids[0]
             
             # Initialize metadata for the consumer.
-            if historical_data:
-                self._next_frame_ids[cid] = self._rb_oldest_frame_ids[self.buf_id]
-            else:
-                self._next_frame_ids[cid] = self._buf_write_frontier_gc_locked()
-            self._tickets_arr[cid, :] = _UINT64_MAX # Use _INT64_MAX to mark unused tickets.
+            self._rb_gc_view_mono_seqlock[self.buf_id] += 1
+            # min(_gc_view) will no longer be monotonically increase, 
+            #  stepping seqlock to protect `_next_frame_ids` writing (decreasing)
+            #  and avoid incorrect `_gc()`
+
+            # -- Additional Store-store barrier (ARM) --
+            with self._gc_locks[self.buf_id]: 
+                # protect from loading a (soon-to-be) invalid `_rb_oldest_frame_ids`
+                # which is modifying in _gc() critical zone. 
+                if historical_data:
+                    self._next_frame_ids[cid] = self._rb_oldest_frame_ids[self.buf_id]
+                else:
+                    self._next_frame_ids[cid] = self._rb_oldest_frame_ids[self.buf_id] + self.buffer.occupied_count_
+            # finish seqlock.
+            # -- Additional Store-store barrier (ARM) --
+            self._rb_gc_view_mono_seqlock[self.buf_id] += 1
+            
+            self._tickets_arr[cid, :] = _UINT64_MAX # Use _UINT64_MAX to mark unused tickets. (monotocity is not violated, no need for seqlock)
+
             self._c_enable_mask[cid] = True # set flag at the end does NOT provide any order guarantee as it is shared memory.
         
-        if logger: logger.info(f"Consumer {cid} registered.")
+            if logger: logger.info(f"Consumer {cid} registered.") # within lock, for accurate logging order.
         return int(cid)
 
     def unregister_consumer(self, cid: int):
@@ -500,8 +521,14 @@ class FrameServer:
             with self.buffer.pointer_lock: 
                 # Check within lock, memory barrier.
                 # wait_for exec predicate in lock, avoid using locked .occupied_count() (dead lock)
-                if not self.buffer.data_available_condition.wait(timeout=timeout):
-                    # Wait without predicate, let next cycle to check false positive.
+                if not self.buffer.data_available_condition.wait_for(
+                    # _buf_write_frontier without _gc_lock
+                    lambda: self._rb_oldest_frame_ids[self.buf_id] + self.buffer.occupied_count_ \
+                        >= next_frame_id + size, 
+                    timeout=timeout
+                ):
+                    # This predicate will only have false-positive since `_rb_oldest_frame_ids`
+                    # is updated before `occupied_count_`, see `_gc()` and `buffer.release()` for more info
                     return None # timeout, return.
                     
 
@@ -547,7 +574,11 @@ class FrameServer:
                     if timeout <= 0: return None # timeout, return.
                 
                 with self.buffer.pointer_lock:
-                    if not self.buffer.data_available_condition.wait(timeout=timeout):
+                    if not self.buffer.data_available_condition.wait_for(
+                        lambda: self._rb_oldest_frame_ids[self.buf_id] + self.buffer.occupied_count_ \
+                            >= ticket.head_id + ticket.size,
+                        timeout=timeout
+                    ):
                         return None # timeout, return.
 
         relative_ptr = (ticket.head_id + self._rb_offsets[self.buf_id]) % self.buffer.buffer_capacity
@@ -596,14 +627,24 @@ class FrameServer:
 
         Returns:
             released_num (int): number of the oldest frames actually released.
+                The GC process may be aborted by various reasons and will return
+                less than `request_num` or 0.
         """
         # _gc() maintains the coupling of buffer release state and write fs_oldest_frame_id.
-        logger = self._logger
         if self._metadata is None or self._c_enable_mask is None or self._gc_view is None:
             # May run in daemon thread, raise is not suitable here.
-            if logger: logger.warning("GC is called when metadata not fully initialized. Release nothing.")
+            if self._logger: self._logger.warning("GC is called when metadata not fully initialized. Release nothing.")
             return 0
-
+        
+        # gc_view is guaranteed to be monotonically increasing in each `epoch`.
+        gc_view_mono_seqlock = self._rb_gc_view_mono_seqlock[self.buf_id]
+        # when monotocity is violated, gc_view_mono_seqlock is set to odd until critical zone (writer) ended.
+        if gc_view_mono_seqlock & 1:
+            # gc_view is writing, `global_occupied_from_id` calculation is invalid.
+            return 0 
+        # -- Additional Load-load barrier (ARM) --
+        # TODO: Rename `global_occupied_from_id` to `global_release_barrier`?
+        
         # Find the lagging most frame id (occupied for tickets, need to be preserved for next_frame_ids).
         global_occupied_from_id = np.min(self._gc_view) 
         # GC can run concurrently with other get_sync/release_sync. 
@@ -618,16 +659,26 @@ class FrameServer:
         else: # The internal `_gc()` call should keep non-blocking.
             if not self._gc_locks[self.buf_id].acquire(block=False): 
                 return 0 # Let next gc to do works.
-        # === Critical zone (protect fs_oldest_frame_id, no concurrent _gc()) ===
+        # ====== Critical zone (committing transaction) ======
+        #  protect `rb_oldest_frame_id`, no concurrent _gc()
 
         try:
+            # -- Additional Load-load barrier (ARM) --
+            if gc_view_mono_seqlock != self._rb_gc_view_mono_seqlock[self.buf_id]:
+                # epoch mismatch, actual `global_occupied_from_id` could be lower than calculated
+                # abort current _gc().
+                return 0
             # Has something to release.
             if global_occupied_from_id > self._rb_oldest_frame_ids[self.buf_id]:
                 # If no active consumer, can_release will be very large, near _UINT64_MAX
                 can_release = global_occupied_from_id - self._rb_oldest_frame_ids[self.buf_id]
-                release_num = self.buffer.release(min(can_release, request_num))
+
+                # use callback function to ensure _rb_oldest_frame_ids is updated before buffer pointer.
+                def release_callback(release_num):
+                    self._rb_oldest_frame_ids[self.buf_id] += release_num 
+                release_num = self.buffer.release(min(can_release, request_num), release_callback)
+
                 # Maintain the couple of FS metadata and buffer status.
-                self._rb_oldest_frame_ids[self.buf_id] += release_num 
                 return release_num
             return 0
         finally: # use `finally` to release lock before leaving current scope.
@@ -677,7 +728,8 @@ class FrameServer:
 
     def pause(self) -> None:
         """
-        Pause the frameserver. Any new `get_sync()` requests will timeout.
+        Pause the frameserver. Any new `get_sync()` requests will timeout or 
+        keep blocking.
         """
         pass
 

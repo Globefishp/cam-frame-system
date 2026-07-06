@@ -21,21 +21,33 @@ import multiprocessing as mp
 import random
 import importlib
 
-from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
+from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer as RB_v4
+from ringbuffers.shared_ring_buffer_v5 import ProcessSafeSharedRingBuffer as RB_v5
+
+def get_rb_class(fs_module_name):
+    return RB_v5 if fs_module_name == "frameserver.v4" else RB_v4
 
 ctx = mp.get_context("spawn")
 
 @pytest.fixture
-def empty_buffer():
-    rb = ProcessSafeSharedRingBuffer(create=True, buffer_capacity=60, frame_shape=(10, 10, 3), dtype=np.uint32)
+def ring_buffer_class(request):
+    try:
+        fs_mod = request.getfixturevalue("fs_module_name")
+    except Exception:
+        fs_mod = "frameserver.v4"
+    return get_rb_class(fs_mod)
+
+@pytest.fixture
+def empty_buffer(ring_buffer_class):
+    rb = ring_buffer_class(create=True, buffer_capacity=60, frame_shape=(10, 10, 3), dtype=np.uint32)
     yield rb
     rb.close()
     try: rb.unlink()
     except Exception: pass
 
 @pytest.fixture
-def small_buffer():
-    rb = ProcessSafeSharedRingBuffer(create=True, buffer_capacity=5, frame_shape=(2, 2, 3), dtype=np.uint32)
+def small_buffer(ring_buffer_class):
+    rb = ring_buffer_class(create=True, buffer_capacity=5, frame_shape=(2, 2, 3), dtype=np.uint32)
     yield rb
     rb.close()
     try: rb.unlink()
@@ -81,7 +93,7 @@ def __basic_use_consumer(fs_module_name, server_master, use_linked_fs, result_qu
     finally:
         server.close()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3", "frameserver.v4"])
 @pytest.mark.parametrize("use_linked_fs", [False, True])
 def test_fs_basic_use(small_buffer, fs_module_name, use_linked_fs):
     """Test frameserver basic registration and sequential flow across processes."""
@@ -153,8 +165,9 @@ def __unified_consumer_worker(fs_module_name, fs_obj, cid, stop_event, fetch_siz
         server.close()
         print(f"Consumer ({cid}) closed.")
 
-def __unified_producer_worker(rb_obj, stop_event, batch_size, result_queue, delay_mean=0.0, delay_std=0.0):
-    buffer = ProcessSafeSharedRingBuffer(create=False, source_buffer=rb_obj)
+def __unified_producer_worker(fs_module_name, rb_obj, stop_event, batch_size, result_queue, delay_mean=0.0, delay_std=0.0):
+    RBClass = get_rb_class(fs_module_name)
+    buffer = RBClass(create=False, source_buffer=rb_obj)
     print(f"Successfully create subprocess producer: {os.getpid()}")
     i = 0
     while not stop_event.is_set():
@@ -170,7 +183,7 @@ def __unified_producer_worker(rb_obj, stop_event, batch_size, result_queue, dela
     result_queue.put(i * batch_size) # 乘以 batch_size 送出实际的帧总数
     buffer.close()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3", "frameserver.v4"])
 def test_fs_concurrent_single_consumer(empty_buffer, fs_module_name):
     """Test concurrent polling inside single CID yielding strictly ordered tickets via MP."""
     fs_mod = importlib.import_module(fs_module_name)
@@ -181,7 +194,7 @@ def test_fs_concurrent_single_consumer(empty_buffer, fs_module_name):
     
     # Stress the server
     tx_queue = ctx.Queue()
-    producer = ctx.Process(target=__unified_producer_worker, args=(empty_buffer, tx_stop_event, 1, tx_queue))
+    producer = ctx.Process(target=__unified_producer_worker, args=(fs_module_name, empty_buffer, tx_stop_event, 1, tx_queue))
     producer.start()
         
     rx_queues = [ctx.Queue() for _ in range(5)]
@@ -228,7 +241,7 @@ def test_fs_concurrent_single_consumer(empty_buffer, fs_module_name):
     server.close()
     server.unlink()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3", "frameserver.v4"])
 def test_fs_multi_cid_parallel(empty_buffer, fs_module_name):
     """Test full system saturation with 32 distinct consumers reading concurrently via True MP."""
     fs_mod = importlib.import_module(fs_module_name)
@@ -239,7 +252,7 @@ def test_fs_multi_cid_parallel(empty_buffer, fs_module_name):
     
     tx_queue = ctx.Queue()
     # Batch=5 increases producer throughput while fetch=1 checks all sequences meticulously.
-    producer = ctx.Process(target=__unified_producer_worker, args=(empty_buffer, tx_stop_event, 5, tx_queue))
+    producer = ctx.Process(target=__unified_producer_worker, args=(fs_module_name, empty_buffer, tx_stop_event, 5, tx_queue))
     producer.start()
     
     rx_queues = [ctx.Queue() for _ in range(32)]
@@ -272,7 +285,7 @@ def test_fs_multi_cid_parallel(empty_buffer, fs_module_name):
     server.close()
     server.unlink()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3", "frameserver.v4"])
 def test_fs_pipeline_backpressure(small_buffer, fs_module_name):
     """Test fast consumer starvation and producer locking by a slow consumer."""
     fs_mod = importlib.import_module(fs_module_name)
@@ -320,7 +333,8 @@ def test_fs_pipeline_backpressure(small_buffer, fs_module_name):
 def __barrier_producer(fs_module_name, fs_obj, rb_obj, stop_event):
     fs_mod = importlib.import_module(fs_module_name)
     server = fs_mod.FrameServer(create=False, frameserver=fs_obj)
-    buffer = ProcessSafeSharedRingBuffer(create=False, source_buffer=rb_obj)
+    RBClass = get_rb_class(fs_module_name)
+    buffer = RBClass(create=False, source_buffer=rb_obj)
     buffer.trigger_release = server._gc
     
     counter = 0
@@ -360,7 +374,7 @@ def __barrier_stalker(fs_module_name, fs_obj, stop_event, result_queue):
     result_queue.put(tearing_cnt)
     server.close()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3", "frameserver.v4"])
 def test_fs_async_sync_barrier(empty_buffer, fs_module_name):
     """Stress test tearing memory guard via get_async_copy alongside a real sync consumer."""
     fs_mod = importlib.import_module(fs_module_name)
@@ -387,7 +401,7 @@ def test_fs_async_sync_barrier(empty_buffer, fs_module_name):
     assert tearing_cnt == 0
     server.close(); server.unlink()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3", "frameserver.v4"])
 def test_fs_release_async_ticket_raises(small_buffer, fs_module_name):
     """Test that trying to release an async ticket raises ValueError."""
     fs_mod = importlib.import_module(fs_module_name)
@@ -406,7 +420,7 @@ def test_fs_release_async_ticket_raises(small_buffer, fs_module_name):
         
     server.close(); server.unlink()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3", "frameserver.v4"])
 def test_fs_consumer_drop(small_buffer, fs_module_name):
     """Test drop-consumer triggering explicit buffer eviction."""
     fs_mod = importlib.import_module(fs_module_name)
@@ -436,7 +450,7 @@ def test_fs_consumer_drop(small_buffer, fs_module_name):
     server.close()
     server.unlink()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3", "frameserver.v4"])
 def test_fs_unregister_usage_denial(small_buffer, fs_module_name):
     """Test post-unregistered CID operations correctly get blocked or silenced."""
     fs_mod = importlib.import_module(fs_module_name)
@@ -460,7 +474,7 @@ def test_fs_unregister_usage_denial(small_buffer, fs_module_name):
     server.close()
     server.unlink()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3", "frameserver.v4"])
 @pytest.mark.parametrize("cons_num, prod_params, cons_params", [
     # 消费者数, 生产(均值,方差)秒, 消费(均值,方差)秒
     # 场景 1：极速并发（测试锁和调度的最高吞吐争抢）
@@ -487,7 +501,7 @@ def test_fs_stochastic_stress(empty_buffer, fs_module_name, cons_num, prod_param
     tx_queue = ctx.Queue()
     producer = ctx.Process(
         target=__unified_producer_worker, 
-        args=(empty_buffer, tx_stop_event, 5, tx_queue, prod_params[0], prod_params[1])
+        args=(fs_module_name, empty_buffer, tx_stop_event, 5, tx_queue, prod_params[0], prod_params[1])
     )
     producer.start()
     
@@ -526,7 +540,7 @@ def test_fs_stochastic_stress(empty_buffer, fs_module_name, cons_num, prod_param
     server.close()
     server.unlink()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3", "frameserver.v4"])
 def test_fs_no_consumer_async_read(small_buffer, fs_module_name):
     """
     Test scenario: No consumers registered, producer keeps putting frames, 
@@ -567,7 +581,7 @@ def test_fs_no_consumer_async_read(small_buffer, fs_module_name):
     server.close()
     server.unlink()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3", "frameserver.v4"])
 def test_fs_rw_during_registration(small_buffer, fs_module_name):
     """
     Test scenario: Consumer registered as historical_data=True should block 
@@ -617,7 +631,8 @@ def test_fs_rw_during_registration(small_buffer, fs_module_name):
 def __async_contention_producer(fs_module_name, fs_obj, rb_obj, stop_event, result_queue):
     fs_mod = importlib.import_module(fs_module_name)
     server = fs_mod.FrameServer(create=False, frameserver=fs_obj)
-    buffer = ProcessSafeSharedRingBuffer(create=False, source_buffer=rb_obj)
+    RBClass = get_rb_class(fs_module_name)
+    buffer = RBClass(create=False, source_buffer=rb_obj)
     buffer.trigger_release = server._gc
     
     put_count = 0
@@ -633,7 +648,7 @@ def __async_contention_producer(fs_module_name, fs_obj, rb_obj, stop_event, resu
     result_queue.put({"put_count": put_count, "timeout_count": timeout_count})
     buffer.close(); server.close()
 
-@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3"])
+@pytest.mark.parametrize("fs_module_name", ["frameserver.v2", "frameserver.v3", "frameserver.v4"])
 def test_fs_async_gc_lock_contention(small_buffer, fs_module_name):
     """Stress test to ensure put() does not timeout when gc_lock is heavily contested by async consumers."""
     fs_mod = importlib.import_module(fs_module_name)
