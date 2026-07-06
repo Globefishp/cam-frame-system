@@ -35,6 +35,10 @@
 #             The buffer can call this when `put()` needs more space.
 #         Loguru logging when success. (260421)
 #         Clean up unnecessary check, "let it crash".
+#   - v5: `.release()` now have an optional `callback` kwarg, which allows
+#         user to execute callback function with planned `release_num` 
+#         before the actual release (pointer moving). All API are backwardly 
+#         compatible with v4. (260706)
 
 
 # for infrastructure, raise instead of logging

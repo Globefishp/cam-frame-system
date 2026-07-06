@@ -21,6 +21,12 @@ conda install numba tqdm
 
 ## 版本日志
 
+### V2.0-pre6
+- 合并部分上游代码修正: 多进程RPC通信可能产生Race condition, 导致与相机通信崩溃; 
+- 底层FrameServer和RingBuffer修正: 
+    - 由于FrameServer的一个TOCTOU问题, 编码视频有时候会丢弃采集的最后一帧.
+    - 由于并发竞争, 新组件注册到FrameServer可能会获取到过时数据, 抛出TicketExpireException. 不过这个问题目前还没有造成任何实质影响.
+
 ### V2.0-pre5
 - 修正相机软件ISP中可能出现内存越界行为, 修正调用链.
 - 修正相机预览和录制时rgb/bgr通道反向问题.
