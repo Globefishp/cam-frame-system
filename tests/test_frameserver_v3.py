@@ -12,12 +12,6 @@ import time
 import multiprocessing as mp
 import random
 
-from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer as RB_v4
-from ringbuffers.shared_ring_buffer_v5 import ProcessSafeSharedRingBuffer as RB_v5
-
-def get_rb_class(fs_module_name):
-    return RB_v5 if fs_module_name == "frameserver.v4" else RB_v4
-
 import importlib
 
 ctx = mp.get_context("spawn")
@@ -25,10 +19,11 @@ ctx = mp.get_context("spawn")
 @pytest.fixture
 def ring_buffer_class(request):
     try:
-        fs_mod = request.getfixturevalue("fs_module_name")
+        fs_mod_name = request.getfixturevalue("fs_module_name")
     except Exception:
-        fs_mod = "frameserver.v4"
-    return get_rb_class(fs_mod)
+        fs_mod_name = "frameserver.v4"
+    fs_mod = importlib.import_module(fs_mod_name)
+    return fs_mod.ProcessSafeSharedRingBuffer
 
 @pytest.fixture
 def empty_buffer(ring_buffer_class):
@@ -188,7 +183,8 @@ def __spin_delay(delay_sec):
         pass
 
 def __unified_producer_worker(fs_module_name, rb_obj, stream_id, stop_event, batch_size, result_queue, delay_mean=0.0, delay_std=0.0, timeout=0.05):
-    RBClass = get_rb_class(fs_module_name)
+    fs_mod = importlib.import_module(fs_module_name)
+    RBClass = fs_mod.ProcessSafeSharedRingBuffer
     buffer = RBClass(create=False, source_buffer=rb_obj)
     i = 0
     timeouts = 0

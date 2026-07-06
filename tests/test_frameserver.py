@@ -9,8 +9,7 @@ import numpy as np
 from typing import List
 
 # 假设你的代码结构如下
-from ringbuffers.shared_ring_buffer_v2a import ProcessSafeSharedRingBuffer
-from frameserver.v1 import FrameServer
+from frameserver.v1 import FrameServer, ProcessSafeSharedRingBuffer
 
 # ==========================================
 # 测试夹具 (Fixtures)

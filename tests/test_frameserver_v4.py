@@ -14,21 +14,16 @@ import time
 import multiprocessing as mp
 import numpy as np
 
-from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer as RB_v4
-from ringbuffers.shared_ring_buffer_v5 import ProcessSafeSharedRingBuffer as RB_v5
-
-def get_rb_class(fs_module_name):
-    return RB_v5 if fs_module_name == "frameserver.v4" else RB_v4
-
 ctx = mp.get_context("spawn")
 
 @pytest.fixture
 def ring_buffer_class(request):
     try:
-        fs_mod = request.getfixturevalue("fs_module_name")
+        fs_mod_name = request.getfixturevalue("fs_module_name")
     except Exception:
-        fs_mod = "frameserver.v4"
-    return get_rb_class(fs_mod)
+        fs_mod_name = "frameserver.v4"
+    fs_mod = importlib.import_module(fs_mod_name)
+    return fs_mod.ProcessSafeSharedRingBuffer
 
 @pytest.fixture
 def empty_buffer(ring_buffer_class):
@@ -45,7 +40,7 @@ def empty_buffer(ring_buffer_class):
 def __producer_worker(fs_module_name, fs_obj, rb_obj, stop_event):
     fs_mod = importlib.import_module(fs_module_name)
     server = fs_mod.FrameServer(create=False, frameserver=fs_obj)
-    RBClass = get_rb_class(fs_module_name)
+    RBClass = fs_mod.ProcessSafeSharedRingBuffer
     buffer = RBClass(create=False, source_buffer=rb_obj)
     buffer.trigger_release = server._gc
     
@@ -160,7 +155,8 @@ def test_fs_register_gc_race(empty_buffer, fs_module_name):
 # ==============================================================================
 
 def __lost_wakeup_producer(fs_module_name, fs_obj, rb_obj, ready_event, stop_event, result_queue):
-    RBClass = get_rb_class(fs_module_name)
+    fs_mod = importlib.import_module(fs_module_name)
+    RBClass = fs_mod.ProcessSafeSharedRingBuffer
     buffer = RBClass(create=False, source_buffer=rb_obj)
     
     import random

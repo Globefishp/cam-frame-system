@@ -21,21 +21,16 @@ import multiprocessing as mp
 import random
 import importlib
 
-from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer as RB_v4
-from ringbuffers.shared_ring_buffer_v5 import ProcessSafeSharedRingBuffer as RB_v5
-
-def get_rb_class(fs_module_name):
-    return RB_v5 if fs_module_name == "frameserver.v4" else RB_v4
-
 ctx = mp.get_context("spawn")
 
 @pytest.fixture
 def ring_buffer_class(request):
     try:
-        fs_mod = request.getfixturevalue("fs_module_name")
+        fs_mod_name = request.getfixturevalue("fs_module_name")
     except Exception:
-        fs_mod = "frameserver.v4"
-    return get_rb_class(fs_mod)
+        fs_mod_name = "frameserver.v4"
+    fs_mod = importlib.import_module(fs_mod_name)
+    return fs_mod.ProcessSafeSharedRingBuffer
 
 @pytest.fixture
 def empty_buffer(ring_buffer_class):
@@ -166,7 +161,8 @@ def __unified_consumer_worker(fs_module_name, fs_obj, cid, stop_event, fetch_siz
         print(f"Consumer ({cid}) closed.")
 
 def __unified_producer_worker(fs_module_name, rb_obj, stop_event, batch_size, result_queue, delay_mean=0.0, delay_std=0.0):
-    RBClass = get_rb_class(fs_module_name)
+    fs_mod = importlib.import_module(fs_module_name)
+    RBClass = fs_mod.ProcessSafeSharedRingBuffer
     buffer = RBClass(create=False, source_buffer=rb_obj)
     print(f"Successfully create subprocess producer: {os.getpid()}")
     i = 0
@@ -333,7 +329,7 @@ def test_fs_pipeline_backpressure(small_buffer, fs_module_name):
 def __barrier_producer(fs_module_name, fs_obj, rb_obj, stop_event):
     fs_mod = importlib.import_module(fs_module_name)
     server = fs_mod.FrameServer(create=False, frameserver=fs_obj)
-    RBClass = get_rb_class(fs_module_name)
+    RBClass = fs_mod.ProcessSafeSharedRingBuffer
     buffer = RBClass(create=False, source_buffer=rb_obj)
     buffer.trigger_release = server._gc
     
@@ -631,7 +627,7 @@ def test_fs_rw_during_registration(small_buffer, fs_module_name):
 def __async_contention_producer(fs_module_name, fs_obj, rb_obj, stop_event, result_queue):
     fs_mod = importlib.import_module(fs_module_name)
     server = fs_mod.FrameServer(create=False, frameserver=fs_obj)
-    RBClass = get_rb_class(fs_module_name)
+    RBClass = fs_mod.ProcessSafeSharedRingBuffer
     buffer = RBClass(create=False, source_buffer=rb_obj)
     buffer.trigger_release = server._gc
     

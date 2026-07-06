@@ -1,5 +1,6 @@
-from .frameserver import FrameServer
+from .frameserver import FrameServer, ProcessSafeSharedRingBuffer
 
 __all__ = [
-    "FrameServer"
+    "FrameServer",
+    "ProcessSafeSharedRingBuffer", # expose the compatible ring buffer
 ]
