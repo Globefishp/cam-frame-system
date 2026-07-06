@@ -4,8 +4,7 @@ import time
 import numpy as np
 from typing import Optional, Tuple, List, Type, Any
 
-from ringbuffers.shared_ring_buffer_v4 import ProcessSafeSharedRingBuffer
-from frameserver.v3 import FrameServer, FrameTicket, TicketExpireException
+from frameserver import FrameServer, FrameTicket, TicketExpireException, ProcessSafeSharedRingBuffer
 from utils.mp_obj_proxy import MpObjProxy
 from cameras.abstractcamera import AbstractCamera, CamException
 from encoders.videoencoder_v3 import BaseVideoEncoder
@@ -67,6 +66,12 @@ class CameraProcess(mp.Process):
             if logger: logger.warning("Cannot get hw_timecode_timebase, assuming 1.")
             timebase = 1
         try:
+            # actually, can be acquired from frame NDArray.dtype
+            frame_dtype = camera.dtype
+        except AttributeError:
+            if logger: logger.warning("Cannot get dtype, assuming uint8.")
+            frame_dtype = np.uint8
+        try:
             while not self.exit_event.is_set():
                 # Wait for start signal
                 self.start_event.wait(timeout=0.1)
@@ -90,7 +95,13 @@ class CameraProcess(mp.Process):
                             # Lazy init burner
                             if self._ts_burner is None:
                                 factor = min(3, max(1, min(frame.shape[0], frame.shape[1]) // 720))
-                                self._ts_burner = FastDigitsOverlay(x=8*factor, y=8*factor, scale=factor)
+                                if frame_dtype == np.uint8: white_val = 255
+                                elif frame_dtype == np.uint16: white_val = 65535
+                                elif frame_dtype == np.float32: white_val = 1
+                                self._ts_burner = FastDigitsOverlay(
+                                    x=8*factor, y=8*factor, scale=factor, 
+                                    border_val=0, text_val=white_val
+                                )
 
                             # Prepare timestamp string
                             ts_str = time.strftime("%Y-%m-%d %H:%M:%S")
