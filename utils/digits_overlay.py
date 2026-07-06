@@ -19,14 +19,18 @@ GLYPHS = {
 }
 
 class FastDigitsOverlay:
-    def __init__(self, x: int=0, y: int=0, scale: int=2):
+    def __init__(self, x: int=0, y: int=0, scale: int=2, border_val: int=0, text_val: int=255):
         """
         :param x: X coordinate in pixel (upper-left)
         :param y: Y coordinate in pixel (upper-left)
         :param scale: scale factor. 1 ~ 80 us; 2 ~ 140 us; 3 ~ 220 us
+        :param border_val: border greyscale. default 0
+        :param text_val: text greyscale, should be set according to your frame dtype. 
+            default 255
         """
         self.x, self.y = x, y
         self.scale = scale
+        self.border_val, self.text_val = border_val, text_val
         self.last_time_str = ""
         
         self.char_masks = self._preprocess_glyphs()
@@ -68,8 +72,8 @@ class FastDigitsOverlay:
 
         roi = frame[self.y : self.y + self.h, self.x : self.x + self.w]
         
-        roi[self.cached_border_mask] = 0
-        roi[self.cached_text_mask] = 255
+        roi[self.cached_border_mask] = self.border_val
+        roi[self.cached_text_mask] = self.text_val
 
     def _update_cache(self, text):
         """Create mask for text"""
