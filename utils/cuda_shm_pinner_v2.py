@@ -37,7 +37,7 @@ class CUDAPinner:
         if err != cuda.CUresult.CUDA_SUCCESS:
             _, err_name = cuda.cuGetErrorName(err)
             _, err_str = cuda.cuGetErrorString(err)
-            raise RuntimeError(f"CUDA Error [{err.name}]: {err_str}")
+            raise RuntimeError(f"CUDA Error [{err.name}]: {err_str.decode('utf-8')}")
 
     @contextmanager
     def _use_primary_context(self):
