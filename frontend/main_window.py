@@ -1,4 +1,5 @@
 import sys
+from typing import Optional, List, Type, Callable, Any
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QSlider, QFileDialog, QLineEdit, 
                              QSizePolicy, QGroupBox)
@@ -6,18 +7,31 @@ from PySide6.QtCore import Qt, QTimer
 
 from frontend.gl_widget import CameraDisplayWidget
 from frontend.gl_upload_thread import GLTextureUploadThread
-from frontend.capture_widget import CaptureWidget
-from frontend.record_widget import RecordWidget
-from frontend.analyzer_widget import AnalyzerWidget
+
+from loguru._logger import Logger # for type hinting only
 
 class MainWindow(QMainWindow):
     """
     Main Application Window. Manages UI layout and interactions.
     """
-    def __init__(self, backend):
+    def __init__(self, backend, 
+                 panel_classes: Optional[List[Type[QWidget]]] = None, 
+                 panel_kwargs: Optional[List[dict]] = None,
+                 post_panel_init: Optional[Callable[[List[QWidget]], None]] = None,
+                 inject_logger: Optional[Logger] = None):
         super().__init__()
         self.backend = backend
         self._is_capturing = False # For deciding if vsync should be sent to render thread
+        
+        # Logger Setup
+        if inject_logger is not None:
+            if isinstance(inject_logger, Logger):
+                self._logger = inject_logger.bind(friendly_name="Backend")
+            else:
+                raise TypeError("inject_logger must be a loguru.Logger instance.")
+        else:
+            self._logger = None
+
         self.setWindowTitle("Camera System - PySide6 + ModernGL")
         self.setGeometry(100, 100, 1000, 700)
 
@@ -36,19 +50,51 @@ class MainWindow(QMainWindow):
         controls_widget.setMinimumWidth(280)
         controls_layout = QVBoxLayout(controls_widget)
 
-        # 1. Capture Controls (Top)
-        self.capture_widget = CaptureWidget(self.backend)
-        controls_layout.addWidget(self.capture_widget)
-
-        # 2. Recording Controls
-        self.record_widget = RecordWidget(self.backend)
-        controls_layout.addWidget(self.record_widget)
+        # Initialize injected panels
+        panel_classes = panel_classes or []
+        panel_kwargs = panel_kwargs or []
+        self.panel_widgets: List[QWidget] = []
         
-        # 3. Analyzer Controls
-        self.analyzer_widget = AnalyzerWidget(self.backend)
-        controls_layout.addWidget(self.analyzer_widget)
-        # Connect bboxes to draw signal
-        self.analyzer_widget.bboxes_to_draw.connect(self.display_widget.update_overlay_lines)
+        _capture_toggled_registered = False
+        _bboxes_to_draw_registered = False
+
+        for idx, WidgetClass in enumerate(panel_classes):
+            kwargs = panel_kwargs[idx] if idx < len(panel_kwargs) else {}
+            kwargs.update({'backend': self.backend})
+            # Fail-fast: Init widget, expecting it supports `NeedBackend` protocol
+            widget = WidgetClass(**kwargs)
+
+            # Contract check: Lifecycle method `stop`
+            if not hasattr(widget, 'stop') or not callable(getattr(widget, 'stop')):
+                err_msg = f"QWidget {WidgetClass.__name__} missing lifecycle method '.stop()'"
+                raise TypeError(err_msg)
+
+            # Duck-typing wiring: SendCaptureState
+            if hasattr(widget, 'capture_toggled'):
+                if _capture_toggled_registered:
+                    if self._logger:
+                        self._logger.warning("Multiple widgets has the capability of "
+                            f"'SendCaptureState', only the first one will take effect, skipping {WidgetClass.__name__}")
+                else:
+                    widget.capture_toggled.connect(self._on_capture_toggled)
+                    _capture_toggled_registered = True
+
+            # Duck-typing wiring: SendBBoxDrawing
+            if hasattr(widget, 'bboxes_to_draw'):
+                if _bboxes_to_draw_registered:
+                    if self._logger:
+                        self._logger.warning("Multiple widgets has the capability of "
+                            f"'SendBBoxDrawing', only the first one will take effect, skipping {WidgetClass.__name__}")
+                else:
+                    widget.bboxes_to_draw.connect(self.display_widget.update_overlay_lines)
+                    _bboxes_to_draw_registered = True
+
+            self.panel_widgets.append(widget)
+            controls_layout.addWidget(widget)
+
+        # Custom post-init operations from caller
+        if post_panel_init is not None:
+            post_panel_init(self.panel_widgets)
 
         controls_layout.addStretch(1)
 
@@ -67,9 +113,6 @@ class MainWindow(QMainWindow):
         self.status_timer.start(500)
 
         main_layout.addWidget(controls_widget, 1)
-
-        # --- Connect Signals ---
-        self.capture_widget.capture_toggled.connect(self._on_capture_toggled)
 
         # --- Render Thread & VSync Setup ---
         # Force context creation for the main widget so we can share it
@@ -106,27 +149,25 @@ class MainWindow(QMainWindow):
             self.render_thread.vsync_event.set()
             self.display_widget.update()
 
-    def _on_capture_toggled(self, checked):
-        """Handle capture state changes from CaptureWidget."""
+    def _on_capture_toggled(self, checked: bool):
+        """Handle capture state changes and broadcast to SenseCaptureState widgets."""
         self._is_capturing = checked
-        # Update record widget state
-        self.record_widget.set_capture_active(checked)
+        for widget in self.panel_widgets:
+            method: Optional[Callable[[bool], None]] = getattr(widget, 'set_capture_active', None)
+            if method:
+                method(checked)
 
     def closeEvent(self, event):
         """Handle cleanup on exit."""
-        # Notify widgets to cleanup their own resources
-        if hasattr(self, 'capture_widget'):
-            self.capture_widget.stop()
-
-        if hasattr(self, 'record_widget'):
-            self.record_widget.stop()
-            
-        # Notify analyzer widget to cleanup its own resources (worker thread, plot window)
-        if hasattr(self, 'analyzer_widget'):
-            self.analyzer_widget.stop()
+        # Notify all injected widgets to cleanup their own resources
+        for widget in self.panel_widgets:
+            try:
+                widget.stop()
+            except Exception as e:
+                if self._logger:
+                    self._logger.opt(exception=e).error(f"Error closing widget when calling {widget.__class__.__name__}.stop()")
         
         if getattr(self, 'render_thread', None):
-            # self.render_thread.frame_ready.disconnect()
             self.render_thread.stop()
             
         event.accept()

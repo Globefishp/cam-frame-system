@@ -116,7 +116,21 @@ def main():
     # 5. Create UI
     # TODO: The main window now use serveral reference to internal object of backend:
     # including analyzer, frame_server. maybe someday refactor it to have better structure...
-    window = MainWindow(backend)
+
+    # Inject right-side panel widgets
+    from frontend.capture_widget import CaptureWidget
+    from frontend.record_widget import RecordWidget
+    from frontend.analyzer_widget import AnalyzerWidget
+    
+    panel_classes = [CaptureWidget, RecordWidget, AnalyzerWidget]
+    panel_kwargs = [{}, {}, {}]
+    
+    window = MainWindow(
+        backend, 
+        panel_classes=panel_classes, 
+        panel_kwargs=panel_kwargs, 
+        inject_logger=logger
+    )
     
     # 6. Show GUI and enter event loop
     window.show()
