@@ -9,7 +9,8 @@ from multiprocessing.connection import Connection
 import threading as t
 import time
 from abc import ABC, abstractmethod
-from typing import Optional, Any, Union, Callable, Tuple, List, Dict, TypeVar, cast, TYPE_CHECKING
+from typing import Optional, Any, Union, Callable, Tuple, List, Dict, TypeVar, Deque, cast, TYPE_CHECKING
+from collections import deque
 from functools import wraps
 import numpy as np
 from numpy.typing import NDArray
@@ -61,6 +62,7 @@ class BaseAnalyzer(ABC):
                  device: DeviceType = DeviceType.CPU,
                  consumer_mode: ConsumerMode = ConsumerMode.ASYNC,
                  continuous_mode: bool = True,
+                 keep_last_n: int = 1,
                  fetch_timeout: float = 0.1,        # Timeout for fetching a single frame.
                  stat_interval: float = 1.0,
                  extinfo_extractor: Optional[Callable[[NDArray,], Tuple[NDArray, List[Dict[str, Any]]]]] = None,
@@ -84,6 +86,10 @@ class BaseAnalyzer(ABC):
             continuous_mode (bool): Control the behaviour of the worker loop. 
                 `continuous_mode=True` will fetch and analyze frames continuously. 
                 `continuous_mode=False` will wait for explicit `step()` calls.
+            keep_last_n (int): Number of historical frame batches to keep alive in the 
+                `FrameServer.buffer` when next `_analyze()` is called. Only effective when 
+                consumer_mode is `ConsumerMode.SYNC`. Useful for stateful analyzers to refer 
+                previous frames, or preventing buffer underflow. Default 1.
             fetch_timeout (float): Timeout for fetching a single frame.
             stat_interval (float): Interval for statistics update.
             extinfo_extractor (Optional[Callable[[NDArray,], Tuple[NDArray, List[Dict[str, Any]]]]]):
@@ -104,6 +110,8 @@ class BaseAnalyzer(ABC):
         self._device            = device
         self._consumer_mode     = consumer_mode
         self._continuous_mode   = continuous_mode
+        self._keep_last_n       = keep_last_n
+        self._MAX_BUF_N         = frame_server.buffer.buffer_capacity
         self._fetch_timeout     = fetch_timeout if consumer_mode == ConsumerMode.SYNC else 0.0 # get_async is non-blocking
         self._stat_interval     = stat_interval
         self._extinfo_extractor = extinfo_extractor
@@ -462,7 +470,7 @@ class BaseAnalyzer(ABC):
         time_last_check = time.monotonic()
 
         # Event loop local variables
-        last_ticket: Optional[FrameTicket] = None
+        historical_tickets: Deque[FrameTicket] = deque(maxlen=self._MAX_BUF_N)
         ticket:      Optional[FrameTicket] = None
 
         # Main Event Loop
@@ -491,7 +499,6 @@ class BaseAnalyzer(ABC):
                 try:
                     if self._consumer_mode == ConsumerMode.SYNC:
                         ticket = frame_server.get_sync(cid, self._batch_size, timeout=self._fetch_timeout)
-                        if last_ticket is not None: frame_server.release_sync(last_ticket)
                     else:
                         ticket = frame_server.get_async(self._batch_size) # TODO: get_async_copy?
                 except Exception as e:
@@ -571,7 +578,11 @@ class BaseAnalyzer(ABC):
                         self._status_subdict_update('error', {step_id if not self._continuous_mode else -1: f"Unexpected analysis error: {e}"})
 
                 if self._consumer_mode == ConsumerMode.SYNC:
-                    last_ticket = ticket # defer release to next iteration
+                    historical_tickets.append(ticket)
+                    ticket = None
+                    while len(historical_tickets) > self._keep_last_n: # release old tickets.
+                        to_release = historical_tickets.popleft()
+                        frame_server.release_sync(to_release)
                 
                 if not self._continuous_mode: 
                     with self._step_cond: self._step_pending = False
@@ -593,7 +604,8 @@ class BaseAnalyzer(ABC):
             
             if self._consumer_mode == ConsumerMode.SYNC:
                 if ticket is not None: frame_server.release_sync(ticket)
-                if last_ticket is not None: frame_server.release_sync(last_ticket)
+                for to_release in historical_tickets:
+                    if to_release is not None: frame_server.release_sync(to_release)
             
             frame_server.close()
             logger.success("Analyzer worker cleanup completed.")
