@@ -120,9 +120,9 @@ def main():
     # Inject right-side panel widgets
     from frontend.capture_widget import CaptureWidget
     from frontend.record_widget import RecordWidget
-    from frontend.analyzer_widget import AnalyzerWidget
+    from frontend.analyzer_widget import YOLOAnalyzerWidget
     
-    panel_classes = [CaptureWidget, RecordWidget, AnalyzerWidget]
+    panel_classes = [CaptureWidget, RecordWidget, YOLOAnalyzerWidget]
     panel_kwargs = [{}, {}, {}]
     
     window = MainWindow(
