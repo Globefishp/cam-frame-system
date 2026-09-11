@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 from .yolo_analyzer import YOLOBaseAnalyzer
 from .analyzer_types import DeviceType
+from .ops import GridTiling
 
 class TimecodeExtractor(Protocol):
     def __call__(self, image: NDArray, **kwargs: Any) -> tuple[NDArray, List[Dict[str, Any]]]:
@@ -95,6 +96,13 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
         
         self._tile_grids: List[Tuple[int, int]] = tile_grids
         self._tile_shape: Tuple[int, int] = tile_shape
+        self._tiling_op = GridTiling(
+            grid_coords=self._tile_grids,
+            tile_shape=self._tile_shape,
+            tiling_axes=(1, 2),
+            axis=1,
+            permute=(0, 3, 1, 2)
+        )
         
         # Fallback to standard RGB->Gray luminance weights
         if color_weights is None:
@@ -190,20 +198,8 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
         # Shape: (B * N, C, H_t, W_t)
         tiles = torch.empty((B * N, C, H_t, W_t), dtype=torch.float32, device=frames.device)
         
-        for i, (tx, ty) in enumerate(self._tile_grids):
-            # Slice the patch (B, H_t, W_t, C) and permute to (B, C, H_t, W_t)
-            # view, no extra memory copy
-            patch = frames[:, ty:ty+H_t, tx:tx+W_t, :].permute(0, 3, 1, 2)
-            
-            # Copy to pre-allocated tensor with fused Normalization
-            # i::N perfectly maps the batch size for N tiles.
-            if frames.dtype == torch.uint8:
-                tiles[i::N] = patch.float() / 255.0
-            elif frames.dtype in (torch.int16, torch.uint16, torch.int32): 
-                # 16-bit images loaded via generic pipelines are often int16/int32
-                tiles[i::N] = patch.float() / 65535.0
-            else:
-                tiles[i::N] = patch.float()
+        # GridTiling handles slicing, permutation, normalization, and memory placement natively
+        self._tiling_op.process(frames, out=tiles.view(B, N, C, H_t, W_t))
             
         metadata = {
             "batch_size": B,
@@ -258,11 +254,16 @@ class YOLOPosColorAnalyzer(YOLOBaseAnalyzer):
 
                 if tile_best_bbox is not None:
                     # Calculate global offsets
-                    x_offset, y_offset = self._tile_grids[i]
-                    x1 = max(0,      tile_best_bbox[0].item() + x_offset)
-                    y1 = max(0,      tile_best_bbox[1].item() + y_offset)
-                    x2 = min(orig_w, tile_best_bbox[2].item() + x_offset)
-                    y2 = min(orig_h, tile_best_bbox[3].item() + y_offset)
+                    x1_local, y1_local = tile_best_bbox[0].item(), tile_best_bbox[1].item()
+                    x2_local, y2_local = tile_best_bbox[2].item(), tile_best_bbox[3].item()
+                    
+                    x1, y1 = self._tiling_op.to_global_coord((i, x1_local, y1_local))
+                    x2, y2 = self._tiling_op.to_global_coord((i, x2_local, y2_local))
+                    
+                    x1 = max(0, x1)
+                    y1 = max(0, y1)
+                    x2 = min(orig_w, x2)
+                    y2 = min(orig_h, y2)
                     global_bbox = (x1, y1, x2, y2)
                     
                     cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
