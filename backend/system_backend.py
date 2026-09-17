@@ -51,7 +51,7 @@ class CameraProcess(mp.Process):
         self.camera_proxy.start_service_thread()
         # Use bare camera to avoid RPC lock allowing concurrent grab and property get/set (avoid blocking UI).
         # This is usually ok, will not cause race condition (but not documented in AbstractCamera)
-        camera = bare_camera 
+        camera: AbstractCamera = bare_camera 
         
         try:
             camera.open()
@@ -372,7 +372,8 @@ class HeadlessBackend: # TODO: Rename as Backend????
 
     # For preview thread
     def get_preview(self, size: int=1, timeout: Optional[float]=None) -> Tuple[Optional[FrameTicket], Optional[List[np.ndarray]]]:
-        """Provides Zero-copy async access to the latest frames."""
+        """Provides Zero-copy async access to the latest frames. 
+        Note that the extra line in the frame is not stripped."""
         if self.frame_server is None:
             return None, None
         ticket = self.frame_server.get_async(size)

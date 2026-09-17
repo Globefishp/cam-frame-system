@@ -484,6 +484,7 @@ class HuatengCamera(AC):
             # No need for copy here, see speed test below.
             raw_data_np = np.frombuffer(raw_data_ctypes, dtype=np.uint8)
 
+            # This block will ensure the final returned array is a copy independent from the SDK's buffer.
             if self._bit_depth == BitDepth._8:
                 raw_data_np = raw_data_np.copy().reshape((self._image_height + self._extra_rows), self._image_width)
             elif self._bit_depth == BitDepth._12:
@@ -534,12 +535,19 @@ class HuatengCamera(AC):
         frame, tc_val = self._grab_extendedbuf_metadata()
         if frame is None: return None, {}
 
-        # TODO: Update the processor with `out` option to: 1. reduce malloc; 
-        frame = self._processor.process(frame) # output dimension is defined when processor init (related with timecode enable or not)
-
-        if self._bit_depth == BitDepth._8: 
-            # not continuous, zero-copy.
-            frame = frame.view(np.uint8)[..., _UINT16_HIGHBYTE::2] 
+        if self.channels == 3: # Color camera, Debayer
+            # TODO: Update the processor with `out` option (Done in V12)
+            # TODO: Specific 8 bit pathway to reduce extra frame copy of 8 bit image (in processor).
+            frame: NDArray[np.uint16] = self._processor.process(frame) # output dimension is defined when processor init (related with timecode enable or not)
+            # TODO: V11 strictly need the same frame.shape as `__init__` (see `.process()` docstring). 
+            #       Detect `frame.shape` for each `.process()` to avoid extra line being debayerred (Done in V12)
+            if self._bit_depth == BitDepth._8: 
+                # not continuous, zero-copy.
+                frame = frame.view(np.uint8)[..., _UINT16_HIGHBYTE::2] 
+        elif self.channels == 1: # Mono camera
+            pass # Pass NDArray from upstream as-is (uint16 or uint8)
+        else: 
+            raise CamException(f"HAL do not support current number of channels ({self.channels}).", src_func="HuatengCamera.grab_extended_info")
         
         # Write metadata to extra_line, 
         metadata = HuatengCamera.HuatengCamMetadata(hw_timecode=tc_val)
