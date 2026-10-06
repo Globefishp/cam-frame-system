@@ -485,6 +485,13 @@ class AbstractCamera(ABC):
     def dtype(self) -> np.dtype:
         """Get image data type (e.g. np.uint8)"""
         return np.dtype(np.uint8)
+
+    @property
+    def range(self) -> Tuple[int, int]:
+        """
+        Get the effective value range of the image data. Default is inferred from `.dtype`
+        """
+        return (np.iinfo(self.dtype).min, np.iinfo(self.dtype).max)
     
     @property
     def frame_size_bytes(self) -> int:
