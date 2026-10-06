@@ -21,7 +21,7 @@ from . import mvsdk_mod as mvsdk
 from .mvsdk_mod import CameraException as MvCamException
 from .extensions.unpack_12bit_raw import unpack_12bit_to_16bit_fast
 from .extensions.PreciseTimer import PreciseTimer
-from .extensions.raw_processing_cy_V11 import RawV11Processor
+from .extensions.raw_processing_cy_V12 import RawV12Processor
 import warnings
 
 from ..abstractcamera import AbstractCamera as AC
@@ -33,6 +33,7 @@ from loguru._logger import Logger # for type hint only
 
 NDArray = np.ndarray
 _UINT16_HIGHBYTE = 1 if sys.byteorder == 'little' else 0
+_UINT16_LOWBYTE = 0 if sys.byteorder == 'little' else 1
 
 # Default values
 _FRAME_TIME = 10
@@ -107,6 +108,7 @@ class HuatengCamera(AC):
         self._image_height: Optional[int] = None
         self._image_channels: Optional[int] = None
         self._bit_depth: BitDepth = bitdepth # 在SDK中被称为media_type，详见open时枚举。
+        self._max_level: int = None
         self._bayer_pattern: BayerPattern = bayer_pattern
 
         self._correction_path = Path(correction_file)
@@ -115,7 +117,7 @@ class HuatengCamera(AC):
              [-0.9692660,  1.8760108,  0.0415560],
              [ 0.0556434, -0.2040259,  1.0572252]])
 
-        self._processor: Optional[RawV11Processor] = None
+        self._processor: Optional[RawV12Processor] = None
         
         self._extra_rows: int = _EXTRA_ROWS_FOR_METADATA
     
@@ -177,6 +179,10 @@ class HuatengCamera(AC):
         else:
             logger.info(f"Using specified media format, Index {target_media_type}")
             mvsdk.CameraSetMediaType(hCamera, target_media_type)
+        try:
+            self._check_last_err()
+        except Exception as e:
+            raise CamException(f"Failed to set pixel format. Camera may not support specified bitdepth.", src_func="HuatengCamera.open") from e
         
         mvsdk.CameraSetRawStartBit(hCamera, -1) # Get full dynamic range
 
@@ -214,7 +220,9 @@ class HuatengCamera(AC):
             correction_info['fwd_mtx'] = np.eye(3, dtype=np.float64)
         else:
             logger.success(f"Loaded color correction from {self._correction_path}")
-        self._processor = RawV11Processor(
+
+        self._max_level = correction_info["ADC_MAX_LEVEL"]
+        self._processor = RawV12Processor(
             self.full_height, self.full_width, 
             black_level=correction_info["BLC"],
             ADC_max_level=correction_info["ADC_MAX_LEVEL"],
@@ -222,7 +230,7 @@ class HuatengCamera(AC):
             wb_params=correction_info['wb_params'],
             fwd_mtx=correction_info['fwd_mtx'],
             render_mtx=self._XYZ_TO_SRGB,
-            gamma='BT709'
+            gamma='BT709' # TODO: Streaming can be enable to further improve performance.
         )
 
     def close(self) -> bool:
@@ -341,6 +349,11 @@ class HuatengCamera(AC):
     @property
     def dtype(self) -> np.dtype:
         return np.dtype("uint8") if self._bit_depth == BitDepth._8 else np.dtype("uint16")
+    @property
+    def range(self) -> int:
+        if self._max_level is not None:
+            return (0, self._max_level)
+        else: raise CamException("The property requires the camera to be opened at least once.", src_func="HuatengCamera.max_level")
 
     @property
     def target_fps(self) -> float:
@@ -529,6 +542,14 @@ class HuatengCamera(AC):
         return frame, ext_info
 
     def grab_extended_info(self) -> Tuple[Optional[NDArray], Dict[str, Any]]:
+        """
+        Grabs a frame with extended information (timecode).
+        For high bit-depth (>8 bit), will left-shift to 16bit and return np.uint16 frame.
+        For color camera, debayer is incorporated and RGB image will be returned.
+        
+        :return: Tuple of (frame w/ extra line, extended_info)
+        :rtype: Tuple[Optional[NDArray], Dict[str, Any]]
+        """
         # Core capture function for HuatengCamera
         if not self.is_feature_enabled(CameraFeatures.TIMECODE):
             raise CamException("TIMECODE is not enabled during initialization.", src_func="HuatengCamera.grab_extended_info")
@@ -543,8 +564,10 @@ class HuatengCamera(AC):
             #       Detect `frame.shape` for each `.process()` to avoid extra line being debayerred (Done in V12)
             if self._bit_depth == BitDepth._8: 
                 # not continuous, zero-copy.
-                frame = frame.view(np.uint8)[..., _UINT16_HIGHBYTE::2] 
+                frame = frame.view(np.uint8)[..., _UINT16_LOWBYTE::2] # RAWProcessorV12 output the same range as input, rather than pad to 16bit.
         elif self.channels == 1: # Mono camera
+            if self._bit_depth == BitDepth._12: 
+                pass
             pass # Pass NDArray from upstream as-is (uint16 or uint8)
         else: 
             raise CamException(f"HAL do not support current number of channels ({self.channels}).", src_func="HuatengCamera.grab_extended_info")
