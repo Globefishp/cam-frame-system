@@ -165,7 +165,8 @@ class HeadlessBackend: # TODO: Rename as Backend????
         
         self.ring_buffer: Optional[ProcessSafeSharedRingBuffer] = None
         self.frame_server: Optional[FrameServer] = None
-        self.camera_dimension: Tuple[int, int, int] = None
+        self.camera_dimension: Optional[Tuple[int, int, int]] = None
+        self.camera_range: Optional[Tuple[int, int]] = None # (min, max) for preview
         self.camera_proxy: Optional[MpObjProxy] = None
         self.camera_process: Optional[CameraProcess] = None
         self.encoder: Optional[BaseVideoEncoder] = None
@@ -182,17 +183,18 @@ class HeadlessBackend: # TODO: Rename as Backend????
 
         camera = self.camera_class(**self.camera_kwargs)
         camera.open()
-        fw, fh, w, h, c, t = camera.full_width, camera.full_height, camera.width, camera.height, camera.channels, camera.dtype
+        fw, fh, w, h, c, t, r = camera.full_width, camera.full_height, camera.width, camera.height, camera.channels, camera.dtype, camera.range
         camera.close()
-        self.buffer_dimension = (fh, fw, c)
+        buffer_dimension = (fh, fw, c)
         self.camera_dimension = (h, w, c)
-        logger.info(f"Got camera dimension  {w} x {h}, {c} channels, {t}")
+        self.camera_range = r
+        logger.info(f"Got camera dimension  {w} x {h}, {c} channels, {t}, range: {r[0]} ~ {r[1]}")
 
         # Create the unified RingBuffer and FrameServer
         self.ring_buffer = ProcessSafeSharedRingBuffer(
             create=True,
             buffer_capacity=self.buffer_capacity,
-            frame_shape=self.buffer_dimension,
+            frame_shape=buffer_dimension,
             dtype=t
         )
         self.frame_server = FrameServer(create=True, ring_buffer=self.ring_buffer)
@@ -277,7 +279,6 @@ class HeadlessBackend: # TODO: Rename as Backend????
         extinfo_extractor.timecode_key = "hw_timecode"
 
         encoder_config = {
-            **self.encoder_kwargs,
             'frame_server': self.frame_server,
             'output_path': path,
             'batch_size': 1,
@@ -285,7 +286,11 @@ class HeadlessBackend: # TODO: Rename as Backend????
             'stat_interval': max(0.5, 10/fps),
             'inject_logger': self._logger,
             'frame_size': self.camera_dimension,
+            'input-csp': "rgb" if self.camera_dimension[2]==3 else "i400",
+            'input-depth': 16 if np.dtype(self.ring_buffer.dtype)==np.uint16 else 8,
+            # Default bitdepth is inferred from dtype.
             'extinfo_extractor': extinfo_extractor,
+            **self.encoder_kwargs,
         }
         try:
             self.encoder = self.encoder_class(**encoder_config)

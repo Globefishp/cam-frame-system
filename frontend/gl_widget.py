@@ -36,6 +36,9 @@ class CameraDisplayWidget(QOpenGLWidget):
         self.tex_w = 0
         self.tex_h = 0
         self.tex_channels = 0
+        self.tex_dtype = "f1"
+        self.eff_min = 0
+        self.eff_max = 255
         self._texture_cache: Dict[int, moderngl.Texture] = {}
         self._ts_texture_cache: Dict[int, moderngl.Texture] = {}
 
@@ -59,16 +62,19 @@ class CameraDisplayWidget(QOpenGLWidget):
         self.last_mouse_pos = None # Used for recording drag state.
 
         # Display mapping parameters
-        self._val_min = 0.0
-        self._val_max = 1.0
+        self.raw_range = (0, 255)
         self._gamma = 1.0
 
+
     @property
-    def val_min(self) -> float: return self._val_min
+    def val_min(self) -> float: return self.raw_range[0] / self.tex_dtype_max
     @property
-    def val_max(self) -> float: return self._val_max
+    def val_max(self) -> float: return self.raw_range[1] / self.tex_dtype_max
     @property
     def gamma(self) -> float: return self._gamma
+
+    @property
+    def tex_dtype_max(self) -> int: return 65535 if self.tex_dtype == "nu2" else 255
 
     def initializeGL(self):
         # PySide6 has already created the context and made it current
@@ -93,10 +99,10 @@ class CameraDisplayWidget(QOpenGLWidget):
         self.vbo = self.ctx.buffer(vertices)
         self.vao = self.ctx.vertex_array(self.prog, [(self.vbo, '2f 2f', 'in_vert', 'in_uv')])
 
-        # --- Not in use for regular camera ---
-        self.prog['val_min'].value = self._val_min
-        self.prog['val_max'].value = self._val_max
-        self.prog['gamma'].value = self._gamma
+        # --- Useful for High bitdepth camera ---
+        self.prog['val_min'].value = self.val_min
+        self.prog['val_max'].value = self.val_max
+        self.prog['gamma'].value = self.gamma
         
         
         # === Timestamp overlay quad ===
@@ -138,19 +144,10 @@ class CameraDisplayWidget(QOpenGLWidget):
 
     @Slot(float, float)
     def update_display_range(self, val_min: float, val_max: float):
-        """Update the intensity mapping range [0, 1]."""
-        # Clamping logic
-        val_min = max(0.0, min(1.0, val_min))
-        val_max = max(0.0, min(1.0, val_max))
-        if val_min > val_max:
-            val_min = val_max
-
-        if self._val_min == val_min and self._val_max == val_max:
-            return
-
-        self._val_min = val_min
-        self._val_max = val_max
-        self.displayRangeChanged.emit(self._val_min, self._val_max)
+        """API for compatibility: Update the intensity mapping range [0, 1]."""
+        # Current Single Truth is `raw_range`
+        self.raw_range = (int(val_min * self.tex_dtype_max), int(val_max * self.tex_dtype_max))
+        self.displayRangeChanged.emit(self.val_min, self.val_max)
         self.update()
 
     @Slot(float)
@@ -214,8 +211,8 @@ class CameraDisplayWidget(QOpenGLWidget):
             self.points_v_n = len(points_data)
             self.update()
 
-    @Slot(int, int, int, int, int)
-    def on_frame_ready(self, tex_glo, ts_glo, w, h, channels):
+    @Slot(int, int, int, int, int, str, int, int)
+    def on_frame_ready(self, tex_glo, ts_glo, w, h, channels, dtype_str, eff_min, eff_max):
         """Slot to receive updated texture metadata from the background thread."""
         if (w,h) != (self.tex_w, self.tex_h):
             self._update_transform_mtx(w, h)
@@ -225,6 +222,9 @@ class CameraDisplayWidget(QOpenGLWidget):
         self.tex_w = w
         self.tex_h = h
         self.tex_channels = channels
+        self.tex_dtype = dtype_str
+        self.eff_min = eff_min
+        self.eff_max = eff_max
         
         self.update()
 
@@ -261,7 +261,8 @@ class CameraDisplayWidget(QOpenGLWidget):
                     glo=self.current_tex_glo, 
                     size=(self.tex_w, self.tex_h), 
                     components=self.tex_channels,
-                    samples=0, dtype='f1')
+                    samples=0, dtype='f1') # Here use a fake dtype, real one can be `f1` or `nu2`.
+                # Be aware that a fake dtype will not cause problem in GPU, but may so in ModernGL wrapper.
                 tex.filter = (self.interpolation, self.interpolation)
                 if len(self._texture_cache) > 4:
                     # Too many cach, flush old textures. TODO: Auto GC? or NOT? 研究一下modernGL的生命周期管理.
@@ -275,6 +276,9 @@ class CameraDisplayWidget(QOpenGLWidget):
             
             self.prog['Texture'].value = 0
             self.prog['channels'].value = self.tex_channels
+            self.prog['val_min'].value = self.val_min
+            self.prog['val_max'].value = self.val_max
+            self.prog['gamma'].value = self._gamma
 
             self.vao.render(moderngl.TRIANGLE_STRIP)
 

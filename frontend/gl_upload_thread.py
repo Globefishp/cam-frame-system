@@ -17,8 +17,8 @@ class GLTextureUploadThread(QThread):
     Background QThread that continuously reads frames from the backend, 
     uploads them to a ModernGL texture, and generates a timestamp texture.
     """
-    # Emits: tex_glo, ts_glo, width, height, channels
-    frame_ready = Signal(int, int, int, int, int)
+    # Emits: tex_glo, ts_glo, width, height, channels, dtype_str, eff_min, eff_max
+    frame_ready = Signal(int, int, int, int, int, str, int, int)
 
     def __init__(self, backend: HeadlessBackend, share_context: QOpenGLContext, parent=None):
         super().__init__(parent)
@@ -104,7 +104,8 @@ class GLTextureUploadThread(QThread):
                 ts_glo = self.ts_texture.glo
                 
                 # Notify UI to paint
-                self.frame_ready.emit(tex.glo, ts_glo, w, h, channels)
+                self.frame_ready.emit(tex.glo, ts_glo, w, h, channels, dtype,
+                    self.backend.camera_range[0], self.backend.camera_range[1])
                 
                 # Swap buffer
                 self.write_idx = 1 - self.write_idx

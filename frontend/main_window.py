@@ -44,6 +44,7 @@ class MainWindow(QMainWindow):
         self.display_widget = CameraDisplayWidget()
         self.display_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         main_layout.addWidget(self.display_widget, 4)
+        self.display_widget.raw_range = self.backend.camera_range
 
         # --- Right: Controls Panel ---
         controls_widget = QWidget()
