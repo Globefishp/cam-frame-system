@@ -237,7 +237,6 @@ class HeadlessBackend: # TODO: Rename as Backend????
     def start_capture(self):
         """Starts the capture loop."""
         logger = self._logger
-        # Unblock the camera process by providing the ring buffer
         self.camera_process.stop_event.clear()
         self.camera_process.start_event.set()
         if logger: logger.debug("Signalled starting camera capture.")
@@ -301,14 +300,16 @@ class HeadlessBackend: # TODO: Rename as Backend????
 
     def stop_recording(self):
         if self.encoder:
+            is_capturing = self.camera_process.start_event.is_set() # Cache to recover status later
             self.camera_process.stop_event.set() # suspend new frame producing
             try:
                 self.encoder.stop()
             except Exception as e:
                 if self._logger:
                     self._logger.opt(exception=e).error("Error occurred while stopping encoder.")
-            self.camera_process.stop_event.clear()
-            self.camera_process.start_event.set()
+            if is_capturing: # Resume previous capture status.
+                self.camera_process.stop_event.clear()
+                self.camera_process.start_event.set()
             self.encoder = None
 
     def rotate_recording(self, new_path: str):
