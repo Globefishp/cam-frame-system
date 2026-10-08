@@ -21,6 +21,26 @@ conda install numba tqdm
 
 ## 版本日志
 
+### V2.0-pre7
+- 新增差分分析器: 计算变化像素数和平均像素差值. (commit 0636282)
+- 修复后端逻辑: 停止捕捉时, 若在录制中, 捕捉应即刻停止而不应自动恢复.(commit 0f4c9c9)
+- 新增黑白相机支持:
+    - 增加Huateng黑白相机的HAL层支持. (commit d25a536)
+    - 增强编码器对黑白相机的兼容: 后端可以自动决定使用的csp(黑白: `i400`, 彩色: `rgb`), 修复黑白相机录制的视频出现3x3重复画面的问题.
+- 合并上游更新: RawProcessor更新到V12 (commit e552770)
+    - 增强Huateng相机高位深统一兼容性: RawProcessor现在保持输出范围与输入范围一致.
+    - TODO: 使用新增的`streaming`模式优化效率.
+- 前端修复和改进:
+    - 统一了的Analyzer面板抽象, 整理了自定义子类实现中数据传输部分.
+    - 修正在高位深场景下图像预览范围不正确的问题. (commit 432b3d3, 89346ab)
+- 多个代码细节优化调整:
+    - 重构了Analyzer UI部分的代码 (commit 888683b)
+    - 将YOLOAnalyzer中分片的部分抽象成独立组件. (commit cba4148)
+    - 完善Analyzer基类流控 (commit 6bedcbf)
+    - 主窗口现在使用更加彻底的依赖注入模式和Duck Typing来处理自定义面板组合. (commit 9bd6212)
+    - 其他细节调整.
+
+
 ### V2.0-pre6
 - 合并部分上游代码修正: 多进程RPC通信可能产生Race condition, 导致与相机通信崩溃; 
 - 底层FrameServer和RingBuffer修正: 
