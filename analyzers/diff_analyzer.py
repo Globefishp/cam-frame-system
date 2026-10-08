@@ -99,7 +99,8 @@ class DiffAnalyzer(BaseAnalyzer):
             tile_shape=self._tile_shape,
             tiling_axes=(1, 2),
             axis=1,
-            permute=None
+            permute=None,
+            norm_factor=1.0 # Keep original scale.
         )
 
         self._save_path: Optional[Path] = Path(save_path) if save_path else None
